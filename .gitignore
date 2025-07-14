@@ -1,3 +1,26 @@
 .zig-cache/
 zig-out/
 *.o
+
+# for zls
+zls.build.json
+
+# MacOS Cache
+.DS_Store
+
+# Xmake cache
+.xmake/
+build/
+makefile
+
+# for VS Code
+.vscode/
+
+# for vim
+*.swp
+*.swo
+tags
+!tags/
+
+# auto-gen build config
+build_config.json
