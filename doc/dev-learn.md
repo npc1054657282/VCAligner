@@ -56,4 +56,4 @@
 
 <https://github.com/ziglang/zig/blob/0.14.0/doc/langref/test_inline_switch_union_tag.zig>
 
-多数Union的动态输入问题，可以用这个静态分派来解决。现有的Union元编程大多要求静态输入，用这个方案可以把动态tag转换成静态tag。
+多数Union的动态输入问题，可以用这个静态分派来解决。现有的Union元编程大多要求编译时内容，用这个方案可以把运行时tag转换成编译时tag。

@@ -28,34 +28,6 @@ pub const Runner = union(enum) {
             },
         }
     }
-    pub fn SubRunnerByName(name: []const u8) ?type {
-        for (runner_meta_list) |meta| {
-            if (std.mem.eql(u8, meta.name, name)) {
-                return meta.field_type;
-            }
-        }
-        return null;
-    }
-};
-
-const RunnerMeta = struct {
-    name: []const u8,
-    tag: std.meta.Tag(Runner),
-    field_type: type,
-};
-
-const runner_meta_list = compblk: {
-    const union_info = @typeInfo(Runner).@"union";
-    const tag_type = union_info.tag_type.?;
-    var list: [union_info.fields.len]RunnerMeta = undefined;
-    for (union_info.fields, 0..) |field, i| {
-        list[i] = RunnerMeta{
-            .name = field.name,
-            .tag = std.meta.stringToEnum(tag_type, field.name).?,
-            .field_type = field.type,
-        };
-    }
-    break :compblk list;
 };
 
 // 为什么不在main里直接解析cli，而要多此一举用一个函数呢？
