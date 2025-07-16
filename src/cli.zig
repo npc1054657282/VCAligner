@@ -14,17 +14,17 @@ pub const Runner = union(enum) {
     };
     pub const Global = struct {
         verbose: bool,
+        // 为子命令添加全局共享参数。不是指那种必须在子命令前输入的全局参数，我不打算使用此类参数。此处是每个子命令都会指定重复添加的参数。
+        pub fn sharedArgs(sub_cmd: zargs.Command) zargs.Command {
+            return sub_cmd.arg(zargs.Arg.opt("verbose", bool).short('v').long("verbose"));
+        }
+        pub fn initGlobal(args: anytype) Global {
+            std.debug.assert(@hasField(@TypeOf(args), "verbose"));
+            return .{
+                .verbose = args.verbose,
+            };
+        }
     };
-    // 为子命令添加全局共享参数。不是指那种必须在子命令前输入的全局参数，我不打算使用此类参数。此处是每个子命令都会指定重复添加的参数。
-    pub fn sharedArgs(sub_cmd: zargs.Command) zargs.Command {
-        return sub_cmd.arg(zargs.Arg.opt("verbose", bool).short('v').long("verbose"));
-    }
-    pub fn initGlobal(args: anytype) Global {
-        std.debug.assert(@hasField(@TypeOf(args), "verbose"));
-        return .{
-            .verbose = args.verbose,
-        };
-    }
     pub fn initFromArgs(args: Runner.cmd.Result(), allocator: std.mem.Allocator) Runner {
         // 这里可以插入处理全局参数。但目前我的范式是不使用名义上的全局参数，而是将全局参数变为所有子命令都共同使用一份的“共享参数”
         // 因此这块全局参数的处理逻辑不实现。
