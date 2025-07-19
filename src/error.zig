@@ -21,11 +21,6 @@ pub const LastError = union {
     }
 };
 
-pub fn inErrorSet(err: anytype, comptime Err: type) bool {
-    if (@typeInfo(Err).error_set) |error_set| for (error_set) |err_info| {
-        if (std.mem.eql(u8, @errorName(err), err_info.name)) {
-            return true;
-        }
-    };
-    return false;
+pub fn inErrorSet(comptime err: anyerror, comptime Err: type) bool {
+    return @hasField(std.meta.FieldEnum(Err), @errorName(err));
 }

@@ -4,7 +4,7 @@ const c = c_helper.c;
 const PrepRunner = @import("prep_cli.zig").PrepRunner;
 
 pub fn preprocess(ctx: *PrepRunner) !void {
-    std.debug.print("verbose: {}, path: {s}", .{ ctx.global.verbose, ctx.bare_repo_path });
+    std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
     var git_error_code = c.git_libgit2_init();
     if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, &ctx.last_error);
     defer {

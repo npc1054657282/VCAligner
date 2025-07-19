@@ -59,7 +59,6 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError)
         c.GIT_EREADONLY => Libgit2Error.GIT_EREADONLY,
         else => unknown_error_blk: {
             last_error_out.* = .{ .unknown_c_error = git_error_code };
-            std.debug.print("\nunknown error: {d}\n", .{git_error_code});
             break :unknown_error_blk Libgit2Error.UnknownCError;
         },
     };
@@ -68,13 +67,13 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError)
 pub fn logLibgit2Error(err: Libgit2Error, last_error: LastError) void {
     switch (err) {
         Libgit2Error.GIT_ERROR => {
-            std.log.err("libgit2 error: {s}\n", .{(last_error.libgit2 orelse c.git_error_last()).*.message});
+            std.log.err("libgit2: {s}\n", .{(last_error.libgit2 orelse c.git_error_last()).*.message});
         },
         error.UnknownCError => {
-            std.log.err("unknown error: {d}\n", .{last_error.unknown_c_error});
+            std.log.err("unknown c: {d}\n", .{last_error.unknown_c_error});
         },
         else => {
-            std.log.err("libgit2 error: {s}\n", .{@errorName(err)});
+            std.log.err("libgit2: {s}\n", .{@errorName(err)});
         },
     }
 }
