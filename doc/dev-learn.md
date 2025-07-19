@@ -58,6 +58,14 @@
 
 多数Union的动态输入问题，可以用这个静态分派来解决。现有的Union元编程大多要求编译时内容，用这个方案可以把运行时tag转换成编译时tag。
 
+### 激活一个已知的union标签
+
+使用`@unionInit`。
+
+### 联合体子集等相关操作
+
+[参见](https://mitchellh.com/writing/zig-comptime-tagged-union-subset)。
+
 ## zig的5种多态
 
 - Tagged Union，最静态，计算开销最可能优化，但是需求一个统一入口，扩展性不太好。
@@ -103,3 +111,23 @@
 对于c字符串，你总是应该用`[:0]u8`的哨兵切片类型来处理。一个快速地分配内存拷贝获得一个c字符串的方式是`std.mem.Allocator.dupZ`。反过来，把哨兵切片转换为普通切片使用`std.mem.span`。
 
 不过，真正令人兴奋的，是`ArrayListUnmanaged`与哨兵切片的互操作。当用`ArrayListUnmanaged`动态地创建了一个字符串以后，想要转换给C操作，只需要使用`toOwnedSliceSentinel`方法，`ArrayListUnmanaged`就会自动在末尾补0，且管理的内存就直接将所有权转移给了哨兵切片指针，原`ArrayListUnmanaged`自动清空。这个东西是最好用的。
+
+## zig的错误处理
+
+### zig错误的上下文携带
+
+zig的错误无法携带错误本身以外的其他信息。想要保存错误信息，必须将错误信息独立地放在一个函数参数里，或者成为某个参数的上下文内容。
+
+有很多[issue](https://github.com/ziglang/zig/issues/2647)讨论了关于让错误信息携带内容的提案，但是最终这些提案被否决。
+
+虽然很让人失望，但是看了语言团队的解释并经过思考，最终理解了这个决定。
+
+在保存错误信息的时候，尤其是在进行内存操作的时候，这个内存操作本身很可能存在错误。而将结构化错误语法化以后，这个错误信息结构依赖于错误本身而存在，因此就相当于是一个错误内部的一个嵌套错误。很明显这不良。
+
+而将错误信息与错误码本身独立时，如果错误信息的保存内部存在错误，它会产生一个新的独立于这个错误本身的错误并被优先抛出。这可以确保zig对错误处理的稳定保障。
+
+### zig的错误集反射
+
+在运行时推断一个错误是否属于某个错误集，目前最可行的方案是[这个](https://ziggit.dev/t/is-there-a-nicer-way-to-check-if-an-error-is-in-an-error-set/8503)。这也是我目前采用的方案。目前Error的类型反射仅有名字，而在此[issue](https://github.com/ziglang/zig/issues/24028)中mlugg在6月1日的回复中提到的一向改动可能可以对这个方案进一步优化。
+
+这个[方案](https://ziggit.dev/t/switching-on-an-errorset/8976)我的测试里似乎对运行时错误不起效，对一个错误在switch时进行`inline else`，似乎并不能把这个错误静态分派为一个静态的错误。我可能还需要继续研究下。

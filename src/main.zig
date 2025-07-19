@@ -1,5 +1,7 @@
 const std = @import("std");
 const zargs = @import("zargs");
+const error_helper = @import("error.zig");
+const c_helper = @import("c.zig");
 
 pub fn main() !void {
     // 使用c分配器的原因：
@@ -10,5 +12,15 @@ pub fn main() !void {
     const root_allocator = std.heap.c_allocator;
     var runner = try @import("cli.zig").parseArgs(root_allocator);
     defer runner.deinit(root_allocator);
-    try runner.run();
+    runner.run() catch |err| {
+        switch (err) {
+            inline else => |e| {
+                if (error_helper.inErrorSet(e, c_helper.Libgit2Error)) {
+                    c_helper.logLibgit2Error(e, runner.getLastError());
+                } else {
+                    return e;
+                }
+            },
+        }
+    };
 }

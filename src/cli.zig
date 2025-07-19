@@ -1,5 +1,6 @@
 const std = @import("std");
 const zargs = @import("zargs");
+const LastError = @import("error.zig").LastError;
 pub const Runner = union(enum) {
     prep: @import("prep/prep_cli.zig").PrepRunner,
     const cmd = cmd_blk: {
@@ -42,6 +43,11 @@ pub const Runner = union(enum) {
     pub fn run(self: *Runner) !void {
         switch (self.*) {
             inline else => |*case| return case.run(),
+        }
+    }
+    pub fn getLastError(self: *Runner) LastError {
+        switch (self.*) {
+            inline else => |case| return case.last_error,
         }
     }
     pub const Error = error{

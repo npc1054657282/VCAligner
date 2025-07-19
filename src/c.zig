@@ -3,6 +3,7 @@ pub const c = @cImport({
     @cInclude("git2.h");
     @cInclude("rocksdb/c.h");
 });
+const LastError = @import("error.zig").LastError;
 test "libgit2 test" {
     _ = c.git_libgit2_init();
     _ = c.git_libgit2_shutdown();
@@ -13,12 +14,16 @@ test "rocksdb test" {
     c.rocksdb_options_destroy(options);
 }
 
-pub const Libgit2Error = error{ GIT_ERROR, GIT_ENOTFOUND, GIT_EEXISTS, GIT_EAMBIGUOUS, GIT_EBUFS, GIT_EUSER, GIT_EBAREREPO, GIT_EUNBORNBRANCH, GIT_EUNMERGED, GIT_ENONFASTFORWARD, GIT_EINVALIDSPEC, GIT_ECONFLICT, GIT_ELOCKED, GIT_EMODIFIED, GIT_EAUTH, GIT_ECERTIFICATE, GIT_EAPPLIED, GIT_EPEEL, GIT_EEOF, GIT_EINVALID, GIT_EUNCOMMITTED, GIT_EDIRECTORY, GIT_EMERGECONFLICT, GIT_PASSTHROUGH, GIT_ITEROVER, GIT_RETRY, GIT_EMISMATCH, GIT_EINDEXDIRTY, GIT_EAPPLYFAIL, GIT_EOWNER, GIT_TIMEOUT, GIT_EUNCHANGED, GIT_ENOTSUPPORTED, GIT_EREADONLY, UnknownError };
+pub const Libgit2Error = error{ GIT_ERROR, GIT_ENOTFOUND, GIT_EEXISTS, GIT_EAMBIGUOUS, GIT_EBUFS, GIT_EUSER, GIT_EBAREREPO, GIT_EUNBORNBRANCH, GIT_EUNMERGED, GIT_ENONFASTFORWARD, GIT_EINVALIDSPEC, GIT_ECONFLICT, GIT_ELOCKED, GIT_EMODIFIED, GIT_EAUTH, GIT_ECERTIFICATE, GIT_EAPPLIED, GIT_EPEEL, GIT_EEOF, GIT_EINVALID, GIT_EUNCOMMITTED, GIT_EDIRECTORY, GIT_EMERGECONFLICT, GIT_PASSTHROUGH, GIT_ITEROVER, GIT_RETRY, GIT_EMISMATCH, GIT_EINDEXDIRTY, GIT_EAPPLYFAIL, GIT_EOWNER, GIT_TIMEOUT, GIT_EUNCHANGED, GIT_ENOTSUPPORTED, GIT_EREADONLY, UnknownCError };
 
-pub fn gitErrorCodeToZigError(git_error_code: c_int) Libgit2Error!void {
+// 我能想到的一种可能的处理方法是：编译时遍历`Libgit2Error`的错误名，然后用`@field`访问其声明，分别与`git_error_code`进行比较。
+pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError) Libgit2Error!void {
     return switch (git_error_code) {
         c.GIT_OK => return,
-        c.GIT_ERROR => Libgit2Error.GIT_ERROR,
+        c.GIT_ERROR => git_error_blk: {
+            last_error_out.* = .{ .libgit2 = c.git_error_last() };
+            break :git_error_blk Libgit2Error.GIT_ERROR;
+        },
         c.GIT_ENOTFOUND => Libgit2Error.GIT_ENOTFOUND,
         c.GIT_EEXISTS => Libgit2Error.GIT_EEXISTS,
         c.GIT_EAMBIGUOUS => Libgit2Error.GIT_EAMBIGUOUS,
@@ -53,17 +58,20 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int) Libgit2Error!void {
         c.GIT_ENOTSUPPORTED => Libgit2Error.GIT_ENOTSUPPORTED,
         c.GIT_EREADONLY => Libgit2Error.GIT_EREADONLY,
         else => unknown_error_blk: {
-            std.log.err("\nunknown error: {d}\n", .{git_error_code});
-            break :unknown_error_blk Libgit2Error.UnknownError;
+            last_error_out.* = .{ .unknown_c_error = git_error_code };
+            std.debug.print("\nunknown error: {d}\n", .{git_error_code});
+            break :unknown_error_blk Libgit2Error.UnknownCError;
         },
     };
 }
 
-pub fn logLibgit2Error(err: Libgit2Error) void {
+pub fn logLibgit2Error(err: Libgit2Error, last_error: LastError) void {
     switch (err) {
         Libgit2Error.GIT_ERROR => {
-            const git_error = c.git_error_last();
-            std.log.err("libgit2 error: {s}\n", .{git_error.*.message});
+            std.log.err("libgit2 error: {s}\n", .{(last_error.libgit2 orelse c.git_error_last()).*.message});
+        },
+        error.UnknownCError => {
+            std.log.err("unknown error: {d}\n", .{last_error.unknown_c_error});
         },
         else => {
             std.log.err("libgit2 error: {s}\n", .{@errorName(err)});
