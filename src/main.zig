@@ -15,13 +15,12 @@ pub fn main() !void {
     runner.run(root_allocator) catch |err| {
         switch (err) {
             inline else => |e| {
-                // 尽管采用了动态分派，但是如果强制comptime执行`inErrorSet`会出错：超过1000个选项。
-                // 而不强制comptime执行，@errorCast到指定错误集就会失败，无视了Libgit2Error以外的其他错误无法通过校验的事实。
-                // 不过有趣的是，如果不用静态分派，纯运行时使用`inErrorSet`也会出错，要求错误必须时编译时已知值。
-                // 我个人的一种推测是，error的switch可能并不是switch所有错误，而是switch的整个整数空间……？
-                // 而zig的编译期函数有可能会对过大的空间在静态分派时自动转换为运行时，代价是后续无法推断错误具体类型，所以不能@errorCast？
-                if (error_helper.inErrorSet(e, c_helper.Libgit2Error)) {
-                    c_helper.logLibgit2Error(e, runner.getLastError().?);
+                // 此处的判断错误集开销较大，如果分支超过1000可能会从编译时转为运行时。
+                // 届时此处的errorCast将无法进行。在此提升最大反向分支数。
+                @setEvalBranchQuota(65535);
+                if (comptime error_helper.inErrorSet(e, c_helper.Libgit2Error)) {
+                    const libgit2_err: c_helper.Libgit2Error = @errorCast(e);
+                    c_helper.logLibgit2Error(libgit2_err, runner.getLastError().?);
                 } else {
                     return e;
                 }

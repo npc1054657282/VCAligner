@@ -21,6 +21,12 @@ pub const LastError = union {
     }
 };
 
+// 出于编译时性能考虑，没有使用更简洁的方案，而是使用了这种基于`@typeInfo`手工对比的方法。
 pub fn inErrorSet(comptime err: anyerror, comptime Err: type) bool {
-    return @hasField(std.meta.FieldEnum(Err), @errorName(err));
+    if (@typeInfo(Err).error_set) |error_set| inline for (error_set) |err_info| {
+        if (std.mem.eql(u8, @errorName(err), err_info.name)) {
+            return true;
+        }
+    };
+    return false;
 }

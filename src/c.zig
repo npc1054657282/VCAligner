@@ -65,8 +65,9 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError)
     };
 }
 
-// 由于从推断错误集强制转换到指定错误集出现了困难，目前将错误参数要求修改为anyerror。试图推断动态err的断言也失败。
-pub fn logLibgit2Error(err: anyerror, last_error: LastError) void {
+// 由于从推断错误集强制转换到指定错误集时可能存在开销过大的现象，类型集推断强制编译时进行可能会有困难。
+// 未来如果遇到不得不将类型集推断交给运行时的场景，此处的err的类型将不再强制为`Libgit2Error`而是`anyerror`
+pub fn logLibgit2Error(err: Libgit2Error, last_error: LastError) void {
     switch (err) {
         Libgit2Error.GIT_ERROR => {
             std.log.err("libgit2: {s}\n", .{(last_error.libgit2 orelse c.git_error_last()).*.message});
