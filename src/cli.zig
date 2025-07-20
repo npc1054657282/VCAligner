@@ -40,14 +40,17 @@ pub const Runner = union(enum) {
             inline else => |*case| return case.deinit(allocator),
         }
     }
-    pub fn run(self: *Runner) !void {
+    pub fn run(self: *Runner, allocator: std.mem.Allocator) !void {
         switch (self.*) {
-            inline else => |*case| return case.run(),
+            inline else => |*case| return case.run(allocator),
         }
     }
-    pub fn getLastError(self: *Runner) LastError {
+    /// 注意：获得的是一份拷贝，不可被修改。
+    pub fn getLastError(self: *Runner) ?LastError {
         switch (self.*) {
-            inline else => |case| return case.last_error,
+            inline else => |*case| {
+                return if (@hasField(@TypeOf(case.*), "last_error")) case.last_error else null;
+            },
         }
     }
     pub const Error = error{
