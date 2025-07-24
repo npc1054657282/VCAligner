@@ -3,8 +3,7 @@ pub const c = @cImport({
     @cInclude("git2.h");
     @cInclude("rocksdb/c.h");
 });
-const error_helper = @import("error.zig");
-const LastError = error_helper.LastError;
+const diag = @import("diagnostics.zig");
 test "libgit2 test" {
     _ = c.git_libgit2_init();
     _ = c.git_libgit2_shutdown();
@@ -18,11 +17,11 @@ test "rocksdb test" {
 pub const Libgit2Error = error{ GIT_ERROR, GIT_ENOTFOUND, GIT_EEXISTS, GIT_EAMBIGUOUS, GIT_EBUFS, GIT_EUSER, GIT_EBAREREPO, GIT_EUNBORNBRANCH, GIT_EUNMERGED, GIT_ENONFASTFORWARD, GIT_EINVALIDSPEC, GIT_ECONFLICT, GIT_ELOCKED, GIT_EMODIFIED, GIT_EAUTH, GIT_ECERTIFICATE, GIT_EAPPLIED, GIT_EPEEL, GIT_EEOF, GIT_EINVALID, GIT_EUNCOMMITTED, GIT_EDIRECTORY, GIT_EMERGECONFLICT, GIT_PASSTHROUGH, GIT_ITEROVER, GIT_RETRY, GIT_EMISMATCH, GIT_EINDEXDIRTY, GIT_EAPPLYFAIL, GIT_EOWNER, GIT_TIMEOUT, GIT_EUNCHANGED, GIT_ENOTSUPPORTED, GIT_EREADONLY, UnknownCError };
 
 // 我能想到的一种可能的处理方法是：编译时遍历`Libgit2Error`的错误名，然后用`@field`访问其声明，分别与`git_error_code`进行比较。
-pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError) Libgit2Error!void {
+pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic) Libgit2Error!void {
     return switch (git_error_code) {
         c.GIT_OK => return,
         c.GIT_ERROR => git_error_blk: {
-            last_error_out.* = .{ .libgit2 = c.git_error_last() };
+            last_diag.* = .{ .DiagnosticGIT_ERROR = DiagnosticGIT_ERROR.init() };
             break :git_error_blk Libgit2Error.GIT_ERROR;
         },
         c.GIT_ENOTFOUND => Libgit2Error.GIT_ENOTFOUND,
@@ -59,24 +58,25 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_error_out: *LastError)
         c.GIT_ENOTSUPPORTED => Libgit2Error.GIT_ENOTSUPPORTED,
         c.GIT_EREADONLY => Libgit2Error.GIT_EREADONLY,
         else => unknown_error_blk: {
-            last_error_out.* = .{ .unknown_c_error = git_error_code };
+            last_diag.* = .{ .DiagnosticUnknownCError = .{ .code = git_error_code } };
             break :unknown_error_blk Libgit2Error.UnknownCError;
         },
     };
 }
 
-// 由于从推断错误集强制转换到指定错误集时可能存在开销过大的现象，类型集推断强制编译时进行可能会有困难。
-// 未来如果遇到不得不将类型集推断交给运行时的场景，此处的err的类型将不再强制为`Libgit2Error`而是`anyerror`
-pub fn logLibgit2Error(err: Libgit2Error, last_error: LastError) void {
-    switch (err) {
-        Libgit2Error.GIT_ERROR => {
-            std.log.err("libgit2: {s}\n", .{(last_error.libgit2 orelse c.git_error_last()).*.message});
-        },
-        error.UnknownCError => {
-            std.log.err("unknown c: {d}\n", .{last_error.unknown_c_error});
-        },
-        else => {
-            std.log.err("libgit2: {s}\n", .{@errorName(err)});
-        },
+pub const DiagnosticGIT_ERROR = struct {
+    last_error: *const c.git_error,
+    pub fn init() DiagnosticGIT_ERROR {
+        return .{ .last_error = c.git_error_last() };
     }
-}
+    pub fn log(self: DiagnosticGIT_ERROR) void {
+        std.log.err("libgit2: {s}\n", .{self.last_error.message});
+    }
+};
+
+pub const DiagnosticUnknownCError = struct {
+    code: c_int,
+    pub fn log(self: DiagnosticUnknownCError) void {
+        std.log.err("unknown c: {d}\n", .{self.code});
+    }
+};

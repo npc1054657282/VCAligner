@@ -1,8 +1,8 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const LastError = @import("error.zig").LastError;
+const diag = @import("diagnostics.zig");
 pub const Runner = union(enum) {
-    prep: @import("prep/prep_cli.zig").PrepRunner,
+    prep: @import("cmd_prep/prep_cli.zig").PrepRunner,
     const cmd = cmd_blk: {
         var building_cmd = zargs.Command.new("gvca").requireSub("sub")
             .about("git version commit aligner")
@@ -40,17 +40,10 @@ pub const Runner = union(enum) {
             inline else => |*case| return case.deinit(allocator),
         }
     }
-    pub fn run(self: *Runner, allocator: std.mem.Allocator) !void {
+    /// NOTE: allocator必须线程安全
+    pub fn run(self: *Runner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
         switch (self.*) {
-            inline else => |*case| return case.run(allocator),
-        }
-    }
-    /// 注意：获得的是一份拷贝，不可被修改。
-    pub fn getLastError(self: *Runner) ?LastError {
-        switch (self.*) {
-            inline else => |*case| {
-                return if (@hasField(@TypeOf(case.*), "last_error")) case.last_error else null;
-            },
+            inline else => |*case| return case.run(allocator, last_diag),
         }
     }
     pub const Error = error{

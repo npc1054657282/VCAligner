@@ -2,19 +2,18 @@ const std = @import("std");
 const zargs = @import("zargs");
 const Runner = @import("../cli.zig").Runner;
 const c = @import("../c.zig").c;
-const LastError = @import("../error.zig").LastError;
+const diag = @import("../diagnostics.zig");
 pub const PrepRunner = struct {
     global: Runner.Global,
     bare_repo_path: [:0]u8,
-    last_error: LastError = undefined,
     repo: *c.git_repository = undefined,
     odb: *c.git_odb = undefined,
     repo_id: [:0]u8 = undefined,
     pub const cmd = Runner.Global.sharedArgs(zargs.Command.new("prep"))
         .arg(zargs.Arg.optArg("repo_path", ?[]const u8).long("repo-path"))
         .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path"));
-    pub fn run(self: *PrepRunner, allocator: std.mem.Allocator) !void {
-        try @import("preprocess.zig").preprocess(self, allocator);
+    pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+        try @import("preprocess.zig").preprocess(self, allocator, last_diag);
         return;
     }
     pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator) !Runner {
