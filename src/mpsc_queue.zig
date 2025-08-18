@@ -392,7 +392,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                     cache.consume_cursor_to_release = self.consume_cursor_to_release.load(.acquire);
                     const produce_avail = probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release);
                     actual_count = if (produce_avail >= count) count else if (produce_avail == 0) return error.MpscQueueVacancyUnavailableForProducer else produce_avail;
-                }
+                } else actual_count = count;
                 new_produce_cursor = cache_produce_cursor +% actual_count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
