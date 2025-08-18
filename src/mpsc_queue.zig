@@ -40,15 +40,11 @@ fn ticket(comptime Sequence: type) type {
             v: Sequence,
             cache: if (runtime_safety) *ConsumerLocal else void,
         };
-    };
-}
-
-fn Tickets(comptime Sequence: type) type {
-    const ProducerLocal = local_cache(Sequence).Producer;
-    return struct {
-        first_ticket: Sequence,
-        count: usize,
-        cache: if (runtime_safety) *ProducerLocal else void,
+        const ProduceMultiple = struct {
+            first_ticket: Sequence,
+            count: usize,
+            cache: if (runtime_safety) *ProducerLocal else void,
+        };
     };
 }
 
@@ -136,6 +132,7 @@ pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type
         pub const ItemType = T;
         pub const Sequence = ResolvedSequence(SequenceTypeOverride);
         pub const ProduceTicket = ticket(Sequence).Produce;
+        pub const ProduceTickets = ticket(Sequence).ProduceMultiple;
         pub const ConsumeTicket = ticket(Sequence).Consume;
         pub const ProducerLocal = local_cache(Sequence).Producer;
         pub const ConsumerLocal = local_cache(Sequence).Consumer;
@@ -193,14 +190,19 @@ pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type
                 inline else => |instance| return instance.claimProduce(cache),
             }
         }
-        pub fn claimProduceMultiple(self: @This(), count: usize, cache: *ProducerLocal) !Tickets(Sequence) {
+        pub fn claimProduceMultiple(self: @This(), count: usize, cache: *ProducerLocal) !ProduceTickets {
             switch (self.u) {
                 inline else => |instance| return instance.claimProduceMultiple(count, cache),
             }
         }
-        pub fn claimProduceMultipleExact(self: @This(), count: usize, cache: *ProducerLocal) !Tickets(Sequence) {
+        pub fn claimProduceMultipleExact(self: @This(), count: usize, cache: *ProducerLocal) !ProduceTickets {
             switch (self.u) {
                 inline else => |instance| return instance.claimProduceMultipleExact(count, cache),
+            }
+        }
+        pub fn nextProduceTicket(self: @This(), tickets: *ProduceTickets) ?struct { ProduceTicket, *T } {
+            switch (self.u) {
+                inline else => |instance| return instance.nextProduceTicket(tickets),
             }
         }
         pub fn publishProducedUnsafe(self: @This(), produce_ticket: ProduceTicket) void {
@@ -284,6 +286,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
         pub const ItemType = T;
         pub const Sequence = ResolvedSequence(SequenceTypeOverride);
         pub const ProduceTicket = ticket(Sequence).Produce;
+        pub const ProduceTickets = ticket(Sequence).ProduceMultiple;
         pub const ConsumeTicket = ticket(Sequence).Consume;
         pub const ProducerLocal = local_cache(Sequence).Producer;
         pub const ConsumerLocal = local_cache(Sequence).Consumer;
@@ -376,15 +379,15 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
         }
         // 返回一个`Tickets`，需要基于`Tickets`迭代地获取一个`Ticket`与一个item。每个`Ticket`需要分别publish
         // 如果剩余空间不够，则申请剩余所有空间用于生产。
-        pub fn claimProduceMultiple(self: *@This(), count: usize, cache: *ProducerLocal) !Tickets(Sequence) {
+        pub fn claimProduceMultiple(self: *@This(), count: usize, cache: *ProducerLocal) !ProduceTickets {
             std.debug.assert(count != 0);
             var cache_produce_cursor = self.produce_cursor_to_claim.load(.monotonic);
             var cas_result: ?Sequence = undefined;
             var new_produce_cursor: Sequence = undefined;
             var actual_count: usize = undefined;
-            while ({
+            while (do_blk: {
                 // 先检查最乐观情况：基于消费者的旧缓存，也能确认足以承载所有请求生产量的情况。
-                if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) > count) {
+                if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) < count) {
                     // 若不是最乐观情况，更新消费者旧缓存，重新检查余量。
                     cache.consume_cursor_to_release = self.consume_cursor_to_release.load(.acquire);
                     const produce_avail = probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release);
@@ -393,9 +396,9 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 new_produce_cursor = cache_produce_cursor +% actual_count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
-                cas_result != null;
+                break :do_blk cas_result != null;
             }) {
-                cache_produce_cursor = cas_result;
+                cache_produce_cursor = cas_result.?;
             }
             if (runtime_safety) cache.unpublished_produce += actual_count;
             return .{
@@ -405,14 +408,14 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             };
         }
         // 如果剩余空间不够，直接失败。
-        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal) !Tickets(Sequence) {
+        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal) !ProduceTickets {
             std.debug.assert(count != 0);
             var cache_produce_cursor = self.produce_cursor_to_claim.load(.monotonic);
             var cas_result: ?Sequence = undefined;
             var new_produce_cursor: Sequence = undefined;
-            while ({
+            while (do_blk: {
                 // 先检查最乐观情况：基于消费者的旧缓存，也能确认足以承载所有请求生产量的情况。
-                if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) > count) {
+                if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) < count) {
                     // 若不是最乐观情况，更新消费者旧缓存，重新检查余量。
                     cache.consume_cursor_to_release = self.consume_cursor_to_release.load(.acquire);
                     const produce_avail = probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release);
@@ -422,9 +425,9 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 new_produce_cursor = cache_produce_cursor +% count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
-                cas_result != null;
+                break :do_blk cas_result != null;
             }) {
-                cache_produce_cursor = cas_result;
+                cache_produce_cursor = cas_result.?;
             }
             if (runtime_safety) cache.unpublished_produce += count;
             return .{
@@ -433,7 +436,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 .cache = if (runtime_safety) cache else {},
             };
         }
-        pub fn nextProduceTicket(self: *@This(), tickets: *Tickets(Sequence)) ?struct { ProduceTicket, *T } {
+        pub fn nextProduceTicket(self: *@This(), tickets: *ProduceTickets) ?struct { ProduceTicket, *T } {
             if (tickets.count == 0) return null;
             const produce_ticket: ProduceTicket = .{
                 .v = tickets.first_ticket,

@@ -11,6 +11,7 @@ pub fn MpscChannel(MpscQueue: type) type {
     const T = MpscQueue.ItemType;
     const Sequence = MpscQueue.Sequence;
     const ProduceTicket = MpscQueue.ProduceTicket;
+    const ProduceTickets = MpscQueue.ProduceTickets;
     const ConsumeTicket = MpscQueue.ConsumeTicket;
     const ProducerLocal = MpscQueue.ProducerLocal;
     const ConsumerLocal = MpscQueue.ConsumerLocal;
@@ -31,9 +32,7 @@ pub fn MpscChannel(MpscQueue: type) type {
         const ProducerSyncBlock = struct {
             // `num_producer_waiting`是普通生产等待与强制批量生产等待之和。一旦存在强制批量生产，必须为broadcast而非signal。
             num_producer_waiting: std.atomic.Value(usize) = .init(0),
-            // 用于标识当前是否有批量生产。
-            num_batch_producer_waiting: usize = 0,
-            // 批量生产者每当唤醒重新竞标此最小值。不能可靠地表达是否存在批量生产，必须依赖`num_batch_producer_waiting`。
+            // 批量生产者每当唤醒重新竞标此最小值。
             smallest_batch_size: usize = ~@as(usize, 0),
             vacancy_avail_cond: std.Thread.Condition = .{},
             vacancy_sufficient_cond: std.Thread.Condition = .{},
@@ -66,7 +65,7 @@ pub fn MpscChannel(MpscQueue: type) type {
                 return .{ ticket, item_ref };
             };
         }
-        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal, on_wait: ?Pollable) mpsc_queue.Tickets(Sequence) {
+        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal, on_wait: ?Pollable) ProduceTickets {
             if (runtime_safety) {
                 // 对于mpsc_channel而言，任何已申请而未发布的生产都有可能导致死锁。
                 std.debug.assert(cache.unpublished_produce == 0);
@@ -84,18 +83,16 @@ pub fn MpscChannel(MpscQueue: type) type {
                 }
                 self.producer_sync.mutex.lock();
                 _ = self.producer_sync.num_producer_waiting.fetchAdd(1, .acquire);
-                const ticket, const item_ref = self.mpsc_queue_ref.claimProduceMultipleExact(count, cache) catch blk: {
-                    self.producer_sync.num_batch_producer_waiting += 1;
+                const tickets = self.mpsc_queue_ref.claimProduceMultipleExact(count, cache) catch blk: {
                     while (true) {
                         if (count < self.producer_sync.smallest_batch_size) self.producer_sync.smallest_batch_size = count;
                         self.producer_sync.vacancy_sufficient_cond.wait(&self.producer_sync.mutex);
                         break :blk self.mpsc_queue_ref.claimProduceMultipleExact(count, cache) catch continue;
                     }
-                    self.producer_sync.num_batch_producer_waiting -= 1;
                 };
                 _ = self.producer_sync.num_producer_waiting.fetchSub(1, .release);
                 self.producer_sync.mutex.unlock();
-                return .{ ticket, item_ref };
+                return tickets;
             };
         }
         pub fn publishProducedUnsafe(self: *@This(), produce_ticket: ProduceTicket) void {
@@ -152,24 +149,12 @@ pub fn MpscChannel(MpscQueue: type) type {
             // 本质是`load(..., .release)`的Rmw操作版本，因为直接对`load`采用`.release`内存序是不被允许的。
             if (self.producer_sync.num_producer_waiting.fetchXor(0, .release) != 0) {
                 self.producer_sync.mutex.lock();
-                // XXX: 当前的唤醒策略的一个逻辑不一致之处：
-                // 假如存在批量生产请求，它看似采用“最小唤醒策略”，只要满足最小批量生产的数量，就会进行广播唤醒。
-                // 但是，案例“非批量的单个生产”才是最小的，但当前实现不会考虑“只要存在单个生产就会广播”。
-                // 简单地说：当前的实现完全割裂了单个生产和多个生产，这保证了对于单个生产，完全不考虑可能有批量生产的情况。
-                // 而存在批量生产的唤醒逻辑和单个生产不互通。
-                if (self.producer_sync.num_batch_producer_waiting == 0) {
-                    self.producer_sync.vacancy_avail_cond.signal();
-                } else {
-                    const vacancy = self.mpsc_queue_ref.probeProduceVacancyForConsumer(consume_ticket.v +% 1);
-                    if (self.producer_sync.smallest_batch_size <= vacancy) {
-                        // 对于符合批处理最小广播条件的情况，一定要同时对非批处理的生产进行广播。
-                        // 让我们考虑这么一种极端情况：当消费者发现一个批处理生产满足条件以后，如果仅仅对批处理生产进行广播。
-                        // 然而，消费者接下来抢在各批处理接收到广播之前，再次迅速消费多次，持续持有本锁。
-                        // 由于其他生产者没有来得及重置`smallest_batch_size`，导致接下来的所有信号成功竞争得到锁前插入的连续消费都不会发送任何信号。
-                        // 例如：当前有一个批量生产4，以及3个单次生产在等待状态。消费者抢在所有等待中的生产者接收到信号前连续消费了4次。
-                        // 这将导致后续几次消费不会产生任何信号，进而3个单次生产本应接收信号却错过了。
-                        // 为了避免此种情况发生，在广播批处理生产时，也必须为单次生产发送广播。
-                        self.producer_sync.vacancy_avail_cond.broadcast();
+                // 总是在非批量生产的等待队列发送一个信号。
+                // 我们的mpsc channel鼓励使用仅单次生产而非强制批量生产，因此不会为判定是否存在单次生产进行更多状态保存与比较。
+                self.producer_sync.vacancy_avail_cond.signal();
+                if (self.producer_sync.smallest_batch_size != ~@as(usize, 0)) {
+                    // 如果存在批量生产，且当前的空闲空间已经允许批量生产的最小值，对批量生产队列广播唤醒，然后重新竞标批量最小值。
+                    if (self.producer_sync.smallest_batch_size <= self.mpsc_queue_ref.probeProduceVacancyForConsumer(consume_ticket.v +% 1)) {
                         self.producer_sync.vacancy_sufficient_cond.broadcast();
                         self.producer_sync.smallest_batch_size = ~@as(usize, 0);
                     }
@@ -178,6 +163,87 @@ pub fn MpscChannel(MpscQueue: type) type {
             }
         }
     };
+}
+
+pub fn run_test() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+    const BigStruct = struct {
+        data: [80]u8,
+    };
+    const Queue = mpsc_queue.AnyMpscQueue(BigStruct, null);
+    const Channel = MpscChannel(Queue);
+    const Producer = struct {
+        fn task(channel: *Channel, id: u8) void {
+            var cache = channel.mpsc_queue_ref.initProducerLocal();
+            if (id % 2 == 0) {
+                for (0..100) |count| {
+                    const ticket, const item_ref = channel.claimProduce(&cache, null);
+                    const probe_produce_vacancy = channel.mpsc_queue_ref.getCapacity() -| (ticket.v -% cache.consume_cursor_to_release);
+                    std.debug.print("producer {d} start to produce No. {d} producet with ticket {d}, consumer_cursor is {d}, probe_produce_vacancy {d} \n", .{ id, count, ticket.v, cache.consume_cursor_to_release, probe_produce_vacancy });
+                    defer channel.publishProducedUnsafe(ticket);
+                    item_ref.* = .{ .data = @splat(id) };
+                }
+            } else {
+                var count: usize = 0;
+                for (0..4) |_| {
+                    var tickets = channel.claimProduceMultipleExact(25, &cache, null);
+                    while (channel.mpsc_queue_ref.nextProduceTicket(&tickets)) |lease| {
+                        const ticket, const item_ref = lease;
+                        const probe_produce_vacancy = channel.mpsc_queue_ref.getCapacity() -| (ticket.v -% cache.consume_cursor_to_release);
+                        std.debug.print("producer {d} start to produce No. {d} producet with ticket {d}, consumer_cursor is {d}, probe_produce_vacancy {d} \n", .{ id, count, ticket.v, cache.consume_cursor_to_release, probe_produce_vacancy });
+                        defer channel.publishProducedUnsafe(ticket);
+                        item_ref.* = .{ .data = @splat(id) };
+                        count += 1;
+                    }
+                }
+            }
+        }
+    };
+    var producers_pool: std.Thread.Pool = undefined;
+    try producers_pool.init(.{ .allocator = allocator });
+    defer producers_pool.deinit();
+    const queue = try Queue.init(allocator, 5);
+    defer queue.deinit(allocator);
+    var channel: Channel = .{ .mpsc_queue_ref = queue };
+    var wait_group: std.Thread.WaitGroup = .{};
+    for (0..8) |i| {
+        const id: u8 = @intCast(i);
+        producers_pool.spawnWg(&wait_group, Producer.task, .{ &channel, id });
+    }
+    {
+        var consumer_cache = channel.mpsc_queue_ref.initConsumerLocal();
+        var statistic: [8]usize = @splat(0);
+        for (0..800) |_| {
+            const ticket, const item_ref = channel.claimConsume(&consumer_cache, null);
+            std.debug.print("consumer start to consume ticket {d} \n", .{ticket.v});
+            defer channel.releaseConsumedUnsafe(ticket);
+            const verify = struct {
+                const possible_product: [8][80]u8 = .{
+                    @as([80]u8, @splat(0)),
+                    @as([80]u8, @splat(1)),
+                    @as([80]u8, @splat(2)),
+                    @as([80]u8, @splat(3)),
+                    @as([80]u8, @splat(4)),
+                    @as([80]u8, @splat(5)),
+                    @as([80]u8, @splat(6)),
+                    @as([80]u8, @splat(7)),
+                };
+                fn check(to_check: *[80]u8) ?usize {
+                    for (possible_product, 0..8) |expect, id| {
+                        if (std.mem.eql(u8, &expect, to_check)) return id;
+                    }
+                    return null;
+                }
+            };
+            const id = verify.check(&item_ref.data);
+            try std.testing.expect(id != null);
+            statistic[id.?] += 1;
+        }
+        try std.testing.expectEqual(statistic, @as([8]usize, @splat(100)));
+    }
+    wait_group.wait();
 }
 
 test MpscChannel {
@@ -189,10 +255,21 @@ test MpscChannel {
     const Producer = struct {
         fn task(channel: *Channel, id: u8) void {
             var cache = channel.mpsc_queue_ref.initProducerLocal();
-            for (0..100) |_| {
-                const ticket, const item_ref = channel.claimProduce(&cache, null);
-                defer channel.publishProducedUnsafe(ticket);
-                item_ref.* = .{ .data = @splat(id) };
+            if (id % 2 == 0) {
+                for (0..100) |_| {
+                    const ticket, const item_ref = channel.claimProduce(&cache, null);
+                    defer channel.publishProducedUnsafe(ticket);
+                    item_ref.* = .{ .data = @splat(id) };
+                }
+            } else {
+                for (0..4) |_| {
+                    var tickets = channel.claimProduceMultipleExact(25, &cache, null);
+                    while (channel.mpsc_queue_ref.nextProduceTicket(&tickets)) |lease| {
+                        const ticket, const item_ref = lease;
+                        defer channel.publishProducedUnsafe(ticket);
+                        item_ref.* = .{ .data = @splat(id) };
+                    }
+                }
             }
         }
     };
