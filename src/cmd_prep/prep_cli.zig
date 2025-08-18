@@ -1,8 +1,8 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const Runner = @import("../cli.zig").Runner;
-const c = @import("../c.zig").c;
-const diag = @import("../diagnostics.zig");
+const Runner = @import("gvca").cli.Runner;
+const c = @import("gvca").c_helper.c;
+const diag = @import("gvca").diag;
 pub const PrepRunner = struct {
     global: Runner.Global,
     bare_repo_path: [:0]u8,

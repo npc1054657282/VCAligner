@@ -1,7 +1,10 @@
+const gvca = @import("gvca.zig");
 const std = @import("std");
 const zargs = @import("zargs");
-const diag = @import("diagnostics.zig");
-const c_helper = @import("c.zig");
+pub const cli = @import("cli.zig");
+pub const diag = @import("diagnostics.zig");
+pub const c_helper = @import("c.zig");
+pub const MpscChannel = @import("mpsc_channel.zig").MpscChannel;
 
 pub fn main() !void {
     // 使用c分配器的原因：
@@ -13,10 +16,14 @@ pub fn main() !void {
     const diagnostics_arena = std.heap.ArenaAllocator.init(root_allocator);
     defer diagnostics_arena.deinit();
     var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
-    var runner = try @import("cli.zig").parseArgs(root_allocator);
+    var runner = try cli.parseArgs(root_allocator);
     defer runner.deinit(root_allocator);
     runner.run(root_allocator, &diagnostics.last_diagnostic) catch |err| {
         diagnostics.log_all(err);
         diagnostics.clear();
     };
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

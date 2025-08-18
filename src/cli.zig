@@ -57,7 +57,7 @@ pub const Runner = union(enum) {
 pub fn parseArgs(allocator: std.mem.Allocator) !Runner {
     const cmd = Runner.cmd;
     const args = cmd.parse(allocator) catch |e|
-        zargs.exitf(e, 1, "\n{s}\n", .{cmd.usage()});
+        zargs.exitf(e, 1, "\n{s}\n", .{cmd.usageString()});
     defer cmd.destroy(&args, allocator);
     var runner: Runner = undefined;
     runner = try Runner.initFromArgs(args, allocator);

@@ -1,5 +1,6 @@
 const std = @import("std");
-const c = @import("c.zig").c;
+const c_helper = @import("c.zig");
+const c = c_helper.c;
 
 pub const Diagnostics = struct {
     arena: std.heap.ArenaAllocator,
@@ -31,8 +32,8 @@ pub const Diagnostics = struct {
 };
 
 pub const Diagnostic = union {
-    DiagnosticGIT_ERROR: @import("c.zig").DiagnosticGIT_ERROR,
-    DiagnosticUnknownCError: @import("c.zig").DiagnosticUnknownCError,
+    DiagnosticGIT_ERROR: c_helper.DiagnosticGIT_ERROR,
+    DiagnosticUnknownCError: c_helper.DiagnosticUnknownCError,
     pub fn enterStack(last_diagnostic: *@This(), last_error: anyerror) !void {
         var diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
         if (diagnostics.double_error != null) {

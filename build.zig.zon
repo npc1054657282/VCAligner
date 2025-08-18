@@ -37,8 +37,8 @@
     // internet connectivity.
     .dependencies = .{
         .zargs = .{
-            .url = "git+https://github.com/kioz-wang/zargs#ff6152d6d52e666b38862b4efa2ceccde79b2f8f",
-            .hash = "zargs-0.14.7-tqzWbpCECADLwQq4zJclQnOqA-r9JtHsx5QIgQBb0stI",
+            .url = "git+https://github.com/kioz-wang/zargs#a2dee76a23de1557c4d11984dae52ac3fcbaad5b",
+            .hash = "zargs-0.14.8-tqzWbrYcCQB8mqGEKJp-HekEi_p4-tdjFyCjpJsvfG3p",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md", "xmake.lua", "xmake_modules", ".gitignore" },

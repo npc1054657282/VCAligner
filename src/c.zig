@@ -17,6 +17,7 @@ test "rocksdb test" {
 pub const Libgit2Error = error{ GIT_ERROR, GIT_ENOTFOUND, GIT_EEXISTS, GIT_EAMBIGUOUS, GIT_EBUFS, GIT_EUSER, GIT_EBAREREPO, GIT_EUNBORNBRANCH, GIT_EUNMERGED, GIT_ENONFASTFORWARD, GIT_EINVALIDSPEC, GIT_ECONFLICT, GIT_ELOCKED, GIT_EMODIFIED, GIT_EAUTH, GIT_ECERTIFICATE, GIT_EAPPLIED, GIT_EPEEL, GIT_EEOF, GIT_EINVALID, GIT_EUNCOMMITTED, GIT_EDIRECTORY, GIT_EMERGECONFLICT, GIT_PASSTHROUGH, GIT_ITEROVER, GIT_RETRY, GIT_EMISMATCH, GIT_EINDEXDIRTY, GIT_EAPPLYFAIL, GIT_EOWNER, GIT_TIMEOUT, GIT_EUNCHANGED, GIT_ENOTSUPPORTED, GIT_EREADONLY, UnknownCError };
 
 // 我能想到的一种可能的处理方法是：编译时遍历`Libgit2Error`的错误名，然后用`@field`访问其声明，分别与`git_error_code`进行比较。
+// 但是，即使遍历得到了匹配的错误名，但依旧没有任何办法直接得到错误。因此，目前手工制作该表是唯一解。
 pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic) Libgit2Error!void {
     return switch (git_error_code) {
         c.GIT_OK => return,

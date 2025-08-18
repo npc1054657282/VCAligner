@@ -28,18 +28,7 @@ rule("zig.build")
         config_editor:save()
         -- 设置testArgs参数
         local vscsetting_editor = import("xmake_modules.jsonc")(".vscode/settings.json")
-        local zig_test_args = {"test", "--test-filter", "${filter}", "${path}"}
-        for _, dir in ipairs(includedirs) do
-            table.join2(zig_test_args, "-I" .. dir)
-        end
-        for _, dir in ipairs(linkdirs) do
-            table.join2(zig_test_args, "-L" .. dir)
-        end
-        for _, link in ipairs(syslinks) do
-            table.join2(zig_test_args, "-l" .. link)
-        end
-        table.join2(zig_test_args, "-lc")
-        table.join2(zig_test_args, "-lc++")
+        local zig_test_args = {"build", "test", "-Dtest_filter=${filter}"}
         vscsetting_editor:set("zig.testArgs", jsonc.array(zig_test_args))
         vscsetting_editor:save()
     end)
