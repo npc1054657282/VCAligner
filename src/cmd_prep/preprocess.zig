@@ -1,8 +1,16 @@
 const std = @import("std");
 const c_helper = @import("gvca").c_helper;
 const c = c_helper.c;
-const PrepRunner = @import("prep_cli.zig").PrepRunner;
+const PrepRunner = @import("PrepRunner.zig");
 const diag = @import("gvca").diag;
+const mpsc_queue = @import("mpsc_queue");
+const MpscChannel = @import("gvca").MpscChannel;
+
+pub const Parsed = struct {
+    pad: [72]u8,
+};
+pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
+pub const Channel = MpscChannel(Queue);
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
@@ -27,7 +35,20 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     std.debug.print("repo-id: {s}", .{ctx.repo_id});
     // rocksdb的使用方案[参见](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ)。
     // 采用多线程解析，单线程写入的模型。解析线程同样涉及odb的I/O读取，并不是纯cpu工作，所以恐怕不会比写入的I/O慢。
-    // 先创建写线程。
+    const queue = try Queue.init(allocator, ctx.task_queue_capacity_log2);
+    defer queue.deinit(allocator);
+    var channel: Channel = .{ .mpsc_queue_ref = queue };
+    // 创建写线程。
+    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{&channel});
+    // 创建解析线程池：
+    var parser_pool: std.Thread.Pool = undefined;
+    try parser_pool.init(.{ .allocator = allocator, .n_jobs = ctx.n_jobs });
+    defer parser_pool.deinit();
+    var wait_group: std.Thread.WaitGroup = .{};
+
+    wait_group.wait();
+    channel.notifyConsumerDone();
+    writer.join();
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。
@@ -96,19 +117,19 @@ pub fn getRepoId(repo: *c.git_repository, allocator: std.mem.Allocator, last_dia
         }
     }
     // 消除尾部的斜杠，但不能消除第一个斜杠。
-    url = trim_tail_slash_blk: {
+    url = trim_tail_slash: {
         var end = url.len;
         while ((if (i_slash != null) end - 1 > i_slash.? else true) and url[end - 1] == '/') : (end -= 1) {}
-        break :trim_tail_slash_blk url[0..end];
+        break :trim_tail_slash url[0..end];
     };
     if (std.mem.endsWith(u8, url, ".git")) {
         url = url[0 .. url.len - ".git".len];
     }
     // 再来一次，消除尾部的斜杠，但不能消除第一个斜杠。
-    url = trim_tail_slash_blk: {
+    url = trim_tail_slash: {
         var end = url.len;
         while ((if (i_slash != null) end - 1 > i_slash.? else true) and url[end - 1] == '/') : (end -= 1) {}
-        break :trim_tail_slash_blk url[0..end];
+        break :trim_tail_slash url[0..end];
     };
     try building_ret.appendSlice(allocator, url);
     return try building_ret.toOwnedSliceSentinel(allocator, 0);

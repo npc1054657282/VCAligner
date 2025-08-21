@@ -192,12 +192,12 @@ fn throw(i: u8) !u8 {
 
 test status_machine {
     var i: u8 = 4;
-    const result = throw(i) catch result_blk: {
+    const result = throw(i) catch result: {
         sw: switch (status_machine(&i)) {
-            false => break :result_blk throw(i) catch continue :sw status_machine(&i),
+            false => break :result throw(i) catch continue :sw status_machine(&i),
             true => break :sw,
         }
-        break :result_blk 100;
+        break :result 100;
     };
     std.debug.print("{d}", .{result});
 }

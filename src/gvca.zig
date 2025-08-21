@@ -16,9 +16,9 @@ pub fn main() !void {
     const diagnostics_arena = std.heap.ArenaAllocator.init(root_allocator);
     defer diagnostics_arena.deinit();
     var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
-    var runner = try cli.parseArgs(root_allocator);
-    defer runner.deinit(root_allocator);
-    runner.run(root_allocator, &diagnostics.last_diagnostic) catch |err| {
+    var cli_runner = try cli.parseArgs(root_allocator);
+    defer cli_runner.deinit(root_allocator);
+    cli_runner.run(root_allocator, &diagnostics.last_diagnostic) catch |err| {
         diagnostics.log_all(err);
         diagnostics.clear();
     };

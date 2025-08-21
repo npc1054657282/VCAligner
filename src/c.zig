@@ -21,9 +21,9 @@ pub const Libgit2Error = error{ GIT_ERROR, GIT_ENOTFOUND, GIT_EEXISTS, GIT_EAMBI
 pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic) Libgit2Error!void {
     return switch (git_error_code) {
         c.GIT_OK => return,
-        c.GIT_ERROR => git_error_blk: {
+        c.GIT_ERROR => blk: {
             last_diag.* = .{ .DiagnosticGIT_ERROR = DiagnosticGIT_ERROR.init() };
-            break :git_error_blk Libgit2Error.GIT_ERROR;
+            break :blk Libgit2Error.GIT_ERROR;
         },
         c.GIT_ENOTFOUND => Libgit2Error.GIT_ENOTFOUND,
         c.GIT_EEXISTS => Libgit2Error.GIT_EEXISTS,
@@ -58,9 +58,9 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic
         c.GIT_EUNCHANGED => Libgit2Error.GIT_EUNCHANGED,
         c.GIT_ENOTSUPPORTED => Libgit2Error.GIT_ENOTSUPPORTED,
         c.GIT_EREADONLY => Libgit2Error.GIT_EREADONLY,
-        else => unknown_error_blk: {
+        else => blk: {
             last_diag.* = .{ .DiagnosticUnknownCError = .{ .code = git_error_code } };
-            break :unknown_error_blk Libgit2Error.UnknownCError;
+            break :blk Libgit2Error.UnknownCError;
         },
     };
 }

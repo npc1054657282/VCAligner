@@ -28,6 +28,9 @@ fn local_cache(comptime Sequence: type) type {
 
 // 设置ticket.Produce与ticket.Consume两个本质相同的概念。
 // 将它们隔离开可以阻止生产者调用消费者的api，以及阻止消费者调用生产者的api。
+// 实际上，使用`enum(Sequence) {_}`可以很好地将一个整数包装为独有类型。
+// 但是，此处利用了结构体的优势，可以在安全检查模式下偷偷往里面塞本地cache，
+// 如此，这样可以在不在非安全模式检查的函数签名里添加额外的参数。
 fn ticket(comptime Sequence: type) type {
     const ProducerLocal = local_cache(Sequence).Producer;
     const ConsumerLocal = local_cache(Sequence).Consumer;
@@ -354,7 +357,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             var cache_produce_cursor = self.produce_cursor_to_claim.load(.monotonic);
             var cas_result: ?Sequence = undefined;
             var new_produce_cursor: Sequence = undefined;
-            while (do_blk: {
+            while (do: {
                 // 缓存的`consume_cursor`与新获取的`produce_cursor`判定非满，则一定非满。
                 // 否则，读取`consume_cursor`，如果仍然判定满，才是满。
                 if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) == 0) {
@@ -366,7 +369,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 // 此处内存序`acquire`即可，claim阶段没有需要发布给consumer的数据。
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
-                break :do_blk cas_result != null;
+                break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
             }
@@ -385,7 +388,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             var cas_result: ?Sequence = undefined;
             var new_produce_cursor: Sequence = undefined;
             var actual_count: usize = undefined;
-            while (do_blk: {
+            while (do: {
                 // 先检查最乐观情况：基于消费者的旧缓存，也能确认足以承载所有请求生产量的情况。
                 if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) < count) {
                     // 若不是最乐观情况，更新消费者旧缓存，重新检查余量。
@@ -396,7 +399,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 new_produce_cursor = cache_produce_cursor +% actual_count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
-                break :do_blk cas_result != null;
+                break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
             }
@@ -413,7 +416,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             var cache_produce_cursor = self.produce_cursor_to_claim.load(.monotonic);
             var cas_result: ?Sequence = undefined;
             var new_produce_cursor: Sequence = undefined;
-            while (do_blk: {
+            while (do: {
                 // 先检查最乐观情况：基于消费者的旧缓存，也能确认足以承载所有请求生产量的情况。
                 if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) < count) {
                     // 若不是最乐观情况，更新消费者旧缓存，重新检查余量。
@@ -425,7 +428,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 new_produce_cursor = cache_produce_cursor +% count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
                 cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
-                break :do_blk cas_result != null;
+                break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
             }

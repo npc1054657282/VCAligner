@@ -2,8 +2,8 @@ const std = @import("std");
 const zargs = @import("zargs");
 const diag = @import("diagnostics.zig");
 pub const Runner = union(enum) {
-    prep: @import("cmd_prep/prep_cli.zig").PrepRunner,
-    const cmd = cmd_blk: {
+    prep: @import("cmd_prep/PrepRunner.zig"),
+    const cmd = blk: {
         var building_cmd = zargs.Command.new("gvca").requireSub("sub")
             .about("git version commit aligner")
             .version("0.0.0")
@@ -11,7 +11,7 @@ pub const Runner = union(enum) {
         for (@typeInfo(Runner).@"union".fields) |field| {
             building_cmd = building_cmd.sub(field.type.cmd);
         }
-        break :cmd_blk building_cmd;
+        break :blk building_cmd;
     };
     pub const Global = struct {
         verbose: bool,
