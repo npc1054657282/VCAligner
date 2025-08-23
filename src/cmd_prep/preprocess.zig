@@ -3,14 +3,6 @@ const c_helper = @import("gvca").c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 const diag = @import("gvca").diag;
-const mpsc_queue = @import("mpsc_queue");
-const MpscChannel = @import("gvca").MpscChannel;
-
-pub const Parsed = struct {
-    pad: [72]u8,
-};
-pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
-pub const Channel = MpscChannel(Queue);
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
@@ -33,22 +25,55 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     ctx.repo_id = try getRepoId(ctx.repo, allocator, last_diag);
     defer allocator.free(ctx.repo_id);
     std.debug.print("repo-id: {s}", .{ctx.repo_id});
+    ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    defer {
+        ctx.commit_registry.table.deinit(ctx.commit_registry.arena.allocator());
+        ctx.commit_registry.arena.deinit();
+        ctx.commit_registry = undefined;
+    }
     // rocksdb的使用方案[参见](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ)。
     // 采用多线程解析，单线程写入的模型。解析线程同样涉及odb的I/O读取，并不是纯cpu工作，所以恐怕不会比写入的I/O慢。
-    const queue = try Queue.init(allocator, ctx.task_queue_capacity_log2);
+    const queue = try PrepRunner.Queue.init(allocator, ctx.task_queue_capacity_log2);
     defer queue.deinit(allocator);
-    var channel: Channel = .{ .mpsc_queue_ref = queue };
+    ctx.channel = .{ .mpsc_queue_ref = queue };
+    defer ctx.channel = undefined;
     // 创建写线程。
-    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{&channel});
+    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{&ctx.channel});
+    defer writer.join();
     // 创建解析线程池：
-    var parser_pool: std.Thread.Pool = undefined;
-    try parser_pool.init(.{ .allocator = allocator, .n_jobs = ctx.n_jobs });
-    defer parser_pool.deinit();
-    var wait_group: std.Thread.WaitGroup = .{};
+    ctx.parsers = .{ .pool = undefined };
+    defer ctx.parsers = undefined;
+    try ctx.parsers.pool.init(.{ .allocator = allocator, .n_jobs = ctx.n_jobs });
+    defer ctx.parsers.pool.deinit();
+    defer {
+        ctx.parsers.wait_group.wait();
+        ctx.channel.notifyConsumerDone();
+    }
+    git_error_code = c.git_odb_foreach(ctx.odb, index_builder_cb, ctx);
+    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+}
 
-    wait_group.wait();
-    channel.notifyConsumerDone();
-    writer.join();
+fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) c_int {
+    var ctx: *PrepRunner = @alignCast(@ptrCast(payload.?));
+    const obj_type: c.git_object_t = blk: {
+        var obj: ?*c.git_odb_object = undefined;
+        const git_error_code = c.git_odb_read(&obj, ctx.odb, id);
+        defer c.git_odb_object_free(obj);
+        if (git_error_code != 0) return git_error_code;
+        break :blk c.git_odb_object_type(obj);
+    };
+    // 只处理commit对象
+    if (obj_type != c.GIT_OBJECT_COMMIT) return 0;
+    // 注意：遍历过程中，可能出现重复的对象。
+    // 参见<https://stackoverflow.com/questions/41050175/why-do-i-see-duplicate-object-ids-when-using-git-odb-foreach>。
+    // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
+    // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
+    if (ctx.commit_registry.table.contains(id.*)) return 0;
+    const commit_seq = ctx.commit_registry.next_commit_seq;
+    ctx.commit_registry.next_commit_seq += 1;
+    ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch std.process.abort();
+    ctx.parsers.pool.spawnWg(&ctx.parsers.wait_group, @import("parse.zig").task, .{ &ctx.channel, id.*, commit_seq });
+    return 0;
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。

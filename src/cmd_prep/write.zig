@@ -1,4 +1,4 @@
-const Channel = @import("preprocess.zig").Channel;
+const Channel = @import("PrepRunner.zig").Channel;
 
 pub fn task(channel: *Channel) void {
     var cache = channel.mpsc_queue_ref.initConsumerLocal();
