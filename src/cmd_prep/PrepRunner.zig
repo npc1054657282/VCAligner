@@ -19,6 +19,30 @@ task_queue_capacity_log2: u8,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
 repo_id: [:0]u8 = undefined,
+parsers: struct {
+    pool: std.Thread.Pool,
+    wait_group: std.Thread.WaitGroup,
+    lctxs: std.ArrayListAlignedUnmanaged(@import("parse.zig").Parsing, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
+    const Parsers = @This();
+    pub fn init(self: *Parsers, allocator: std.mem.Allocator, n_jobs: usize) !void {
+        try self.pool.init(.{ .allocator = allocator, .n_jobs = n_jobs, .track_ids = true });
+        self.wait_group = .{};
+        self.lctxs = .empty;
+        for (try self.lctxs.addManyAsSlice(allocator, n_jobs)) |*lctx| {
+            lctx.init();
+        }
+    }
+    pub fn deinit(self: *Parsers, allocator: std.mem.Allocator) void {
+        for (self.lctxs.items) |*lctx| {
+            lctx.deinit();
+        }
+        self.lctxs.deinit(allocator);
+        self.pool.deinit();
+        self.* = undefined;
+    }
+} = undefined,
+channel: Channel = undefined,
+// 下列内容是在各线程已经被创建后，主线程依旧会修改的可变内容，应缓存行对齐，以避免各线程读取上列对各线程而言的只读内容时遭遇伪共享。
 commit_registry: struct {
     // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
     // 目前还不知道有什么需要回溯插入顺序的地方，也暂时没想到迭代需求。如果未来有迭代需求，会考虑改用ArrayHashMap。
@@ -26,12 +50,7 @@ commit_registry: struct {
     table: std.AutoHashMapUnmanaged(c.git_oid, void) = .empty,
     arena: std.heap.ArenaAllocator,
     next_commit_seq: usize = 0, // 每个commit分配一个序列号，因为commit太长了，写入时使用序列号可以提升存储效率。
-} = undefined,
-parsers: struct {
-    pool: std.Thread.Pool,
-    wait_group: std.Thread.WaitGroup = .{},
-} = undefined,
-channel: Channel = undefined,
+} align(std.atomic.cache_line) = undefined,
 
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("repo_path", ?[]const u8).long("repo-path"))

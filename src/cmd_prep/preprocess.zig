@@ -37,17 +37,15 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer queue.deinit(allocator);
     ctx.channel = .{ .mpsc_queue_ref = queue };
     defer ctx.channel = undefined;
+    // 创建解析线程池。
+    try ctx.parsers.init(allocator, ctx.n_jobs);
+    defer ctx.parsers.deinit(allocator);
     // 创建写线程。
     var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{&ctx.channel});
-    defer writer.join();
-    // 创建解析线程池：
-    ctx.parsers = .{ .pool = undefined };
-    defer ctx.parsers = undefined;
-    try ctx.parsers.pool.init(.{ .allocator = allocator, .n_jobs = ctx.n_jobs });
-    defer ctx.parsers.pool.deinit();
     defer {
         ctx.parsers.wait_group.wait();
         ctx.channel.notifyConsumerDone();
+        writer.join();
     }
     git_error_code = c.git_odb_foreach(ctx.odb, index_builder_cb, ctx);
     try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -72,7 +70,9 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     const commit_seq = ctx.commit_registry.next_commit_seq;
     ctx.commit_registry.next_commit_seq += 1;
     ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch std.process.abort();
-    ctx.parsers.pool.spawnWg(&ctx.parsers.wait_group, @import("parse.zig").task, .{ &ctx.channel, id.*, commit_seq });
+    // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
+    // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
+    ctx.parsers.pool.spawnWgId(&ctx.parsers.wait_group, @import("parse.zig").task, .{ ctx, id.*, commit_seq });
     return 0;
 }
 

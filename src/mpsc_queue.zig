@@ -296,8 +296,10 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
         // 对于编译期泛型Slot，目前zig不支持对它设定整体的对齐。因此，只能通过设定它的第一个元素的对齐方式来设定整个结构体的对齐方式。
         // 理论上，如果有内存重排优化导致item不再是第一个元素，将导致极大内存浪费，若需要确保避免这一点，需要设定为`extern struct`。
         // 但是，这会带来极大的对外兼容困难。因此，只能信任编译器不会做愚蠢的优化。
+        // `_: void align(std.atomic.cache_line) = {},`学习自[SmpAllocator](https://github.com/ziglang/zig/blob/8e72a25285b5e782ee44828b6d1904d91fb16a29/lib/std/heap/SmpAllocator.zig#L59)
         const Slot = struct {
-            item: T align(std.atomic.cache_line),
+            _: void align(std.atomic.cache_line) = {},
+            item: T,
             // XXX: 另一种可能的实现是，available设计为写入值为ticket >> capacity_log2。
             // 消费者需要将`consumer_cursor >> capacity_log2`与available比较决定是否允许消费。
             // 这种实现可能对内存有更极致的压缩。在某些边缘场景，可以避免Slot浪费一个缓存行的大小。

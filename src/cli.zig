@@ -56,7 +56,7 @@ pub const Runner = union(enum) {
 // 因此，将它包装在一个函数里，将解析结果转化为一个执行器，这样这个解析结果的生命周期就可以在执行完以后提前结束了。
 pub fn parseArgs(allocator: std.mem.Allocator) !Runner {
     const cmd = Runner.cmd;
-    const args = cmd.parse(allocator) catch |e|
+    var args = cmd.parse(allocator) catch |e|
         zargs.exitf(e, 1, "\n{s}\n", .{cmd.usageString()});
     defer cmd.destroy(&args, allocator);
     var runner: Runner = undefined;

@@ -12,15 +12,16 @@ fn readBuildConfig(allocator: std.mem.Allocator) !BuildConfig {
     return parsed.value;
 }
 
-pub fn build(b: *std.Build) void {
-    const build_config = readBuildConfig(b.allocator) catch |err| {
-        std.debug.print("failed to parse `build_config.json`: {}\n", .{err});
-        std.process.exit(1);
-    };
-
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
+fn createGvcaModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *const BuildConfig,
+    comptime is_test: bool,
+) *std.Build.Module {
+    // 如果有可能需要导出的模块，利用`is_test`参数决定是创建导出模块还是创建匿名模块（若用于测试，则创建匿名模块）。
+    // 由于没有需要导出的模块，此参数未使用。
+    _ = is_test;
     const mpsc_queue_module = b.createModule(.{
         .root_source_file = b.path("src/mpsc_queue.zig"),
         .target = target,
@@ -32,7 +33,7 @@ pub fn build(b: *std.Build) void {
     mpsc_queue_options.addOption(?bool, "runtime_safety", null);
     mpsc_queue_module.addOptions("mpsc_queue_options", mpsc_queue_options);
 
-    const exe_module = b.createModule(.{
+    const gvca_module = b.createModule(.{
         .root_source_file = b.path("src/gvca.zig"),
         .target = target,
         .optimize = optimize,
@@ -40,23 +41,42 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
     });
     for (build_config.add_include_paths) |include_path| {
-        exe_module.addIncludePath(.{ .cwd_relative = include_path });
+        gvca_module.addIncludePath(.{ .cwd_relative = include_path });
     }
     for (build_config.add_library_paths) |library_path| {
-        exe_module.addLibraryPath(.{ .cwd_relative = library_path });
+        gvca_module.addLibraryPath(.{ .cwd_relative = library_path });
     }
     for (build_config.link_system_librarys) |system_library| {
-        exe_module.linkSystemLibrary(system_library, .{});
+        gvca_module.linkSystemLibrary(system_library, .{});
     }
 
-    exe_module.addImport("gvca", exe_module);
+    gvca_module.addImport("gvca", gvca_module);
 
-    exe_module.addImport("mpsc_queue", mpsc_queue_module);
+    gvca_module.addImport("mpsc_queue", mpsc_queue_module);
 
-    exe_module.addImport("zargs", b.dependency("zargs", .{
+    gvca_module.addImport("zargs", b.dependency("zargs", .{
         .target = target,
         .optimize = optimize,
     }).module("zargs"));
+    return gvca_module;
+}
+
+pub fn build(b: *std.Build) void {
+    const build_config = readBuildConfig(b.allocator) catch |err| {
+        std.debug.print("failed to parse `build_config.json`: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe_module = createGvcaModule(
+        b,
+        target,
+        optimize,
+        &build_config,
+        false,
+    );
 
     const exe = b.addExecutable(.{
         .name = "gvca",
@@ -96,8 +116,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     for (test_targets) |test_target| {
         const unit_tests = b.addTest(.{
-            .root_module = exe_module,
-            .target = b.resolveTargetQuery(test_target),
+            .root_module = createGvcaModule(
+                b,
+                b.resolveTargetQuery(test_target),
+                optimize,
+                &build_config,
+                true,
+            ),
             .filters = test_filters,
         });
 

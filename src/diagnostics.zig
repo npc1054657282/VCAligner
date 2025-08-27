@@ -27,6 +27,9 @@ pub const Diagnostics = struct {
             while (it.nextPtr()) |item| {
                 item.diagnostic.log(item.code);
             }
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpStackTrace(trace.*);
+            }
         } else return;
     }
 };
