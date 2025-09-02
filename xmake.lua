@@ -5,7 +5,7 @@ set_policy("check.target_package_licenses", false)
 set_toolchains("@zig")
 
 add_requires("libgit2 v1.9.1")
-add_requires("rocksdb v10.0.1")
+add_requires("rocksdb v10.5.1")
 
 rule("zig.build")
     on_config(function (target)

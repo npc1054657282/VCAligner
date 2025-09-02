@@ -24,3 +24,6 @@ tags
 
 # auto-gen build config
 build_config.json
+
+# temp files
+tmp/

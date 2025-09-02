@@ -4,6 +4,13 @@ const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 const diag = @import("gvca").diag;
 
+// 由于std.Thread.Pool中，`Runnable`和`RunProto`未公开，因此拷贝其构造。
+const Runnable = struct {
+    runFn: RunProto,
+    node: std.SinglyLinkedList.Node = .{},
+};
+const RunProto = *const fn (*Runnable, id: ?usize) void;
+
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
     var git_error_code = c.git_libgit2_init();
@@ -11,19 +18,38 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer {
         git_error_code = c.git_libgit2_shutdown();
         const tmp_diagnostics_arena = std.heap.ArenaAllocator.init(allocator);
+        defer tmp_diagnostics_arena.deinit();
         var tmp_diagnostics: diag.Diagnostics = .{ .arena = tmp_diagnostics_arena };
         c_helper.gitErrorCodeToZigError(git_error_code, &tmp_diagnostics.last_diagnostic) catch |err| tmp_diagnostics.log_all(err);
-        tmp_diagnostics_arena.deinit();
     }
-    git_error_code = c.git_repository_open_bare(@ptrCast(&ctx.repo), ctx.bare_repo_path.ptr);
-    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-    defer c.git_repository_free(ctx.repo);
-    git_error_code = c.git_repository_odb(@ptrCast(&ctx.odb), ctx.repo);
+    ctx.repo = blk: {
+        var repo: ?*c.git_repository = undefined;
+        git_error_code = c.git_repository_open_bare(&repo, ctx.bare_repo_path.ptr);
+        try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+        break :blk repo.?;
+    };
+    defer {
+        c.git_repository_free(ctx.repo);
+        ctx.repo = undefined;
+    }
+    ctx.odb = blk: {
+        var odb: ?*c.git_odb = undefined;
+        git_error_code = c.git_repository_odb(&odb, ctx.repo);
+        try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+        break :blk odb.?;
+    };
+    defer {
+        c.git_odb_free(ctx.odb);
+        ctx.odb = undefined;
+    }
     // oidtype标识仓库的hash是SHA1还是SHA256。
     const oidtype = c.git_repository_oid_type(ctx.repo);
     _ = oidtype;
     ctx.repo_id = try getRepoId(ctx.repo, allocator, last_diag);
-    defer allocator.free(ctx.repo_id);
+    defer {
+        allocator.free(ctx.repo_id);
+        ctx.repo_id = undefined;
+    }
     std.debug.print("repo-id: {s}", .{ctx.repo_id});
     ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     defer {
@@ -38,12 +64,12 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     ctx.channel = .{ .mpsc_queue_ref = queue };
     defer ctx.channel = undefined;
     // 创建解析线程池。
-    try ctx.parsers.init(allocator, ctx.n_jobs);
+    try ctx.parsers.init(allocator, ctx.n_parserjobs);
     defer ctx.parsers.deinit(allocator);
     // 创建写线程。
-    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{&ctx.channel});
+    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{ctx});
     defer {
-        ctx.parsers.wait_group.wait();
+        ctx.parsers.pool.waitAndWork(&ctx.parsers.wait_group);
         ctx.channel.notifyConsumerDone();
         writer.join();
     }
@@ -52,12 +78,12 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
 }
 
 fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) c_int {
-    var ctx: *PrepRunner = @alignCast(@ptrCast(payload.?));
+    var ctx: *PrepRunner = @ptrCast(@alignCast(payload.?));
     const obj_type: c.git_object_t = blk: {
         var obj: ?*c.git_odb_object = undefined;
-        const git_error_code = c.git_odb_read(&obj, ctx.odb, id);
-        defer c.git_odb_object_free(obj);
+        const git_error_code = c.git_odb_read(@as([*c]?*c.git_odb_object, &obj), ctx.odb, id);
         if (git_error_code != 0) return git_error_code;
+        defer c.git_odb_object_free(obj);
         break :blk c.git_odb_object_type(obj);
     };
     // 只处理commit对象
@@ -70,6 +96,17 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     const commit_seq = ctx.commit_registry.next_commit_seq;
     ctx.commit_registry.next_commit_seq += 1;
     ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch std.process.abort();
+    // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
+    const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);
+    if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
+        const run_node = blk: {
+            ctx.parsers.pool.mutex.lock();
+            defer ctx.parsers.pool.mutex.unlock();
+            break :blk ctx.parsers.pool.run_queue.popFirst() orelse break :help_do_work;
+        };
+        const runnable: *Runnable = @fieldParentPtr("node", run_node);
+        runnable.runFn(runnable, 0);
+    }
     // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
     // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
     ctx.parsers.pool.spawnWgId(&ctx.parsers.wait_group, @import("parse.zig").task, .{ ctx, id.*, commit_seq });

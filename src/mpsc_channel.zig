@@ -37,7 +37,7 @@ pub fn MpscChannel(MpscQueue: type) type {
         const ProducerSyncBlock = struct {
             // `num_producer_waiting`是普通生产等待与强制批量生产等待之和。一旦存在强制批量生产，必须为broadcast而非signal。
             num_producer_waiting: std.atomic.Value(usize) = .init(0),
-            // 批量生产者每当唤醒重新竞标此最小值。
+            // 批量生产者每当唤醒后陷入等待时重新竞标此最小值。
             smallest_batch_size: usize = ~@as(usize, 0),
             vacancy_avail_cond: std.Thread.Condition = .{},
             vacancy_sufficient_cond: std.Thread.Condition = .{},
