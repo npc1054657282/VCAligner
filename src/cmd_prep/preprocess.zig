@@ -63,8 +63,8 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer queue.deinit(allocator);
     ctx.channel = .{ .mpsc_queue_ref = queue };
     defer ctx.channel = undefined;
-    // 创建解析线程池。
-    try ctx.parsers.init(allocator, ctx.n_parserjobs);
+    // 创建解析线程池。需要为主线程和写线程各预留1个线程数量。rocksdb的后台flush线程为I/O密集线程，不需要预留。
+    try ctx.parsers.init(allocator, ctx.n_jobs - 2);
     defer ctx.parsers.deinit(allocator);
     // 创建写线程。
     var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{ctx});
@@ -139,7 +139,7 @@ pub fn getRepoId(repo: *c.git_repository, allocator: std.mem.Allocator, last_dia
     } else null;
     // 跳过协议后，无字符是非法的。
     if (url.len == 0) return error.GitRepoInvalidUrl;
-    var building_ret: std.ArrayListUnmanaged(u8) = .empty;
+    var building_ret: std.ArrayList(u8) = .empty;
     errdefer building_ret.deinit(allocator);
     // 斜杠位置为关键，需动态调整。冒号和@位置仅用于粗处理内部检查。
     var i_slash = std.mem.indexOfScalar(u8, url, '/');

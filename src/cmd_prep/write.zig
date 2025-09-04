@@ -2,65 +2,123 @@ const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
 const c = @import("gvca").c_helper.c;
 
+const PathRegistry = struct {
+    // ArrayHashMap提供排序功能，应当使用它
+    table: std.StringArrayHashMap(struct {
+        // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
+        index: usize,
+        // 在写入过程中不记录此值。在全部写入完毕以后，遍历一遍所有的key统计此值。最后排序的依据。
+        // XXX: 在内存中为每个path都记录一个它的blob的hashmap。怀疑其可行性，宁肯全部写入完毕以后再遍历rocksdb数据库。
+        blob_cnt: usize,
+    }),
+};
+
 pub fn task(ctx: *PrepRunner) void {
     // 写线程本地分配器。都是c分配器。
     const allocator = std.heap.c_allocator;
-    // rocksdb相关对象创建的C API内部是`new`，走的C++异常机制，不会把错误结果传播，因此判空无意义。
-    const db_options = c.rocksdb_options_create().?;
-    defer c.rocksdb_options_destroy(db_options);
-    if (ctx.n_rocksdbjobs) |n_rocksdbjobs| {
-        c.rocksdb_options_increase_parallelism(db_options, n_rocksdbjobs);
-    }
-    c.rocksdb_options_prepare_for_bulk_load(db_options);
-    c.rocksdb_options_set_create_if_missing(db_options, 1);
-    c.rocksdb_options_set_error_if_exists(db_options, 1); // 如果db已存在，报错。
-    // 默认列族以path-id为前缀。目前path-id设计为usize。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
-    const prefix = c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(usize)).?;
-    defer c.rocksdb_slicetransform_destroy(prefix);
-    c.rocksdb_options_set_prefix_extractor(db_options, prefix);
+
+    // 一个写线程本地的ArrayHashMap，
+
     // 默认列族需要merge operator，在后面追加commit。
     var merge_operator: FixedBinaryAppendMergeOperater = undefined;
     merge_operator.init(allocator);
     defer merge_operator.deinit();
-    c.rocksdb_options_set_merge_operator(db_options, merge_operator.op);
-    var err_cstr: ?[*:0]u8 = null;
-    const db = c.rocksdb_open(db_options, ctx.rocksdb_output, @ptrCast(&err_cstr)).?;
-    if (err_cstr) |ecstr| {
-        std.log.err("rocksdb create failed! {s}\n", .{std.mem.span(ecstr)});
-        std.process.abort();
-    }
+    // 默认列族以path-id为前缀。目前path-id设计为usize。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
+    const prefix = c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(usize)).?;
+    defer c.rocksdb_slicetransform_destroy(prefix);
+    // rocksdb相关对象创建的C API内部是`new`，走的C++异常机制，不会把错误结果传播，因此判空无意义。
+    // 数据库以及默认列族相关配置
+    const db_options = blk: {
+        const db_options = c.rocksdb_options_create();
+        c.rocksdb_options_set_create_if_missing(db_options, 1);
+        c.rocksdb_options_set_error_if_exists(db_options, 1); // 如果db已存在，报错。
+        // 设置最大环境线程储量。
+        c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_jobs));
+        // 目前仅单线程写入，获取一点微小的性能提升。注：因为全是merge操作，因此`inplace_update_support`无用，不予配置。
+        c.rocksdb_options_set_allow_concurrent_memtable_write(db_options, 0);
+
+        // 此配置为关键混合配置：同时影响数据库与默认列族的行为。
+        // FAQ说这个函数会使用vector memtable。如果是这样的话，对我这种乱序写入的场景就不适合了。
+        // 但是，所幸的是，看了[源码](https://github.com/facebook/rocksdb/blob/a34683bf543cc3eb151d08eeac00791862acd4d6/options/options.cc#L478-L519)
+        // 实际没有修改memtable使用类型的行为，仅仅是全部写入L0以及禁止自动压缩。这些行为都是我需要的，可以放心使用。
+        // 这个行为会设置`flush`线程为4。不用担心`flush`线程数影响parser等其他线程，因为这是I/O密集线程，不怎么影响计算线程。
+        c.rocksdb_options_prepare_for_bulk_load(db_options);
+
+        // 以下为默认列族相关配置
+        c.rocksdb_options_set_prefix_extractor(db_options, prefix);
+        c.rocksdb_options_set_merge_operator(db_options, merge_operator.op);
+        // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
+        // 但是，后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改数据库以及各默认列族的行为。
+        break :blk db_options.?;
+    };
+    defer c.rocksdb_options_destroy(db_options);
+
+    const db = blk: {
+        var err_cstr: ?[*:0]u8 = null;
+        const db = c.rocksdb_open(db_options, ctx.rocksdb_output, @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :blk db.?;
+    };
     defer c.rocksdb_close(db);
+
     // 默认列族：键是path_index-blob，值由多个commit_index组成，需要前缀提取器。
     const cf_pi_b_cis = c.rocksdb_get_default_column_family_handle(db).?;
     defer c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
-    // 为其它列族设置单独的默认配置（它们不需要前缀提取器）
-    const cf_options = c.rocksdb_options_create().?;
+
+    // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
+    const cf_options = blk: {
+        const cf_options = c.rocksdb_options_create();
+        c.rocksdb_options_prepare_for_bulk_load(cf_options);
+        break :blk cf_options.?;
+    };
     defer c.rocksdb_options_destroy(cf_options);
+
     // 键 commit_index - 值 commit 列族
-    const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr)).?;
-    if (err_cstr) |ecstr| {
-        std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-        std.process.abort();
-    }
+    const cf_ci_c = blk: {
+        var err_cstr: ?[*:0]u8 = null;
+        const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :blk cf_ci_c.?;
+    };
     defer c.rocksdb_column_family_handle_destroy(cf_ci_c);
+
     // 键 path_index - 值 path 列族
-    const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr)).?;
-    if (err_cstr) |ecstr| {
-        std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-        std.process.abort();
-    }
+    const cf_pi_p = blk: {
+        var err_cstr: ?[*:0]u8 = null;
+        const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :blk cf_pi_p.?;
+    };
     defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
-    // 键 path_rank - 值 path_index 列族
-    const cf_pr_pi = c.rocksdb_create_column_family(db, cf_options, "pr2pi", @ptrCast(&err_cstr)).?;
-    if (err_cstr) |ecstr| {
-        std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-        std.process.abort();
-    }
+
+    // 键 path_rank - 值 path_index 列族。这个列族要多想想，前两个列族都适合直接通过sstfilewriter写入的，而这个或许不太一样？适合在最后单独写入。
+    // 暂时还是和其他列族共享相同的
+    const cf_pr_pi = blk: {
+        var err_cstr: ?[*:0]u8 = null;
+        const cf_pr_pi = c.rocksdb_create_column_family(db, cf_options, "pr2pi", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :blk cf_pr_pi.?;
+    };
     defer c.rocksdb_column_family_handle_destroy(cf_pr_pi);
 
-    const woptions = c.rocksdb_writeoptions_create().?;
+    const woptions = blk: {
+        const woptions = c.rocksdb_writeoptions_create();
+        c.rocksdb_writeoptions_disable_WAL(woptions, 1);
+        break :blk woptions.?;
+    };
     defer c.rocksdb_writeoptions_destroy(woptions);
-    c.rocksdb_writeoptions_disable_WAL(woptions, 1);
 
     const wb = c.rocksdb_writebatch_create().?;
     defer c.rocksdb_writebatch_destroy(wb);
@@ -77,6 +135,7 @@ const FixedBinaryAppendMergeOperater = struct {
     op: *c.rocksdb_mergeoperator_t,
     state: MemPools,
     const MemPools = struct {
+        failed: [0]u8, // 当失败的时候返回其指针。
         pool1: std.heap.MemoryPoolExtra([8]u8, .{}),
         pool2: std.heap.MemoryPoolExtra([16]u8, .{}),
         pool4: std.heap.MemoryPoolExtra([32]u8, .{}),
@@ -90,6 +149,7 @@ const FixedBinaryAppendMergeOperater = struct {
         allocator: std.mem.Allocator,
         fn init(allocator: std.mem.Allocator) MemPools {
             return .{
+                .failed = .{},
                 .pool1 = .init(allocator),
                 .pool2 = .init(allocator),
                 .pool4 = .init(allocator),
@@ -152,12 +212,13 @@ const FixedBinaryAppendMergeOperater = struct {
         self.* = .{
             .op = c.rocksdb_mergeoperator_create(
                 &self.state,
-                null,
+                // destructor可以是空操作，但是不能没有。
+                destructor,
                 fullMerge,
-                // 不设置部分合并。部分合并会增加多个小对象分配。完整对象栈的合并因为减少了内存分配量反而更高效。
-                // 但不确定部分合并有没有可能可以减少内存用量以提升效率。如果发现有此瓶颈可能考虑设置部分合并。
+                // 部分合并会增加多个小对象分配。完整对象栈的合并因为减少了内存分配量反而更高效。
+                // 但是`partialMerge`的实现是必须的，而且C API没有合理的部分合并失败策略，只能正常实现。
                 // [参考](https://github.com/johnzeng/rocksdb-doc-cn/blob/master/doc/Merge-Operator-Implementation.md#%E6%95%88%E7%8E%87%E7%9B%B8%E5%85%B3%E7%9A%84%E7%AC%94%E8%AE%B0)
-                null,
+                partialMerge,
                 deleteValue,
                 name,
             ).?,
@@ -194,7 +255,9 @@ const FixedBinaryAppendMergeOperater = struct {
         const result = mem_pools.create(total_length) catch {
             std.log.err("mem pool create failed! lotal length is {d}\n", .{total_length});
             success.* = 0;
-            return null;
+            new_value_length.* = 0;
+            // 分析C API源码发现merge失败时不会检查是否失败都会进行一次对`string`的赋值，如果返回`null`是未定义行为，于是借用state里的failed地址返回。
+            return &mem_pools.failed;
         };
 
         var offset: usize = 0;
@@ -212,7 +275,28 @@ const FixedBinaryAppendMergeOperater = struct {
         success.* = 1;
         return result.ptr;
     }
+    fn destructor(state: ?*anyopaque) callconv(.c) void {
+        _ = state;
+        return;
+    }
+    fn partialMerge(
+        state: ?*anyopaque,
+        key: [*c]const u8,
+        key_length: usize,
+        operands_list: [*c]const [*c]const u8,
+        operands_list_length: [*c]const usize,
+        num_operands: c_int,
+        success: [*c]u8,
+        new_value_length: [*c]usize,
+    ) callconv(.c) [*c]u8 {
+        // 1.根据C语言的源码，`partialMerge`是不可不实现的，不实现就出问题。
+        // 2.根据C语言源码，没有可靠的阻止`partialMerge`实现的失败策略，
+        // 因为我看相关注释，如果想要阻止`partialMerge`，要求不改变`new_value`且返回失败。而C API源码实现不论是否成败都一定更新`new_value`。
+        // 因此，只能尽可能让`partialMerge`成功，虽然每次这么做都需要一次大的内存拷贝，也属于无奈之举。
+        return fullMerge(state, key, key_length, null, 0, operands_list, operands_list_length, num_operands, success, new_value_length);
+    }
     fn deleteValue(state: ?*anyopaque, value: [*c]const u8, value_length: usize) callconv(.c) void {
+        if (value_length == 0) return;
         const mem_pools: *MemPools = @ptrCast(@alignCast(state.?));
         // 神秘API设计：`deleteValue`钩子居然要求是个`const`指针，差点让我以为我用错了。检察源码发现居然真就是这么用的。
         mem_pools.destroy(@constCast(value), value_length);

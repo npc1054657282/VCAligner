@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Diagnostics = struct {
     allocator: std.mem.Allocator,
-    error_stack: std.ArrayListUnmanaged(Error) = .empty,
+    error_stack: std.ArrayList(Error) = .empty,
     last_diagnostic: Diagnostic = .{ .empty = {} },
     double_error: ?anyerror = null,
     pub const Error = struct {

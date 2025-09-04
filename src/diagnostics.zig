@@ -4,7 +4,7 @@ const c = c_helper.c;
 
 pub const Diagnostics = struct {
     arena: std.heap.ArenaAllocator,
-    error_stack: std.ArrayListUnmanaged(Error) = .empty,
+    error_stack: std.ArrayList(Error) = .empty,
     last_diagnostic: Diagnostic = undefined,
     double_error: ?anyerror = null,
     pub const Error = struct {

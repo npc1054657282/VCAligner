@@ -6,8 +6,19 @@ const diag = @import("gvca").diag;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
 const MpscChannel = @import("gvca").MpscChannel;
+
 pub const Parsed = struct {
-    pad: [72]u8,
+    arena: std.heap.ArenaAllocator,
+    commit_hash: ?c.git_oid,
+    commit_seq: usize,
+    // 可能并非必要，因为已经在arena中分配？
+    // path_strings: std.ArrayList(u8),
+    parsed_units: std.ArrayList(ParsedUnit),
+
+    pub const ParsedUnit = struct {
+        path: []u8,
+        blob: c.git_oid,
+    };
 };
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
@@ -15,8 +26,8 @@ pub const Channel = MpscChannel(Queue);
 global: CliRunner.Global,
 bare_repo_path: [:0]u8,
 rocksdb_output: [:0]u8,
-n_parserjobs: usize,
-n_rocksdbjobs: ?c_int,
+// 指代计算密集型任务。rocksdb的flush多为I/O密集型任务，不在`n_jobs`考虑范围内
+n_jobs: usize,
 task_queue_capacity_log2: u5,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
@@ -62,15 +73,15 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path"))
     .arg(zargs.Arg.optArg("rocksdb_output", []const u8).long("rocksdb-output").short('o').default("./tmp/rocksdb-output"))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"))
-    .arg(zargs.Arg.optArg("parser_job_weight", u8).long("parser-job-weight").default(1).ranges(zargs.Ranges(u8).new().u(1, null)))
-    .arg(zargs.Arg.optArg("rocksdb_job_weight", u8).long("rocksdb-job-weight").default(0))
+    .arg(zargs.Arg.optArg("parser_job_weight", u8).long("parser-job-weight").default(3))
+    .arg(zargs.Arg.optArg("rocksdb_job_weight", u8).long("rocksdb-job-weight").default(1))
     .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(10).ranges(zargs.Ranges(u5).new().u(5, 20)));
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;
 }
 pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
-    var building_bare_repo_path: std.ArrayListUnmanaged(u8) = .empty;
+    var building_bare_repo_path: std.ArrayList(u8) = .empty;
     errdefer building_bare_repo_path.deinit(allocator);
     if (args.bare_repo_path) |bare_repo_path| {
         try building_bare_repo_path.appendSlice(allocator, bare_repo_path);
@@ -81,38 +92,17 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         std.log.err("Option `bare-repo-path` or `repo-path` is necessary.\n", .{});
         return CliRunner.Error.CliArgInvalidInput;
     }
-    // 需要预留至少3个线程：主线程，写入线程，rocksdb的至少一个默认的后台工作线程。
-    const assignable_jobs = (if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount()) -| 3;
-    if (assignable_jobs == 0) {
-        std.log.err("Option `jobs` must more than 3.\n", .{});
+    const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
+    // 在rocksdb那边最大线程数需要使用c整数输入。提前确保它不会溢出。
+    if (n_jobs > std.math.maxInt(c_int)) {
+        std.log.err("Option `jobs` is set unreasonably large.\n", .{});
         return error.CliArgInvalidInput;
     }
-    const n_parserjobs: usize = blk: {
-        const mul: usize, const overflow: u1 = @mulWithOverflow(assignable_jobs, args.parser_job_weight);
-        if (overflow == 1) {
-            std.log.err("Option `jobs` is set unreasonably large.\n", .{});
-            return error.CliArgInvalidInput;
-        }
-        break :blk try std.math.divCeil(usize, mul, args.parser_job_weight + args.rocksdb_job_weight);
-    };
-    const n_rocksdbjobs: ?c_int = blk: {
-        var n_rocksdbjobs: usize = assignable_jobs -| n_parserjobs;
-        // 如果结果为0，不设置`IncreaseParallelism`，采用默认值。否则，设置`IncreaseParallelism`，加上先前被预先减去的至少一个默认的后台工作线程。
-        if (n_rocksdbjobs > 0) {
-            n_rocksdbjobs +|= 1;
-        }
-        if (n_rocksdbjobs > std.math.maxInt(c_int)) {
-            std.log.err("Option `jobs` is set unreasonably large.\n", .{});
-            return error.CliArgInvalidInput;
-        }
-        break :blk if (n_rocksdbjobs == 0) null else @intCast(n_rocksdbjobs);
-    };
     return .{ .prep = .{
         .global = CliRunner.Global.initGlobal(args),
         .bare_repo_path = try building_bare_repo_path.toOwnedSliceSentinel(allocator, 0),
         .rocksdb_output = try std.mem.Allocator.dupeZ(allocator, u8, args.rocksdb_output),
-        .n_parserjobs = n_parserjobs,
-        .n_rocksdbjobs = n_rocksdbjobs,
+        .n_jobs = n_jobs,
         .task_queue_capacity_log2 = args.task_queue_capacity_log2,
     } };
 }
