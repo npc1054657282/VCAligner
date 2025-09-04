@@ -64,7 +64,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     ctx.channel = .{ .mpsc_queue_ref = queue };
     defer ctx.channel = undefined;
     // 创建解析线程池。需要为主线程和写线程各预留1个线程数量。rocksdb的后台flush线程为I/O密集线程，不需要预留。
-    try ctx.parsers.init(allocator, ctx.n_jobs - 2);
+    try ctx.parsers.init(allocator, ctx.n_jobs - 2, &ctx.channel);
     defer ctx.parsers.deinit(allocator);
     // 创建写线程。
     var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{ctx});
