@@ -355,7 +355,7 @@ const FixedBinaryAppendMergeOperater = struct {
                 @sizeOf(PrepRunner.CommitSeq) * 256 => self.pool256.destroy(@ptrCast(@alignCast(ptr))),
                 @sizeOf(PrepRunner.CommitSeq) * 512 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
                 @sizeOf(PrepRunner.CommitSeq) * 1024 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
-                else => self.allocator.free(ptr),
+                else => self.allocator.free(ptr[0..len]),
             }
         }
     };
@@ -450,7 +450,7 @@ const FixedBinaryAppendMergeOperater = struct {
         if (value_length == 0) return;
         const mem_pools: *MemPools = @ptrCast(@alignCast(state.?));
         // 神秘API设计：`deleteValue`钩子居然要求是个`const`指针，差点让我以为我用错了。检察源码发现居然真就是这么用的。
-        mem_pools.destroy(@constCast(value), value_length);
+        mem_pools.destroy(@constCast(value.?), value_length);
     }
     fn name(state: ?*anyopaque) callconv(.c) [*c]const u8 {
         _ = state;
