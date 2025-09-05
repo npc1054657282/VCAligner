@@ -170,6 +170,8 @@ pub fn task(ctx: *PrepRunner) void {
 
         // 如果`commit_hash`非空，写入一个commit id- commit对
         if (parsed.commit_hash) |*commit_hash| {
+            std.log.info("commit_seq: {d}\n", .{parsed.commit_seq.*});
+            std.log.info("commit_hash: {x}\n", .{commit_hash.id});
             c.rocksdb_writebatch_put_cf(
                 wb,
                 cf_ci_c,
@@ -186,27 +188,19 @@ pub fn task(ctx: *PrepRunner) void {
                 diagnostics.clear();
                 std.process.abort();
             };
-            // XXX: 总是使用`get_or_put_result.index`可以减少访存，在大部分已经存在的情况，减少访存是相当有利的。
-            // 但是，如果后续增加一些异步执行内容，例如提前排序，会导致此处的`index`不可靠。目前尚未添加异步执行内容，因此此处用这样的方案。
-            get_or_put_result.value_ptr.index = get_or_put_result.index;
             if (!get_or_put_result.found_existing) {
-
+                get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, get_or_put_result.index);
                 // 新的path id - path对，写入writebatch
-                const path_seq_ptr = parsed.arena.allocator().create(PathSeq) catch |err| {
-                    diagnostics.log_all(err);
-                    diagnostics.clear();
-                    std.process.abort();
-                };
-                path_seq_ptr.* = get_or_put_result.index;
+                parsed_unit.key.path_seq = get_or_put_result.value_ptr.index;
                 c.rocksdb_writebatch_put_cf(
                     wb,
                     cf_pi_p,
-                    @ptrCast(parsed_unit.path.ptr),
-                    parsed_unit.path.len,
                     @ptrCast(&parsed_unit.key.path_seq),
                     @sizeOf(PathSeq),
+                    @ptrCast(parsed_unit.path.ptr),
+                    parsed_unit.path.len,
                 );
-            }
+            } else parsed_unit.key.path_seq = get_or_put_result.value_ptr.index;
         }
         // 检查是否超出阈值。超出阈值立即写入memtable。
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
@@ -216,8 +210,8 @@ pub fn task(ctx: *PrepRunner) void {
                 std.process.abort();
             }
         }
-        // 批量写入默认列族
-        c.rocksdb_writebatch_putv_cf(
+        // 批量merge入默认列族
+        c.rocksdb_writebatch_mergev_cf(
             wb,
             cf_pi_b_cis,
             @intCast(parsed.keys_list.items.len),

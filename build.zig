@@ -39,6 +39,7 @@ fn createGvcaModule(
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .sanitize_c = .full,
     });
     for (build_config.add_include_paths) |include_path| {
         gvca_module.addIncludePath(.{ .cwd_relative = include_path });

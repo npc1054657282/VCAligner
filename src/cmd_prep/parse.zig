@@ -43,7 +43,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
 
     lctx.current_task = .{
         .arena = .init(allocator),
-        .commit_seq = commit_seq,
+        .commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, commit_seq),
     };
     defer lctx.current_task.arena.deinit();
     lctx.to_flush = .{
@@ -60,7 +60,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         lctx.diagnostics.clear();
         std.process.abort();
     };
-    lctx.to_flush.commit_seq.* = commit_seq;
+    lctx.to_flush.commit_seq.* = lctx.current_task.commit_seq;
     // 交由写者释放。
 
     const commit: *c.git_commit = blk: {
