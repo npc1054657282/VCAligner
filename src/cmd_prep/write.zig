@@ -1,7 +1,8 @@
 const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
-const c = @import("gvca").c_helper.c;
-const diag = @import("gvca").diag;
+const gvca = @import("gvca");
+const c = gvca.c_helper.c;
+const diag = gvca.diag;
 
 pub const write_batch_threshold = 512;
 // Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
@@ -21,7 +22,7 @@ const PathRegistry = struct {
 
 pub fn task(ctx: *PrepRunner) void {
     // 写线程本地分配器。都是c分配器。
-    const allocator = std.heap.c_allocator;
+    const allocator = gvca.getAllocator();
     const diagnostics_arena = std.heap.ArenaAllocator.init(allocator);
     defer diagnostics_arena.deinit();
     var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
@@ -32,12 +33,11 @@ pub fn task(ctx: *PrepRunner) void {
 
     // 默认列族需要merge operator，在后面追加commit。
     var err_cstr: ?[*:0]u8 = null;
-    var merge_operator: FixedBinaryAppendMergeOperater = undefined;
-    merge_operator.init(allocator);
-    defer merge_operator.deinit();
-    // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
-    const prefix = c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)).?;
-    defer c.rocksdb_slicetransform_destroy(prefix);
+    var merge_operator_state: FixedBinaryAppendMergeOperaterState = .init(allocator);
+    defer {
+        std.log.info("merge operator state deinit...\n", .{});
+        merge_operator_state.deinit();
+    }
     // rocksdb相关对象创建的C API内部是`new`，走的C++异常机制，不会把错误结果传播，因此判空无意义。
     // 数据库以及默认列族相关配置
     const db_options = blk: {
@@ -57,15 +57,22 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_options_prepare_for_bulk_load(db_options);
 
         // 以下为默认列族相关配置
-        c.rocksdb_options_set_prefix_extractor(db_options, prefix);
-        c.rocksdb_options_set_merge_operator(db_options, merge_operator.op);
+        // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
+        // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
+        // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
+        c.rocksdb_options_set_merge_operator(db_options, merge_operator_state.createFixedBinaryAppendMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
-        // 但是，后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改数据库以及各默认列族的行为。
+        // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
+        // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
         break :blk db_options.?;
     };
-    defer c.rocksdb_options_destroy(db_options);
+    defer {
+        std.log.info("db options destroy...\n", .{});
+        c.rocksdb_options_destroy(db_options);
+    }
 
-    const db = blk: {
+    var db = blk: {
         const db = c.rocksdb_open(db_options, ctx.rocksdb_output, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create failed! {s}\n", .{std.mem.span(ecstr)});
@@ -73,11 +80,17 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk db.?;
     };
-    defer c.rocksdb_close(db);
+    defer {
+        std.log.info("rocksdb close...\n", .{});
+        c.rocksdb_close(db);
+    }
 
     // 默认列族：键是path_index-blob，值由多个commit_index组成，需要前缀提取器。
-    const cf_pi_b_cis = c.rocksdb_get_default_column_family_handle(db).?;
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
+    var cf_pi_b_cis = c.rocksdb_get_default_column_family_handle(db).?;
+    defer {
+        std.log.info("default handle destroy...\n", .{});
+        c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
+    }
 
     // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
     // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
@@ -86,12 +99,15 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_options_prepare_for_bulk_load(cf_options);
         break :blk cf_options.?;
     };
-    defer c.rocksdb_options_destroy(cf_options);
+    defer {
+        std.log.info("cf options destroy...\n", .{});
+        c.rocksdb_options_destroy(cf_options);
+    }
 
     // 键 path_index - 值 path 列族
     // 由于path index 由本写者线程自己维护，因此这个列族一定可以确保有序写入，理论上完全可以通过sstfilewriter写入。
     // 不是主要性能问题来源，暂不考虑增加复杂度。
-    const cf_pi_p = blk: {
+    var cf_pi_p = blk: {
         const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
@@ -99,13 +115,16 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk cf_pi_p.?;
     };
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
+    defer {
+        std.log.info("pi2p handle destroy...\n", .{});
+        c.rocksdb_column_family_handle_destroy(cf_pi_p);
+    }
 
     // 键 commit_index - 值 commit 列族
     // 由于commit index由任务发布者线程创建，这个列族无法确保有序写入，除非在写本地线程重新维护一套seq方案而不使用任务发布者提出的方案。
     // XXX: 另一个方案是，和path rank一样，不在中途写入，而是由任务发布者保存seq，且在全部写入完毕后从任务发布者处接收并一次性写入。
     // 替代方案优化性能有限，暂不考虑。
-    const cf_ci_c = blk: {
+    var cf_ci_c = blk: {
         const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
@@ -113,33 +132,34 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk cf_ci_c.?;
     };
-    defer c.rocksdb_column_family_handle_destroy(cf_ci_c);
-
-    // 键 path_rank - 值 path_index 列族。
-    // 这个列族的键需要在全部写入完毕以后重新遍历获取，仅适合在最后单独写入。
-    const cf_pr_pi = blk: {
-        const cf_pr_pi = c.rocksdb_create_column_family(db, cf_options, "pr2pi", @ptrCast(&err_cstr));
-        if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-            std.process.abort();
-        }
-        break :blk cf_pr_pi.?;
-    };
-    defer c.rocksdb_column_family_handle_destroy(cf_pr_pi);
+    defer {
+        std.log.info("ci2c handle destroy...\n", .{});
+        c.rocksdb_column_family_handle_destroy(cf_ci_c);
+    }
 
     const woptions = blk: {
         const woptions = c.rocksdb_writeoptions_create();
         c.rocksdb_writeoptions_disable_WAL(woptions, 1);
         break :blk woptions.?;
     };
-    defer c.rocksdb_writeoptions_destroy(woptions);
+    defer {
+        std.log.info("write options destroy...\n", .{});
+        c.rocksdb_writeoptions_destroy(woptions);
+    }
 
     const wb = c.rocksdb_writebatch_create().?;
-    defer c.rocksdb_writebatch_destroy(wb);
+    defer {
+        std.log.info("writebatch destroy...\n", .{});
+        c.rocksdb_writebatch_destroy(wb);
+    }
 
     var consumer_local = ctx.channel.mpsc_queue_ref.initConsumerLocal();
     // 一个写线程本地的ArrayHashMap，
     var path_registry: PathRegistry = .{ .map = .empty, .arena = .init(allocator) };
+    defer {
+        path_registry.map.deinit(path_registry.arena.allocator());
+        path_registry.arena.deinit();
+    }
     // XXX: 如果阻塞，添加一些异步执行的内容，比如整理当前的path排序？若如此做，后续部分逻辑需要改动。
     while (ctx.channel.claimConsume(&consumer_local, null)) |lease| {
         const ticket, const parsed: *PrepRunner.Parsed = lease;
@@ -217,42 +237,85 @@ pub fn task(ctx: *PrepRunner) void {
         parsed.arena.deinit();
     } else |_| {}
     // 后处理：修改配置不再启用 prepare for bulk load
-    // 先确保全部刷新到磁盘。
+    // 先确保可能写入的列族全部刷新到磁盘。
     const foptions = c.rocksdb_flushoptions_create().?;
-    defer c.rocksdb_flushoptions_destroy(foptions);
-    c.rocksdb_flushoptions_set_wait(foptions, 1);
-    c.rocksdb_flush(db, foptions, @ptrCast(&err_cstr));
-    if (err_cstr) |ecstr| {
-        std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
-        std.process.abort();
+    defer {
+        std.log.info("flush options destroy...\n", .{});
+        c.rocksdb_flushoptions_destroy(foptions);
     }
-    set_options: {
-        const keys = [_][*:0]const u8{
-            "max_background_compactions",
-            "max_background_flushes",
+    c.rocksdb_flushoptions_set_wait(foptions, 1);
+    flush_all: {
+        var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
+            cf_pi_b_cis,
+            cf_pi_p,
+            cf_ci_c,
         };
-        var buf: [8]u8 = @splat(0);
-        const values = [_][*:0]const u8{
-            std.fmt.bufPrintZ(&buf, "{d}", .{ctx.n_jobs}) catch |err| {
-                diagnostics.log_all(err);
-                diagnostics.clear();
-                std.process.abort();
-            },
-            "1",
-        };
-        c.rocksdb_set_options(db, 2, @ptrCast(&keys), @ptrCast(&values), @ptrCast(&err_cstr));
+        c.rocksdb_flush_cfs(db, foptions, &column_family, column_family.len, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
-            std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
+            std.log.err("rocksdb flush failed! {s}\n", .{std.mem.span(ecstr)});
             std.process.abort();
         }
-        break :set_options;
+        break :flush_all;
     }
+    // 由于C API没有对`SetDbOptions`的支持，因此只得关闭数据库后，根据修改后的配置重新打开。
+    db, cf_pi_b_cis, cf_pi_p, cf_ci_c = reopen_db: {
+        c.rocksdb_options_set_max_background_compactions(db_options, @intCast(ctx.n_jobs));
+        c.rocksdb_options_set_max_background_flushes(db_options, 1);
+        c.rocksdb_options_set_create_if_missing(db_options, 0);
+        c.rocksdb_options_set_error_if_exists(db_options, 0);
+
+        c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
+        c.rocksdb_column_family_handle_destroy(cf_pi_p);
+        c.rocksdb_column_family_handle_destroy(cf_ci_c);
+        c.rocksdb_close(db);
+        const column_family_names = [_][*:0]const u8{
+            "default",
+            "pi2p",
+            "ci2c",
+        };
+        const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
+            db_options,
+            cf_options,
+            cf_options,
+        };
+        var column_family_handles: [column_family_names.len]?*c.rocksdb_column_family_handle_t = undefined;
+        // 其他列族已经不再需要，但是打开的时候必须打开所有列族，否则就报失败。
+        const new_db = c.rocksdb_open_column_families(
+            db_options,
+            ctx.rocksdb_output,
+            column_family_names.len,
+            @ptrCast(&column_family_names),
+            &column_family_options,
+            &column_family_handles,
+            @ptrCast(&err_cstr),
+        );
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb reopen failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :reopen_db .{ new_db.?, column_family_handles[0].?, column_family_handles[1].?, column_family_handles[2].? };
+    };
     // 触发手动compaction（整个数据库）
     const compact_options = c.rocksdb_compactoptions_create();
-    defer c.rocksdb_compactoptions_destroy(compact_options);
+    defer {
+        std.log.info("compact options destroy...\n", .{});
+        c.rocksdb_compactoptions_destroy(compact_options);
+    }
     c.rocksdb_compact_range_opt(db, compact_options, null, 0, null, 0);
     // 等待compaction完成
-    // 等待 Compaction 完成
+    // XXX: 如果不必重新打开数据库的话，此处可以配置压缩前刷写数据库，或许可以不再需要前面手动flush。不过现在说这个有些晚了。
+    const wait_for_compact_options = c.rocksdb_wait_for_compact_options_create().?;
+    defer {
+        std.log.info("wait for compact options destroy...\n", .{});
+        c.rocksdb_wait_for_compact_options_destroy(wait_for_compact_options);
+    }
+    c.rocksdb_wait_for_compact(db, wait_for_compact_options, @ptrCast(&err_cstr));
+    if (err_cstr) |ecstr| {
+        std.log.err("rocksdb wait for compact failed! {s}\n", .{std.mem.span(ecstr)});
+        std.process.abort();
+    }
+
+    // 另一种方案等待 Compaction 完成，为了保险起见，因为不熟悉`rocksdb_wait_for_compact`
     while (true) {
         var num_running: u64 = undefined;
         var err = c.rocksdb_property_int(db, "rocksdb.num-running-compactions", &num_running);
@@ -275,111 +338,118 @@ pub fn task(ctx: *PrepRunner) void {
         std.debug.print("Waiting for compaction: running={d}, pending={d}\n", .{ num_running, pending });
         std.Thread.sleep(10 * std.time.ns_per_s); // 等待 10s
     }
+    // 键 path_rank - 值 path_index 列族。
+    // 这个列族的键需要在全部写入完毕以后重新遍历获取，仅适合在最后单独写入。
+    const cf_pr_pi = blk: {
+        const cf_pr_pi = c.rocksdb_create_column_family(db, cf_options, "pr2pi", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.process.abort();
+        }
+        break :blk cf_pr_pi.?;
+    };
+    defer {
+        std.log.info("pr2pi handle destroy...\n", .{});
+        c.rocksdb_column_family_handle_destroy(cf_pr_pi);
+    }
+    std.log.info("Create pr2pi OK.\n", .{});
 }
 
-const FixedBinaryAppendMergeOperater = struct {
-    op: *c.rocksdb_mergeoperator_t,
-    state: MemPools,
-    const MemPools = struct {
-        failed: [0]u8, // 当失败的时候返回其指针。
-        pool1: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 1]u8, .{}),
-        pool2: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 2]u8, .{}),
-        pool4: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 4]u8, .{}),
-        pool8: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 8]u8, .{}),
-        pool16: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 16]u8, .{}),
-        pool32: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 32]u8, .{}),
-        pool64: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 64]u8, .{}),
-        pool128: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 128]u8, .{}),
-        pool256: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 256]u8, .{}),
-        pool512: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 512]u8, .{}),
-        pool1024: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 1024]u8, .{}),
-        allocator: std.mem.Allocator,
-        fn init(allocator: std.mem.Allocator) MemPools {
-            return .{
-                .failed = .{},
-                .pool1 = .init(allocator),
-                .pool2 = .init(allocator),
-                .pool4 = .init(allocator),
-                .pool8 = .init(allocator),
-                .pool16 = .init(allocator),
-                .pool32 = .init(allocator),
-                .pool64 = .init(allocator),
-                .pool128 = .init(allocator),
-                .pool256 = .init(allocator),
-                .pool512 = .init(allocator),
-                .pool1024 = .init(allocator),
-                .allocator = allocator,
-            };
-        }
-        fn deinit(self: *MemPools) void {
-            self.pool1.deinit();
-            self.pool2.deinit();
-            self.pool4.deinit();
-            self.pool8.deinit();
-            self.pool16.deinit();
-            self.pool32.deinit();
-            self.pool64.deinit();
-            self.pool128.deinit();
-            self.pool256.deinit();
-            self.pool512.deinit();
-            self.pool1024.deinit();
-        }
-        fn create(self: *MemPools, len: usize) ![]u8 {
-            const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
-            return switch (fitlen) {
-                @sizeOf(PrepRunner.CommitSeq) * 1 => try self.pool1.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 2 => try self.pool2.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 4 => try self.pool4.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 8 => try self.pool8.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 16 => try self.pool16.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 32 => try self.pool32.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 64 => try self.pool64.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 128 => try self.pool128.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 256 => try self.pool256.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 512 => try self.pool512.create(),
-                @sizeOf(PrepRunner.CommitSeq) * 1024 => try self.pool1024.create(),
-                else => try self.allocator.alloc(u8, len),
-            };
-        }
-        fn destroy(self: *MemPools, ptr: [*c]u8, len: usize) void {
-            const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
-            switch (fitlen) {
-                @sizeOf(PrepRunner.CommitSeq) * 1 => self.pool1.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 2 => self.pool2.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 4 => self.pool4.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 8 => self.pool8.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 16 => self.pool16.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 32 => self.pool32.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 64 => self.pool64.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 128 => self.pool128.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 256 => self.pool256.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 512 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
-                @sizeOf(PrepRunner.CommitSeq) * 1024 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
-                else => self.allocator.free(ptr[0..len]),
-            }
-        }
-    };
-    fn init(self: *FixedBinaryAppendMergeOperater, allocator: std.mem.Allocator) void {
-        self.* = .{
-            .op = c.rocksdb_mergeoperator_create(
-                &self.state,
-                // destructor可以是空操作，但是不能没有。
-                destructor,
-                fullMerge,
-                // 部分合并会增加多个小对象分配。完整对象栈的合并因为减少了内存分配量反而更高效。
-                // 但是`partialMerge`的实现是必须的，而且C API没有合理的部分合并失败策略，只能正常实现。
-                // [参考](https://github.com/johnzeng/rocksdb-doc-cn/blob/master/doc/Merge-Operator-Implementation.md#%E6%95%88%E7%8E%87%E7%9B%B8%E5%85%B3%E7%9A%84%E7%AC%94%E8%AE%B0)
-                partialMerge,
-                deleteValue,
-                name,
-            ).?,
-            .state = .init(allocator),
+const FixedBinaryAppendMergeOperaterState = struct {
+    failed: [0]u8, // 当失败的时候返回其指针。
+    pool1: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 1]u8, .{}),
+    pool2: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 2]u8, .{}),
+    pool4: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 4]u8, .{}),
+    pool8: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 8]u8, .{}),
+    pool16: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 16]u8, .{}),
+    pool32: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 32]u8, .{}),
+    pool64: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 64]u8, .{}),
+    pool128: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 128]u8, .{}),
+    pool256: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 256]u8, .{}),
+    pool512: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 512]u8, .{}),
+    pool1024: std.heap.MemoryPoolExtra([@sizeOf(PrepRunner.CommitSeq) * 1024]u8, .{}),
+    allocator: std.mem.Allocator,
+    fn init(allocator: std.mem.Allocator) FixedBinaryAppendMergeOperaterState {
+        return .{
+            .failed = .{},
+            .pool1 = .init(allocator),
+            .pool2 = .init(allocator),
+            .pool4 = .init(allocator),
+            .pool8 = .init(allocator),
+            .pool16 = .init(allocator),
+            .pool32 = .init(allocator),
+            .pool64 = .init(allocator),
+            .pool128 = .init(allocator),
+            .pool256 = .init(allocator),
+            .pool512 = .init(allocator),
+            .pool1024 = .init(allocator),
+            .allocator = allocator,
         };
     }
-    fn deinit(self: *FixedBinaryAppendMergeOperater) void {
-        c.rocksdb_mergeoperator_destroy(self.op);
-        self.state.deinit();
-        self.* = undefined;
+    fn deinit(self: *FixedBinaryAppendMergeOperaterState) void {
+        self.pool1.deinit();
+        self.pool2.deinit();
+        self.pool4.deinit();
+        self.pool8.deinit();
+        self.pool16.deinit();
+        self.pool32.deinit();
+        self.pool64.deinit();
+        self.pool128.deinit();
+        self.pool256.deinit();
+        self.pool512.deinit();
+        self.pool1024.deinit();
+    }
+    fn create(self: *FixedBinaryAppendMergeOperaterState, len: usize) ![]u8 {
+        const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
+        return switch (fitlen) {
+            @sizeOf(PrepRunner.CommitSeq) * 1 => try self.pool1.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 2 => try self.pool2.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 4 => try self.pool4.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 8 => try self.pool8.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 16 => try self.pool16.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 32 => try self.pool32.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 64 => try self.pool64.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 128 => try self.pool128.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 256 => try self.pool256.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 512 => try self.pool512.create(),
+            @sizeOf(PrepRunner.CommitSeq) * 1024 => try self.pool1024.create(),
+            else => try self.allocator.alloc(u8, len),
+        };
+    }
+    fn destroy(self: *FixedBinaryAppendMergeOperaterState, ptr: [*c]u8, len: usize) void {
+        const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
+        switch (fitlen) {
+            @sizeOf(PrepRunner.CommitSeq) * 1 => self.pool1.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 2 => self.pool2.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 4 => self.pool4.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 8 => self.pool8.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 16 => self.pool16.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 32 => self.pool32.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 64 => self.pool64.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 128 => self.pool128.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 256 => self.pool256.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 512 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(PrepRunner.CommitSeq) * 1024 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
+            else => self.allocator.free(ptr[0..len]),
+        }
+    }
+    fn createFixedBinaryAppendMergeOperater(self: *FixedBinaryAppendMergeOperaterState) *c.rocksdb_mergeoperator_t {
+        return c.rocksdb_mergeoperator_create(
+            self,
+            // destructor可以是空操作，但是不能没有。
+            destructor,
+            fullMerge,
+            // 部分合并会增加多个小对象分配。完整对象栈的合并因为减少了内存分配量反而更高效。
+            // 但是`partialMerge`的实现是必须的，而且C API没有合理的部分合并失败策略，只能正常实现。
+            // [参考](https://github.com/johnzeng/rocksdb-doc-cn/blob/master/doc/Merge-Operator-Implementation.md#%E6%95%88%E7%8E%87%E7%9B%B8%E5%85%B3%E7%9A%84%E7%AC%94%E8%AE%B0)
+            partialMerge,
+            deleteValue,
+            name,
+        ).?;
+    }
+    fn destructor(state: ?*anyopaque) callconv(.c) void {
+        _ = state;
+        return;
     }
     fn fullMerge(
         state: ?*anyopaque,
@@ -393,7 +463,7 @@ const FixedBinaryAppendMergeOperater = struct {
         success: [*c]u8,
         new_value_length: [*c]usize,
     ) callconv(.c) [*c]u8 {
-        const mem_pools: *MemPools = @ptrCast(@alignCast(state.?));
+        const mem_pools: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
         _ = key;
         _ = key_length;
         const total_length = blk: {
@@ -426,10 +496,6 @@ const FixedBinaryAppendMergeOperater = struct {
         success.* = 1;
         return result.ptr;
     }
-    fn destructor(state: ?*anyopaque) callconv(.c) void {
-        _ = state;
-        return;
-    }
     fn partialMerge(
         state: ?*anyopaque,
         key: [*c]const u8,
@@ -448,7 +514,7 @@ const FixedBinaryAppendMergeOperater = struct {
     }
     fn deleteValue(state: ?*anyopaque, value: [*c]const u8, value_length: usize) callconv(.c) void {
         if (value_length == 0) return;
-        const mem_pools: *MemPools = @ptrCast(@alignCast(state.?));
+        const mem_pools: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
         // 神秘API设计：`deleteValue`钩子居然要求是个`const`指针，差点让我以为我用错了。检察源码发现居然真就是这么用的。
         mem_pools.destroy(@constCast(value.?), value_length);
     }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Channel = @import("PrepRunner.zig").Channel;
-const c_helper = @import("gvca").c_helper;
+const gvca = @import("gvca");
+const c_helper = gvca.c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 
@@ -22,7 +23,7 @@ pub const Parsing = struct {
     to_flush: PrepRunner.Parsed,
 
     pub fn init(self: *Parsing, channel: *Channel) void {
-        self.allocator = std.heap.c_allocator;
+        self.allocator = gvca.getAllocator();
         self.diagnostics_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.diagnostics = .{ .arena = self.diagnostics_arena };
         self.producer_local = channel.mpsc_queue_ref.initProducerLocal();
@@ -47,7 +48,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     defer lctx.current_task.arena.deinit();
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
-        .arena = .init(std.heap.c_allocator),
+        .arena = .init(gvca.getAllocator()),
         .commit_hash = commit_hash,
         .commit_seq = undefined,
         .parsed_units = .empty,
@@ -165,7 +166,7 @@ fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *con
     if (lctx.to_flush.parsed_units.items.len >= lctx.flush_threshold) {
         try flush_relation_batch(gctx, lctx);
         lctx.to_flush = .{
-            .arena = .init(std.heap.c_allocator),
+            .arena = .init(gvca.getAllocator()),
             .commit_hash = null,
             .commit_seq = undefined,
             .parsed_units = .empty,

@@ -17,20 +17,19 @@ pub const Diagnostics = struct {
         self.last_diagnostic = undefined;
         self.double_error = null;
     }
-    pub fn log_all(self: *Diagnostics, last_error: ?anyerror) void {
-        if (last_error) |err| {
-            if (self.double_error) |double_error| {
-                std.log.err("double error!{s}", .{@errorName(double_error)});
-            }
-            self.last_diagnostic.log(err);
-            var it = std.mem.reverseIterator(self.error_stack.items);
-            while (it.nextPtr()) |item| {
-                item.diagnostic.log(item.code);
-            }
-            if (@errorReturnTrace()) |trace| {
-                std.debug.dumpStackTrace(trace.*);
-            }
-        } else return;
+    pub fn log_all(self: *Diagnostics, last_error: anyerror) void {
+        std.log.err("Diagnostics log all.\n", .{});
+        if (self.double_error) |double_error| {
+            std.log.err("double error!{s}", .{@errorName(double_error)});
+        }
+        self.last_diagnostic.log(last_error);
+        var it = std.mem.reverseIterator(self.error_stack.items);
+        while (it.nextPtr()) |item| {
+            item.diagnostic.log(item.code);
+        }
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
     }
 };
 

@@ -1,0 +1,42 @@
+PS D:\git-version-commit-aligner-zig> .\zig-out\bin\gvca.exe prep -v --bare-repo-path .\.git
+verbose: true, path: .\.git
+repo-id: github.com/npc1054657282/git-version-commit-aligner-zig
+Segmentation fault at address 0x1fdb7542919
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\mem.zig:697:24: 0x7ff79a4bd210 in eql__anon_6875 (gvca_zcu.obj)
+        return eqlBytes(sliceAsBytes(a), sliceAsBytes(b));
+                       ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:49:19: 0x7ff79a5a4929 in eqlString (gvca_zcu.obj)
+    return mem.eql(u8, a, b);
+                  ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:44:25: 0x7ff79a5a399d in eql (gvca_zcu.obj)
+        return eqlString(a, b);
+                        ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:1943:27: 0x7ff79a59f3e1 in checkedEql__anon_72439 (gvca_zcu.obj)
+            return ctx.eql(a, b, b_index);
+                          ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:1794:46: 0x7ff79a59fec6 in getOrPutInternal__anon_72485 (gvca_zcu.obj)
+                if (hash_match and checkedEql(ctx, key, keys_array[i], i)) {
+                                             ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:861:52: 0x7ff79a595e93 in getOrPutAssumeCapacityAdapted__anon_71781 (gvca_zcu.obj)
+                .u8 => return self.getOrPutInternal(key, ctx, header, u8),
+                                                   ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:799:54: 0x7ff79a58c1b9 in getOrPutContextAdapted__anon_70066 (gvca_zcu.obj)     
+            return self.getOrPutAssumeCapacityAdapted(key, key_ctx);
+                                                     ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:775:56: 0x7ff79a57f131 in getOrPutContext (gvca_zcu.obj)
+            const gop = try self.getOrPutContextAdapted(gpa, key, ctx, ctx);
+                                                       ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\array_hash_map.zig:772:40: 0x7ff79a56fd91 in getOrPut (gvca_zcu.obj)
+            return self.getOrPutContext(gpa, key, undefined);
+                                       ^
+D:\git-version-commit-aligner-zig\src\cmd_prep\write.zig:179:65: 0x7ff79a55f99f in task (gvca_zcu.obj)
+            const get_or_put_result = path_registry.map.getOrPut(path_registry.arena.allocator(), parsed_unit.path) catch |err| {
+                                                                ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\Thread.zig:510:13: 0x7ff79a55681c in callFn__anon_51838 (gvca_zcu.obj)
+            @call(.auto, f, args);
+            ^
+C:\Users\ly\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.15.1\lib\std\Thread.zig:623:30: 0x7ff79a550a34 in entryFn (gvca_zcu.obj)
+                return callFn(f, self.fn_args);
+                             ^
+???:?:?: 0x7ffa25fa259c in ??? (KERNEL32.DLL)
+???:?:?: 0x7ffa27baaf77 in ??? (ntdll.dll)

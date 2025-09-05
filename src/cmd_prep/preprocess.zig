@@ -45,7 +45,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         allocator.free(ctx.repo_id);
         ctx.repo_id = undefined;
     }
-    std.debug.print("repo-id: {s}", .{ctx.repo_id});
+    std.debug.print("repo-id: {s}\n", .{ctx.repo_id});
     ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     defer {
         ctx.commit_registry.table.deinit(ctx.commit_registry.arena.allocator());
@@ -70,6 +70,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         ctx.parsers.pool.waitAndWork(&ctx.parsers.wait_group);
         ctx.channel.notifyConsumerDone();
         writer.join();
+        std.log.info("Writer end.\n", .{});
     }
     git_error_code = c.git_odb_foreach(ctx.odb, index_builder_cb, ctx);
     try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -93,7 +94,10 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     if (ctx.commit_registry.table.contains(id.*)) return 0;
     // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
     const commit_seq = ctx.commit_registry.table.count();
-    ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch std.process.abort();
+    ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch {
+        std.log.err("Commit regisistry put no clobber failed.\n", .{});
+        std.process.abort();
+    };
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
     const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);
     if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
