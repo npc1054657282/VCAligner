@@ -3,13 +3,8 @@ const c_helper = @import("gvca").c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 const diag = @import("gvca").diag;
-
-// 由于std.Thread.Pool中，`Runnable`和`RunProto`未公开，因此拷贝其构造。
-const Runnable = struct {
-    runFn: RunProto,
-    node: std.SinglyLinkedList.Node = .{},
-};
-const RunProto = *const fn (*Runnable, id: ?usize) void;
+const Pool = @import("gvca").Pool;
+const PathSeq = @import("write.zig").PathSeq;
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
@@ -57,6 +52,9 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         ctx.commit_registry.arena.deinit();
         ctx.commit_registry = undefined;
     }
+    // 初始化两个永远一样的数组。
+    ctx.keys_list_sizes = @splat(@sizeOf(PrepRunner.Parsed.KeyBuf));
+    ctx.values_list_sizes = @splat(@sizeOf(PrepRunner.CommitSeq));
     // rocksdb的使用方案[参见](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ)。
     // 采用多线程解析，单线程写入的模型。解析线程同样涉及odb的I/O读取，并不是纯cpu工作，所以恐怕不会比写入的I/O慢。
     const queue = try PrepRunner.Queue.init(allocator, ctx.task_queue_capacity_log2);
@@ -93,8 +91,8 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
     // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
     if (ctx.commit_registry.table.contains(id.*)) return 0;
-    const commit_seq = ctx.commit_registry.next_commit_seq;
-    ctx.commit_registry.next_commit_seq += 1;
+    // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
+    const commit_seq = ctx.commit_registry.table.count();
     ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch std.process.abort();
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
     const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);
@@ -104,7 +102,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
             defer ctx.parsers.pool.mutex.unlock();
             break :blk ctx.parsers.pool.run_queue.popFirst() orelse break :help_do_work;
         };
-        const runnable: *Runnable = @fieldParentPtr("node", run_node);
+        const runnable: *Pool.Runnable = @fieldParentPtr("node", run_node);
         runnable.runFn(runnable, 0);
     }
     // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。

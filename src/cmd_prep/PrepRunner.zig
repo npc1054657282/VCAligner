@@ -3,25 +3,37 @@ const zargs = @import("zargs");
 const CliRunner = @import("gvca").cli.Runner;
 const c = @import("gvca").c_helper.c;
 const diag = @import("gvca").diag;
+const Pool = @import("gvca").Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
 const MpscChannel = @import("gvca").MpscChannel;
+const PathSeq = @import("write.zig").PathSeq;
 
+pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
+pub const Channel = MpscChannel(Queue);
+const CommitRegistryTable = std.AutoHashMapUnmanaged(c.git_oid, void);
+pub const CommitSeq = CommitRegistryTable.Size;
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_hash: ?c.git_oid,
-    commit_seq: usize,
+    commit_seq: *CommitSeq,
+    // XXX: 考虑`MultiArrayList`，但是实际使用有些困难，因为实际上我的需求是要为key与path本身设计列表，也要为key的指针设计列表。
+    // 如果`MultiArrayList`的各个成员之间有地址依赖，该怎么设计，我感到头疼。因此目前依然是设计为分开的`ArrayList`
     // 可能并非必要，因为已经在arena中分配？
     // path_strings: std.ArrayList(u8),
     parsed_units: std.ArrayList(ParsedUnit),
-
+    keys_list: std.ArrayList(*KeyBuf),
+    // 将CommitSeq的指针一次性拷贝len次
+    values_list: []*CommitSeq,
+    pub const KeyBuf = extern struct {
+        path_seq: PathSeq align(1), // flush时未赋值，写入前解析赋值。
+        blob_hash: [20]u8 align(1), //目前硬编码，尚未考虑SHA256。未来libgit2升级了可能会考虑。
+    };
     pub const ParsedUnit = struct {
         path: []u8,
-        blob: c.git_oid,
+        key: KeyBuf,
     };
 };
-pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
-pub const Channel = MpscChannel(Queue);
 
 global: CliRunner.Global,
 bare_repo_path: [:0]u8,
@@ -33,9 +45,9 @@ repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
 repo_id: [:0]u8 = undefined,
 parsers: struct {
-    pool: std.Thread.Pool,
+    pool: Pool,
     wait_group: std.Thread.WaitGroup,
-    lctxs: std.ArrayListAlignedUnmanaged(@import("parse.zig").Parsing, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
+    lctxs: std.ArrayListAligned(@import("parse.zig").Parsing, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
     // 记录队列中的任务数量。
     task_in_queue_count: std.atomic.Value(usize) align(std.atomic.cache_line),
     const Parsers = @This();
@@ -58,14 +70,17 @@ parsers: struct {
     }
 } = undefined,
 channel: Channel = undefined,
+// 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此保存在全局上下文中，总是给write_batch看相同的内容。
+// `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用。
+keys_list_sizes: [@import("write.zig").write_batch_threshold * 2]usize = undefined,
+values_list_sizes: [@import("write.zig").write_batch_threshold * 2]usize = undefined,
 // 下列内容是在各线程已经被创建后，主线程依旧会修改的可变内容，应缓存行对齐，以避免各线程读取上列对各线程而言的只读内容时遭遇伪共享。
 commit_registry: struct {
     // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
     // 目前还不知道有什么需要回溯插入顺序的地方，也暂时没想到迭代需求。如果未来有迭代需求，会考虑改用ArrayHashMap。
     // 目前基于最高查询效率的目的采用HashMap
-    table: std.AutoHashMapUnmanaged(c.git_oid, void) = .empty,
+    table: CommitRegistryTable = .empty,
     arena: std.heap.ArenaAllocator,
-    next_commit_seq: usize = 0, // 每个commit分配一个序列号，因为commit太长了，写入时使用序列号可以提升存储效率。
 } align(std.atomic.cache_line) = undefined,
 
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))

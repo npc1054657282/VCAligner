@@ -3,6 +3,7 @@ const Channel = @import("PrepRunner.zig").Channel;
 const c_helper = @import("gvca").c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
+
 const diag = @import("gvca").diag;
 
 pub const Parsing = struct {
@@ -11,11 +12,11 @@ pub const Parsing = struct {
     diagnostics_arena: std.heap.ArenaAllocator,
     diagnostics: diag.Diagnostics,
     producer_local: PrepRunner.Queue.ProducerLocal,
-    comptime flush_threshold: usize = 1024,
+    comptime flush_threshold: usize = 512,
     // 以下内容为当前任务的缓存，下一个任务起重置。
     current_task: struct {
         arena: std.heap.ArenaAllocator,
-        commit_seq: usize,
+        commit_seq: PrepRunner.CommitSeq,
     },
     // 以下内容为当前批次内容，flush过了就重置。
     to_flush: PrepRunner.Parsed,
@@ -32,8 +33,8 @@ pub const Parsing = struct {
     }
 };
 
-pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: usize) void {
-    const lctx = &gctx.parsers.lctxs.items[thrd_id];
+pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: PrepRunner.CommitSeq) void {
+    const lctx: *Parsing = &gctx.parsers.lctxs.items[thrd_id];
     const allocator = lctx.allocator;
     const last_diag = &lctx.diagnostics.last_diagnostic;
     // 进入解析，降低积压的`task_in_queue_count`
@@ -45,11 +46,20 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     };
     defer lctx.current_task.arena.deinit();
     lctx.to_flush = .{
-        .arena = .init(allocator),
+        // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
+        .arena = .init(std.heap.c_allocator),
         .commit_hash = commit_hash,
-        .commit_seq = commit_seq,
+        .commit_seq = undefined,
         .parsed_units = .empty,
+        .keys_list = .empty,
+        .values_list = undefined,
     };
+    lctx.to_flush.commit_seq = lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq) catch |err| {
+        lctx.diagnostics.log_all(err);
+        lctx.diagnostics.clear();
+        std.process.abort();
+    };
+    lctx.to_flush.commit_seq.* = commit_seq;
     // 交由写者释放。
 
     const commit: *c.git_commit = blk: {
@@ -74,8 +84,22 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         break :blk tree.?;
     };
     defer c.git_tree_free(tree);
+    parse_tree(gctx, lctx, tree, &@as([0]u8, .{})) catch |err| {
+        lctx.diagnostics.log_all(err);
+        lctx.diagnostics.clear();
+        std.process.abort();
+    };
+    // 任务结束时最后刷新一次。
+    flush_relation_batch(gctx, lctx) catch |err| {
+        lctx.diagnostics.log_all(err);
+        lctx.diagnostics.clear();
+        std.process.abort();
+    };
+    return;
 }
 
+// XXX: 子树存在一个或许可能降低内存分配量的方案：每个线程维护一个树，每一级分析都在本地树里搜索和创建文件目录节点。
+// 或许可以降低内存分配量，但我相信瓶颈不在解析这一端而在rocksdb写入这一端，所以提升解析端效率而消耗更大内存可能是得不偿失的。
 fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_path: []const u8) !void {
     const entry_count = c.git_tree_entrycount(tree);
     for (0..entry_count) |i| {
@@ -120,7 +144,7 @@ fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_p
                     try builder.appendSlice(lctx.to_flush.arena.allocator(), entry_name_slice);
                     break :blk try builder.toOwnedSlice(lctx.to_flush.arena.allocator());
                 };
-                try append_relation(gctx, lctx, full_path, entry_oid.*);
+                try append_relation(gctx, lctx, full_path, entry_oid);
             },
             else => {},
         }
@@ -128,23 +152,37 @@ fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_p
     return;
 }
 
-fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_hash: c.git_oid) !void {
+fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *const c.git_oid) !void {
     try lctx.to_flush.parsed_units.append(lctx.to_flush.arena.allocator(), .{
         .path = path,
-        .blob = blob_hash,
+        .key = .{
+            .path_seq = undefined,
+            .blob_hash = blob_oid.id,
+        },
     });
-    if (lctx.to_flush.parsed_units.len >= lctx.flush_threshold) {
-        flush_relation_batch(gctx, lctx);
+    const key_ptr = &lctx.to_flush.parsed_units.items[lctx.to_flush.parsed_units.items.len - 1].key;
+    try lctx.to_flush.keys_list.append(lctx.to_flush.arena.allocator(), key_ptr);
+    if (lctx.to_flush.parsed_units.items.len >= lctx.flush_threshold) {
+        try flush_relation_batch(gctx, lctx);
         lctx.to_flush = .{
-            .arena = .init(lctx.allocator),
+            .arena = .init(std.heap.c_allocator),
             .commit_hash = null,
-            .commit_seq = lctx.current_task.commit_seq,
+            .commit_seq = undefined,
             .parsed_units = .empty,
+            .keys_list = .empty,
+            .values_list = undefined,
         };
+        lctx.to_flush.commit_seq = try lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq);
+        lctx.to_flush.commit_seq.* = lctx.current_task.commit_seq;
     }
 }
 
-fn flush_relation_batch(gctx: *PrepRunner, lctx: *Parsing) void {
-    _ = gctx;
-    _ = lctx;
+fn flush_relation_batch(gctx: *PrepRunner, lctx: *Parsing) !void {
+    lctx.to_flush.values_list = try lctx.to_flush.arena.allocator().alloc(*PrepRunner.CommitSeq, lctx.to_flush.parsed_units.items.len);
+    @memset(lctx.to_flush.values_list, lctx.to_flush.commit_seq);
+    const ticket, const to_produce: *PrepRunner.Parsed = gctx.channel.claimProduce(&lctx.producer_local, null);
+    defer gctx.channel.publishProducedUnsafe(ticket);
+    // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
+    to_produce.* = lctx.to_flush;
+    lctx.to_flush = undefined;
 }

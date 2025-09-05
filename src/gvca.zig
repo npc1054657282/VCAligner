@@ -5,6 +5,7 @@ pub const cli = @import("cli.zig");
 pub const diag = @import("diagnostics.zig");
 pub const c_helper = @import("c.zig");
 pub const MpscChannel = @import("mpsc_channel.zig").MpscChannel;
+pub const Pool = @import("Pool.zig");
 
 pub fn main() !void {
     // 使用c分配器的原因：
