@@ -1,12 +1,35 @@
 const std = @import("std");
-const c_helper = @import("gvca").c_helper;
+const gvca = @import("gvca");
+const c_helper = gvca.c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
-const diag = @import("gvca").diag;
-const Pool = @import("gvca").Pool;
-const PathSeq = @import("write.zig").PathSeq;
+const diag = gvca.diag;
+const Pool = gvca.Pool;
+const PathSeq = PrepRunner.PathSeq;
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+    ctx.writer = .{
+        // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
+        .path_registry = .{ .arena = .init(gvca.getAllocator()) },
+        // 默认列族需要merge operator，在后面追加commit。
+        .merge_operator_state = .init(gvca.getAllocator()),
+    };
+    defer {
+        ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
+        ctx.writer.path_registry.arena.deinit();
+        ctx.writer.merge_operator_state.deinit();
+        ctx.writer = undefined;
+    }
+    try parseAndWrite(ctx, allocator, last_diag);
+    // 压缩rocksdb的写入内容。
+    try @import("compaction.zig").compaction(ctx, allocator, last_diag);
+}
+
+// mpsc，多生产者解析，单消费者写入。具体逻辑见`parse.zig`和`write.zig`。其中，写入对于rocksdb为仅写入，无压缩。
+// XXX: 可能需要重构。目前设计为主线程分发解析，线程池解析，然后另设计一个线程写入。
+// 考虑到最终的操作为rocksdb操作最多，或许应当重构为主线程写入，另创建一个线程分发解析，分发解析线程内再创建线程池。
+// 重新思考：另开写线程未尝不可，只是可能要根据情况决定是由线程自己打开rocksdb数据库，还是主线程打开然后让rocksdb数据库持有使用权。
+pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
     var git_error_code = c.git_libgit2_init();
     if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -52,9 +75,6 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         ctx.commit_registry.arena.deinit();
         ctx.commit_registry = undefined;
     }
-    // 初始化两个永远一样的数组。
-    ctx.keys_list_sizes = @splat(@sizeOf(PrepRunner.Parsed.KeyBuf));
-    ctx.values_list_sizes = @splat(@sizeOf(PrepRunner.CommitSeq));
     // rocksdb的使用方案[参见](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ)。
     // 采用多线程解析，单线程写入的模型。解析线程同样涉及odb的I/O读取，并不是纯cpu工作，所以恐怕不会比写入的I/O慢。
     const queue = try PrepRunner.Queue.init(allocator, ctx.task_queue_capacity_log2);

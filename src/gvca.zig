@@ -6,6 +6,7 @@ pub const diag = @import("diagnostics.zig");
 pub const c_helper = @import("c.zig");
 pub const MpscChannel = @import("mpsc_channel.zig").MpscChannel;
 pub const Pool = @import("Pool.zig");
+pub const rocksdb_custom = @import("rocksdb_custom.zig");
 
 const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,

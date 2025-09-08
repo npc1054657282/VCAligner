@@ -7,12 +7,15 @@ const Pool = @import("gvca").Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
 const MpscChannel = @import("gvca").MpscChannel;
-const PathSeq = @import("write.zig").PathSeq;
+const FixedBinaryAppendMergeOperaterState = @import("gvca").rocksdb_custom.FixedBinaryAppendMergeOperaterState;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
 const CommitRegistryTable = std.AutoHashMapUnmanaged(c.git_oid, void);
 pub const CommitSeq = CommitRegistryTable.Size;
+// Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
+// 尽管path多数情况下最大值可能不如commit多。简单起见PathSeq设置为符合ArrayHashMap要求的usize。
+pub const PathSeq = usize;
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_hash: ?c.git_oid,
@@ -70,10 +73,6 @@ parsers: struct {
     }
 } = undefined,
 channel: Channel = undefined,
-// 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此保存在全局上下文中，总是给write_batch看相同的内容。
-// `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用。
-keys_list_sizes: [@import("write.zig").write_batch_threshold * 2]usize = undefined,
-values_list_sizes: [@import("write.zig").write_batch_threshold * 2]usize = undefined,
 // 下列内容是在各线程已经被创建后，主线程依旧会修改的可变内容，应缓存行对齐，以避免各线程读取上列对各线程而言的只读内容时遭遇伪共享。
 commit_registry: struct {
     // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
@@ -81,6 +80,23 @@ commit_registry: struct {
     // 目前基于最高查询效率的目的采用HashMap
     table: CommitRegistryTable = .empty,
     arena: std.heap.ArenaAllocator,
+} align(std.atomic.cache_line) = undefined,
+// 下列内容是写线程会修改，而最终移交给主线程的内容。
+writer: struct {
+    path_registry: struct {
+        // ArrayHashMap提供排序功能，应当使用它
+        map: std.StringArrayHashMapUnmanaged(struct {
+            // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
+            index: PathSeq,
+            // 在写入过程中不记录此值。在全部写入完毕以后，遍历一遍所有的key统计此值。最后排序的依据。
+            // XXX: 在内存中为每个path都记录一个它的blob的hashmap。怀疑其可行性，宁肯全部写入完毕以后再遍历rocksdb数据库。
+            blob_cnt: usize,
+        }) = .empty,
+        // arena很重要，注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存
+        //因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
+        arena: std.heap.ArenaAllocator,
+    },
+    merge_operator_state: FixedBinaryAppendMergeOperaterState,
 } align(std.atomic.cache_line) = undefined,
 
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
