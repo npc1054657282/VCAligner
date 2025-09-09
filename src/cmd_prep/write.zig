@@ -57,10 +57,7 @@ pub fn task(ctx: *PrepRunner) void {
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
         break :blk db_options.?;
     };
-    defer {
-        std.log.info("db options destroy...\n", .{});
-        c.rocksdb_options_destroy(db_options);
-    }
+    defer c.rocksdb_options_destroy(db_options);
 
     const db = blk: {
         const db = c.rocksdb_open(db_options, ctx.rocksdb_output, @ptrCast(&err_cstr));
@@ -70,17 +67,11 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk db.?;
     };
-    defer {
-        std.log.info("rocksdb close...\n", .{});
-        c.rocksdb_close(db);
-    }
+    defer c.rocksdb_close(db);
 
     // 默认列族：键是path_index-blob，值由多个commit_index组成，需要前缀提取器。
     const cf_pi_b_cis = c.rocksdb_get_default_column_family_handle(db).?;
-    defer {
-        std.log.info("default handle destroy...\n", .{});
-        c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
-    }
+    defer c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
 
     // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
     // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
@@ -89,10 +80,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_options_prepare_for_bulk_load(cf_options);
         break :blk cf_options.?;
     };
-    defer {
-        std.log.info("cf options destroy...\n", .{});
-        c.rocksdb_options_destroy(cf_options);
-    }
+    defer c.rocksdb_options_destroy(cf_options);
 
     // 键 path_index - 值 path 列族
     // 由于path index 由本写者线程自己维护，因此这个列族一定可以确保有序写入，理论上完全可以通过sstfilewriter写入。
@@ -105,10 +93,7 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk cf_pi_p.?;
     };
-    defer {
-        std.log.info("pi2p handle destroy...\n", .{});
-        c.rocksdb_column_family_handle_destroy(cf_pi_p);
-    }
+    defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
 
     // 键 commit_index - 值 commit 列族
     // 由于commit index由任务发布者线程创建，这个列族无法确保有序写入，除非在写本地线程重新维护一套seq方案而不使用任务发布者提出的方案。
@@ -122,30 +107,21 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :blk cf_ci_c.?;
     };
-    defer {
-        std.log.info("ci2c handle destroy...\n", .{});
-        c.rocksdb_column_family_handle_destroy(cf_ci_c);
-    }
+    defer c.rocksdb_column_family_handle_destroy(cf_ci_c);
 
     const woptions = blk: {
         const woptions = c.rocksdb_writeoptions_create();
         c.rocksdb_writeoptions_disable_WAL(woptions, 1);
         break :blk woptions.?;
     };
-    defer {
-        std.log.info("write options destroy...\n", .{});
-        c.rocksdb_writeoptions_destroy(woptions);
-    }
+    defer c.rocksdb_writeoptions_destroy(woptions);
 
     const wb = c.rocksdb_writebatch_create().?;
-    defer {
-        std.log.info("writebatch destroy...\n", .{});
-        c.rocksdb_writebatch_destroy(wb);
-    }
+    defer c.rocksdb_writebatch_destroy(wb);
 
     var consumer_local = ctx.channel.mpsc_queue_ref.initConsumerLocal();
 
-    // XXX: 如果阻塞，添加一些异步执行的内容，比如整理当前的path排序？若如此做，后续部分逻辑需要改动。
+    // XXX: 如果阻塞，添加一些异步执行的内容。但目前没什么想法。
     while (ctx.channel.claimConsume(&consumer_local, null)) |lease| {
         const ticket, const parsed: *PrepRunner.Parsed = lease;
         // mpsc队列中消费者不比生产者，生产者写入过程需要尽可能快否则消费者可能卡在慢生产者后面。消费者慢点卡着没逝的。
@@ -155,8 +131,6 @@ pub fn task(ctx: *PrepRunner) void {
 
         // 如果`commit_hash`非空，写入一个commit id- commit对
         if (parsed.commit_hash) |*commit_hash| {
-            std.log.info("commit_seq: {x}\n", .{parsed.commit_seq.*});
-            std.log.info("commit_hash: {x}\n", .{commit_hash.id});
             c.rocksdb_writebatch_put_cf(
                 wb,
                 cf_ci_c,
@@ -174,11 +148,6 @@ pub fn task(ctx: *PrepRunner) void {
                 std.process.abort();
             };
             if (!get_or_put_result.found_existing) {
-                std.log.info("path id: {d}\n", .{get_or_put_result.index});
-                std.log.info("path: {s}\n", .{parsed_unit.path});
-                std.log.info("path ptr: {*}\n", .{parsed_unit.path.ptr});
-                std.log.info("key ptr: {*}\n", .{get_or_put_result.key_ptr});
-                std.log.info("key ptr ptr: {*}\n", .{get_or_put_result.key_ptr.*.ptr});
                 // 注意！`getOrPut`会直接把我们用于比较的`parsed_unit.path`作为键。但是`parsed_unit.path`的生存周期实际上并不够！
                 // 因此，我们需要重新设置一个生命周期安全的新key，也就是将当前的`parsed_unit.path`用hash map自己的分配器重新拷贝一份。
                 // 虽然文档让我们不要修改键，但我想我知道我们现在在做什么。

@@ -7,7 +7,6 @@ const PathSeq = PrepRunner.PathSeq;
 
 // write线程执行完的后续。
 pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    _ = allocator;
     _ = last_diag;
     // 由于C API没有对`SetDbOptions`的支持，因此只得关闭数据库后，根据修改后的配置重新打开。
     var err_cstr: ?[*:0]u8 = null;
@@ -19,6 +18,8 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_jobs));
         c.rocksdb_options_set_max_background_compactions(db_options, @intCast(ctx.n_jobs));
         c.rocksdb_options_set_max_background_flushes(db_options, 1);
+        // 依旧禁用自动compaction。我们使用手动compaction，避免撞车。
+        c.rocksdb_options_set_disable_auto_compactions(db_options, 1);
         // 下面为默认列族配置
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
         c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createFixedBinaryAppendMergeOperater());
@@ -66,18 +67,14 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     }
     // 触发手动compaction（整个数据库）
     const compact_options = c.rocksdb_compactoptions_create();
-    defer {
-        std.log.info("compact options destroy...\n", .{});
-        c.rocksdb_compactoptions_destroy(compact_options);
-    }
+    defer c.rocksdb_compactoptions_destroy(compact_options);
+
     c.rocksdb_compact_range_opt(db, compact_options, null, 0, null, 0);
     // 等待compaction完成
     // XXX: 如果不必重新打开数据库的话，此处可以配置压缩前刷写数据库，或许可以不再需要前面手动flush。不过现在说这个有些晚了。
     const wait_for_compact_options = c.rocksdb_wait_for_compact_options_create().?;
-    defer {
-        std.log.info("wait for compact options destroy...\n", .{});
-        c.rocksdb_wait_for_compact_options_destroy(wait_for_compact_options);
-    }
+    defer c.rocksdb_wait_for_compact_options_destroy(wait_for_compact_options);
+
     c.rocksdb_wait_for_compact(db, wait_for_compact_options, @ptrCast(&err_cstr));
     if (err_cstr) |ecstr| {
         std.log.err("rocksdb wait for compact failed! {s}\n", .{std.mem.span(ecstr)});
@@ -107,6 +104,109 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         std.debug.print("Waiting for compaction: running={d}, pending={d}\n", .{ num_running, pending });
         std.Thread.sleep(10 * std.time.ns_per_s); // 等待 10s
     }
+
+    // 开始估算各前缀（路径id）对应的blob的数量。
+    block_count_estimate: {
+        var iter = ctx.writer.path_registry.map.iterator();
+        while (iter.next()) |entry| {
+            const prefix = std.mem.toBytes(entry.value_ptr.index);
+            const limit = std.mem.toBytes(entry.value_ptr.index + 1);
+            const range_start_key: [1][*]const u8 = .{
+                &prefix,
+            };
+            const range_start_key_len: [1]usize = .{
+                @sizeOf(@TypeOf(prefix)),
+            };
+            const range_limit_key: [1][*]const u8 = .{
+                &limit,
+            };
+            const range_limit_key_len: [1]usize = .{
+                @sizeOf(@TypeOf(limit)),
+            };
+            c.rocksdb_approximate_sizes_cf(
+                db,
+                cf_pi_b_cis,
+                1,
+                @ptrCast(&range_start_key),
+                &range_start_key_len,
+                @ptrCast(&range_limit_key),
+                &range_limit_key_len,
+                &entry.value_ptr.approximate_blob_cnt,
+                @ptrCast(&err_cstr),
+            );
+            if (err_cstr) |ecstr| {
+                std.log.err("rocksdb approximate size failed! {s}\n", .{std.mem.span(ecstr)});
+                return error.RocksdbError;
+            }
+        }
+        break :block_count_estimate;
+    }
+    // 对估算值进行排序
+    sort: {
+        const SortContext = struct {
+            map: *const @TypeOf(ctx.writer.path_registry.map),
+            pub fn lessThan(sctx: @This(), a_index: usize, b_index: usize) bool {
+                // 基于值中的 blob_cnt 比较。采用降序，符号翻转。
+                return sctx.map.values()[a_index].approximate_blob_cnt > sctx.map.values()[b_index].approximate_blob_cnt;
+            }
+        };
+        const sctx: SortContext = .{ .map = &ctx.writer.path_registry.map };
+        ctx.writer.path_registry.map.sort(sctx);
+        break :sort;
+    }
+    // 写入sst文件。此过程相对独立。写入一个临时文件。
+    const cf_pr_pi_options = blk: {
+        const cf_pr_pi_options = c.rocksdb_options_create();
+        // 将写入的SST文件导入列族。仅需要设置列族级别即可。
+        // 因为数据库级别的`prepare_for_bulk_load`影响的是`max_background_flushes`和`max_background_compactions`
+        // 其中前者无意义，后者建议禁用最后手动compaction
+        c.rocksdb_options_prepare_for_bulk_load(cf_pr_pi_options);
+        break :blk cf_pr_pi_options.?;
+    };
+    defer c.rocksdb_options_destroy(cf_pr_pi_options);
+    // 基于临时文件名前缀确定写入的临时sst文件名。
+    const sst_file_name: [:0]u8 = blk: {
+        var sst_file_name_builder: std.ArrayList(u8) = .empty;
+        try sst_file_name_builder.appendSlice(allocator, ctx.tmp_output_prefix);
+        try sst_file_name_builder.appendSlice(allocator, "pr2pi-sst");
+        break :blk try sst_file_name_builder.toOwnedSliceSentinel(allocator, 0);
+    };
+    defer allocator.free(sst_file_name);
+    sst_file_write: {
+        const env = c.rocksdb_envoptions_create().?;
+        defer c.rocksdb_envoptions_destroy(env);
+        const sstwriter = c.rocksdb_sstfilewriter_create(env, cf_pr_pi_options);
+        defer c.rocksdb_sstfilewriter_destroy(sstwriter);
+        c.rocksdb_sstfilewriter_open(sstwriter, sst_file_name.ptr, @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb sstfilewriter open failed! {s}\n", .{std.mem.span(ecstr)});
+            return error.RocksdbError;
+        }
+        defer {
+            c.rocksdb_sstfilewriter_finish(sstwriter, @ptrCast(&err_cstr));
+            if (err_cstr) |ecstr| {
+                std.log.err("rocksdb sstfilewriter finish failed! {s}\n", .{std.mem.span(ecstr)});
+                std.process.abort();
+            }
+        }
+
+        // 遍历排序后的`path_registry`，写入sst
+        var iter = ctx.writer.path_registry.map.iterator();
+        var key: usize = undefined;
+        while (do: {
+            key = std.mem.nativeToBig(usize, iter.index);
+            break :do iter.next();
+        }) |entry| {
+            // sstfilewriter与writebatch不同，每次put以后，key和value的生存期即可结束，不需要长期维持生存期
+            c.rocksdb_sstfilewriter_put(sstwriter, @ptrCast(&key), @sizeOf(usize), @ptrCast(&entry.value_ptr.index), @sizeOf(PathSeq), @ptrCast(&err_cstr));
+            if (err_cstr) |ecstr| {
+                std.log.err("rocksdb sstfilewriter put failed! {s}\n", .{std.mem.span(ecstr)});
+                return error.RocksdbError;
+            }
+        }
+        break :sst_file_write;
+    }
+
     // 键 path_rank - 值 path_index 列族。
     // 这个列族的键需要在全部写入完毕以后重新遍历获取，仅适合在最后单独写入。
     const cf_pr_pi = blk: {
@@ -117,9 +217,24 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         }
         break :blk cf_pr_pi.?;
     };
-    defer {
-        std.log.info("pr2pi handle destroy...\n", .{});
-        c.rocksdb_column_family_handle_destroy(cf_pr_pi);
+    defer c.rocksdb_column_family_handle_destroy(cf_pr_pi);
+
+    // 将sst文件导入列族
+    const ifo = c.rocksdb_ingestexternalfileoptions_create().?;
+    defer c.rocksdb_ingestexternalfileoptions_destroy(ifo);
+    const file_list = [_][*:0]const u8{
+        sst_file_name,
+    };
+    c.rocksdb_ingest_external_file_cf(db, cf_pr_pi, @ptrCast(&file_list), file_list.len, ifo, @ptrCast(&err_cstr));
+    if (err_cstr) |ecstr| {
+        std.log.err("rocksdb ingest external file failed! {s}\n", .{std.mem.span(ecstr)});
+        return error.RocksdbError;
     }
-    std.log.info("Create pr2pi OK.\n", .{});
+    // 再次触发compaction（复用先前的compaction配置）
+    c.rocksdb_compact_range_cf_opt(db, cf_pr_pi, compact_options, null, 0, null, 0);
+    c.rocksdb_wait_for_compact(db, wait_for_compact_options, @ptrCast(&err_cstr));
+    if (err_cstr) |ecstr| {
+        std.log.err("rocksdb wait for compact failed! {s}\n", .{std.mem.span(ecstr)});
+        return error.RocksdbError;
+    }
 }
