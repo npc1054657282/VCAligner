@@ -56,7 +56,7 @@ pub fn dumpAndCrash(self: *CrashDump) noreturn {
     var iter = self.registry.iterator();
     while (iter.next()) |entry| {
         std.log.info("cuash log: {s}-{d}", .{ entry.key_ptr.name, entry.key_ptr.id });
-        entry.value_ptr.dumpFn(entry.value_ptr);
+        entry.value_ptr.*.dumpFn(entry.value_ptr.*);
     }
     std.process.abort();
 }

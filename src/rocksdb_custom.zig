@@ -82,22 +82,22 @@ const MemPool = struct {
             @sizeOf(CommitSeq) * 128 => self.pool128.destroy(@ptrCast(@alignCast(ptr))),
             @sizeOf(CommitSeq) * 256 => self.pool256.destroy(@ptrCast(@alignCast(ptr))),
             @sizeOf(CommitSeq) * 512 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
-            @sizeOf(CommitSeq) * 1024 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(CommitSeq) * 1024 => self.pool1024.destroy(@ptrCast(@alignCast(ptr))),
             else => self.allocator.free(ptr[0..len]),
         }
     }
     fn logUsage(self: *MemPool) void {
-        std.log.info("pool1: {d}\n", .{self.pool1.arena.queryCapacity()});
-        std.log.info("pool2: {d}\n", .{self.pool2.arena.queryCapacity()});
-        std.log.info("pool4: {d}\n", .{self.pool4.arena.queryCapacity()});
-        std.log.info("pool8: {d}\n", .{self.pool8.arena.queryCapacity()});
-        std.log.info("pool16: {d}\n", .{self.pool16.arena.queryCapacity()});
-        std.log.info("pool32: {d}\n", .{self.pool32.arena.queryCapacity()});
-        std.log.info("pool64: {d}\n", .{self.pool64.arena.queryCapacity()});
-        std.log.info("pool128: {d}\n", .{self.pool128.arena.queryCapacity()});
-        std.log.info("pool256: {d}\n", .{self.pool256.arena.queryCapacity()});
-        std.log.info("pool512: {d}\n", .{self.pool512.arena.queryCapacity()});
-        std.log.info("pool1024: {d}\n", .{self.pool1024.arena.queryCapacity()});
+        std.log.info("pool1: {d}", .{self.pool1.arena.queryCapacity()});
+        std.log.info("pool2: {d}", .{self.pool2.arena.queryCapacity()});
+        std.log.info("pool4: {d}", .{self.pool4.arena.queryCapacity()});
+        std.log.info("pool8: {d}", .{self.pool8.arena.queryCapacity()});
+        std.log.info("pool16: {d}", .{self.pool16.arena.queryCapacity()});
+        std.log.info("pool32: {d}", .{self.pool32.arena.queryCapacity()});
+        std.log.info("pool64: {d}", .{self.pool64.arena.queryCapacity()});
+        std.log.info("pool128: {d}", .{self.pool128.arena.queryCapacity()});
+        std.log.info("pool256: {d}", .{self.pool256.arena.queryCapacity()});
+        std.log.info("pool512: {d}", .{self.pool512.arena.queryCapacity()});
+        std.log.info("pool1024: {d}", .{self.pool1024.arena.queryCapacity()});
     }
 };
 
@@ -106,15 +106,19 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
     mutex: std.Thread.Mutex,
     mempool_registry: std.ArrayList(*MemPool),
     allocator: std.mem.Allocator,
-    pub fn init(allocator: std.mem.Allocator) FixedBinaryAppendMergeOperaterState {
-        return .{
+    dumpable: gvca.CrashDump.Dumpable,
+    pub fn init(self: *FixedBinaryAppendMergeOperaterState, allocator: std.mem.Allocator) !void {
+        self.* = .{
             .failed = .{},
             .mutex = .{},
             .mempool_registry = .empty,
             .allocator = allocator,
+            .dumpable = .{ .dumpFn = dumpFn },
         };
+        try gvca.crash_dump.reg("mergeop", 0, &self.dumpable);
     }
     pub fn deinit(self: *FixedBinaryAppendMergeOperaterState) void {
+        gvca.crash_dump.unreg("mergeop", 0);
         for (self.mempool_registry.items) |threadlocal_mempool| {
             threadlocal_mempool.deinit();
             self.allocator.destroy(threadlocal_mempool);
@@ -176,7 +180,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             success.* = 0;
             new_value_length.* = 0;
             // 注意到当内存不足的时候失败了还会无休止地反复调用，改换思路，快速失败。
-            std.process.abort();
+            gvca.crash_dump.dumpAndCrash();
             // 分析C API源码发现merge失败时不会检查是否失败都会进行一次对`string`的赋值，如果返回`null`是未定义行为，于是借用state里的failed地址返回。
             return &s.failed;
         };
@@ -221,5 +225,12 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
     fn name(state: ?*anyopaque) callconv(.c) [*c]const u8 {
         _ = state;
         return "FixedBinaryAppendMergeOperater";
+    }
+    fn dumpFn(dumpable: *gvca.CrashDump.Dumpable) void {
+        const state: *FixedBinaryAppendMergeOperaterState = @alignCast(@fieldParentPtr("dumpable", dumpable));
+        for (state.mempool_registry.items, 0..) |threadlocal_mempool, id| {
+            std.log.info("mempool usage -{d}", .{id});
+            threadlocal_mempool.logUsage();
+        }
     }
 };

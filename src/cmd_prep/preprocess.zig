@@ -12,8 +12,9 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
         .path_registry = .{ .arena = .init(gvca.getAllocator()) },
         // 默认列族需要merge operator，在后面追加commit。
-        .merge_operator_state = .init(gvca.getAllocator()),
+        .merge_operator_state = undefined,
     };
+    try ctx.writer.merge_operator_state.init(gvca.getAllocator());
     defer {
         ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
         ctx.writer.path_registry.arena.deinit();
@@ -116,7 +117,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     const commit_seq = ctx.commit_registry.table.count();
     ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch {
         std.log.err("Commit regisistry put no clobber failed.\n", .{});
-        std.process.abort();
+        gvca.crash_dump.dumpAndCrash();
     };
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
     const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);

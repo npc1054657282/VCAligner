@@ -39,6 +39,7 @@ pub const Parsing = struct {
     }
     fn dumpFn(dumpable: *gvca.CrashDump.Dumpable) void {
         const parsing: *Parsing = @alignCast(@fieldParentPtr("dumpable", dumpable));
+        // 注：崩溃时打印不用关注数据即时性，虽然可能有数据竞争，但是获取过时数据不太紧要。
         std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
     }
 };
@@ -67,7 +68,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     lctx.to_flush.commit_seq = lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        std.process.abort();
+        gvca.crash_dump.dumpAndCrash();
     };
     lctx.to_flush.commit_seq.* = lctx.current_task.commit_seq;
     // 交由写者释放。
@@ -78,7 +79,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            std.process.abort();
+            gvca.crash_dump.dumpAndCrash();
         };
         break :blk commit.?;
     };
@@ -89,7 +90,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            std.process.abort();
+            gvca.crash_dump.dumpAndCrash();
         };
         break :blk tree.?;
     };
@@ -97,13 +98,13 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     parse_tree(gctx, lctx, tree, &@as([0]u8, .{})) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        std.process.abort();
+        gvca.crash_dump.dumpAndCrash();
     };
     // 任务结束时最后刷新一次。
     flush_relation_batch(gctx, lctx) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        std.process.abort();
+        gvca.crash_dump.dumpAndCrash();
     };
     return;
 }
