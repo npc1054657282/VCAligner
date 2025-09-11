@@ -47,6 +47,7 @@ tmp_output_prefix: []u8, // 生成临时文件的文件名前缀。与`rocksdb_o
 n_jobs: usize,
 n_rocksdbjobs: c_int,
 task_queue_capacity_log2: u5,
+compaction_trigger: c_int,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
 repo_id: [:0]u8 = undefined,
@@ -110,8 +111,10 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path"))
     .arg(zargs.Arg.optArg("rocksdb_output", ?[]const u8).long("rocksdb-output").short('o'))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"))
-    .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.0))
-    .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)));
+    .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.5))
+    .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)))
+    // 0指代禁用自动compaction。
+    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(512));
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;
@@ -205,6 +208,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         .n_jobs = n_jobs,
         .n_rocksdbjobs = n_rocksdbjobs,
         .task_queue_capacity_log2 = args.task_queue_capacity_log2,
+        .compaction_trigger = args.compaction_trigger,
     } };
 }
 pub fn deinit(self: *PrepRunner, allocator: std.mem.Allocator) void {

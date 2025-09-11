@@ -45,14 +45,32 @@ pub fn task(ctx: *PrepRunner) void {
         // 实战还是磁盘消耗量太大。采用轻量级压缩。只需要创建时设置一次即可，不用每次设置。
         c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
 
-        // 此配置为关键混合配置：同时影响数据库与默认列族的行为。
+        // 此配置为关键混合配置：部分影响数据库行为，部分影响默认列族的行为。
         // FAQ说这个函数会使用vector memtable。如果是这样的话，对我这种乱序写入的场景就不适合了。
         // 但是，所幸的是，看了[源码](https://github.com/facebook/rocksdb/blob/a34683bf543cc3eb151d08eeac00791862acd4d6/options/options.cc#L478-L519)
         // 实际没有修改memtable使用类型的行为，仅仅是全部写入L0以及禁止自动压缩。这些行为都是我需要的，可以放心使用。
         // 这个行为会设置`flush`线程为4。不用担心`flush`线程数影响parser等其他线程，因为这是I/O密集线程，不怎么影响计算线程。
-        c.rocksdb_options_prepare_for_bulk_load(db_options);
-        // 进一步增加`flush`线程数，因为发现瓶颈可能在flush
-        c.rocksdb_options_set_max_background_flushes(db_options, @intCast(ctx.n_rocksdbjobs));
+        // 补：最终发现如果不compaction，会导致写入量过大，如果磁盘不是非常大的话，会导致磁盘耗尽。
+        // 因此除非设置的compaction-trigger为0，否则依然采用自动compaction，但是相关配置会仿照parepare_for_bulk_load进行一些修改以减少写放大。
+        if (ctx.compaction_trigger == 0) {
+            c.rocksdb_options_prepare_for_bulk_load(db_options);
+            // 进一步增加`flush`线程数，因为发现瓶颈可能在flush
+            c.rocksdb_options_set_max_background_flushes(db_options, @intCast(ctx.n_rocksdbjobs));
+        } else {
+            c.rocksdb_options_set_level0_file_num_compaction_trigger(db_options, ctx.compaction_trigger);
+            // NOTE：减缓和停止触发器设置为极大值，具体减缓和停止的触发会基于`soft_pending_compaction_bytes_limit`和`hard_pending_compaction_bytes_limit`
+            // 这两个参数默认为64GB和256GB，符合需求。——本来我是这么想的。
+            // 但是最终还是磁盘空间耗尽，导致我最终尝试设置写入减缓和停止的触发。目前采取compaction_trigger的两倍和4倍。
+            c.rocksdb_options_set_level0_slowdown_writes_trigger(db_options, ctx.compaction_trigger * 2);
+            c.rocksdb_options_set_level0_stop_writes_trigger(db_options, ctx.compaction_trigger * 4);
+            // 以下配置来自prepare for bulk load内部实现。
+            c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
+            c.rocksdb_options_set_num_levels(db_options, 2);
+            c.rocksdb_options_set_max_write_buffer_number(db_options, 6);
+            c.rocksdb_options_set_min_write_buffer_number_to_merge(db_options, 1);
+            c.rocksdb_options_set_target_file_size_base(db_options, 256 * 1024 * 1024);
+            // flush和compaction的线程分配交给前面的`rocksdb_options_increase_parallelism`自动进行。
+        }
 
         // 以下为默认列族相关配置
         // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！

@@ -41,6 +41,7 @@ pub const Parsing = struct {
         const parsing: *Parsing = @alignCast(@fieldParentPtr("dumpable", dumpable));
         // 注：崩溃时打印不用关注数据即时性，虽然可能有数据竞争，但是获取过时数据不太紧要。
         std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
+        std.log.info("commit_seq: {d}\n", .{std.mem.bigToNative(PrepRunner.CommitSeq, parsing.current_task.commit_seq)});
     }
 };
 

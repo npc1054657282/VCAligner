@@ -29,6 +29,8 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 依旧禁用自动compaction。我们使用手动compaction，避免撞车。
         c.rocksdb_options_set_disable_auto_compactions(db_options, 1);
         c.rocksdb_options_set_max_open_files(db_options, 1024);
+        // 手动compaction的最大字节数应为极大值。
+        c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
         // 下面为默认列族配置
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
         c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createFixedBinaryAppendMergeOperater());

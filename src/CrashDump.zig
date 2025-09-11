@@ -55,7 +55,7 @@ pub fn unreg(self: *CrashDump, comptime name: []const u8, id: usize) void {
 pub fn dumpAndCrash(self: *CrashDump) noreturn {
     var iter = self.registry.iterator();
     while (iter.next()) |entry| {
-        std.log.info("cuash log: {s}-{d}", .{ entry.key_ptr.name, entry.key_ptr.id });
+        std.log.info("crash log: {s}-{d}", .{ entry.key_ptr.name, entry.key_ptr.id });
         entry.value_ptr.*.dumpFn(entry.value_ptr.*);
     }
     std.process.abort();

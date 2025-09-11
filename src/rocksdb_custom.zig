@@ -176,7 +176,6 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         };
         const result = local_mempool.?.create(total_length) catch {
             std.log.err("mem pool create failed! lotal length is {d}, key is {x}\n", .{ total_length, key[0..key_length] });
-            local_mempool.?.logUsage();
             success.* = 0;
             new_value_length.* = 0;
             // 注意到当内存不足的时候失败了还会无休止地反复调用，改换思路，快速失败。
@@ -230,7 +229,9 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         const state: *FixedBinaryAppendMergeOperaterState = @alignCast(@fieldParentPtr("dumpable", dumpable));
         for (state.mempool_registry.items, 0..) |threadlocal_mempool, id| {
             std.log.info("mempool usage -{d}", .{id});
-            threadlocal_mempool.logUsage();
+            // threadlocal_mempool.logUsage();
+            // 内存池的泄露问题已排除，不打印详情了。
+            _ = threadlocal_mempool;
         }
     }
 };
