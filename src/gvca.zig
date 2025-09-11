@@ -6,12 +6,16 @@ pub const diag = @import("diagnostics.zig");
 pub const c_helper = @import("c.zig");
 pub const MpscChannel = @import("mpsc_channel.zig").MpscChannel;
 pub const Pool = @import("Pool.zig");
+pub const CrashDump = @import("CrashDump.zig");
 pub const rocksdb_custom = @import("rocksdb_custom.zig");
 
 const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
 };
+
+// 全局变量，用于注册崩溃日志。
+pub var crash_dump: CrashDump = undefined;
 
 // var gpa: if (runtime_safety) std.heap.DebugAllocator(.{}) else void = if (runtime_safety) .init else {};
 
@@ -35,6 +39,8 @@ pub fn main() !void {
     //         }
     //     }
     // }
+    crash_dump = .init(root_allocator);
+    defer crash_dump.deinit();
     const diagnostics_arena = std.heap.ArenaAllocator.init(root_allocator);
     defer diagnostics_arena.deinit();
     var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };

@@ -21,31 +21,40 @@ pub const Parsing = struct {
     },
     // 以下内容为当前批次内容，flush过了就重置。
     to_flush: PrepRunner.Parsed,
+    // 当全局崩溃时，打印相关信息。目前打印arena分配的空间大小。
+    dumpable: gvca.CrashDump.Dumpable,
 
     pub fn init(self: *Parsing, channel: *Channel) void {
         self.allocator = gvca.getAllocator();
         self.diagnostics_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.diagnostics = .{ .arena = self.diagnostics_arena };
         self.producer_local = channel.mpsc_queue_ref.initProducerLocal();
+        self.current_task.arena = .init(self.allocator);
+        self.dumpable = .{ .dumpFn = dumpFn };
     }
     pub fn deinit(self: *Parsing) void {
         self.diagnostics_arena.deinit();
+        self.current_task.arena.deinit();
         self.* = undefined;
+    }
+    fn dumpFn(dumpable: *gvca.CrashDump.Dumpable) void {
+        const parsing: *Parsing = @alignCast(@fieldParentPtr("dumpable", dumpable));
+        std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
     }
 };
 
 pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: PrepRunner.CommitSeq) void {
     const lctx: *Parsing = &gctx.parsers.lctxs.items[thrd_id];
-    const allocator = lctx.allocator;
     const last_diag = &lctx.diagnostics.last_diagnostic;
     // 进入解析，降低积压的`task_in_queue_count`
     _ = gctx.parsers.task_in_queue_count.fetchSub(1, .release);
 
-    lctx.current_task = .{
-        .arena = .init(allocator),
-        .commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, commit_seq),
-    };
-    defer lctx.current_task.arena.deinit();
+    defer {
+        if (!lctx.current_task.arena.reset(.retain_capacity)) {
+            std.log.warn("Retain capacity failed, free all", .{});
+        }
+    }
+    lctx.current_task.commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, commit_seq);
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
         .arena = .init(gvca.getAllocator()),

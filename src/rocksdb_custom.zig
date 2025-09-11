@@ -86,6 +86,19 @@ const MemPool = struct {
             else => self.allocator.free(ptr[0..len]),
         }
     }
+    fn logUsage(self: *MemPool) void {
+        std.log.info("pool1: {d}\n", .{self.pool1.arena.queryCapacity()});
+        std.log.info("pool2: {d}\n", .{self.pool2.arena.queryCapacity()});
+        std.log.info("pool4: {d}\n", .{self.pool4.arena.queryCapacity()});
+        std.log.info("pool8: {d}\n", .{self.pool8.arena.queryCapacity()});
+        std.log.info("pool16: {d}\n", .{self.pool16.arena.queryCapacity()});
+        std.log.info("pool32: {d}\n", .{self.pool32.arena.queryCapacity()});
+        std.log.info("pool64: {d}\n", .{self.pool64.arena.queryCapacity()});
+        std.log.info("pool128: {d}\n", .{self.pool128.arena.queryCapacity()});
+        std.log.info("pool256: {d}\n", .{self.pool256.arena.queryCapacity()});
+        std.log.info("pool512: {d}\n", .{self.pool512.arena.queryCapacity()});
+        std.log.info("pool1024: {d}\n", .{self.pool1024.arena.queryCapacity()});
+    }
 };
 
 pub const FixedBinaryAppendMergeOperaterState = struct {
@@ -150,8 +163,6 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         if (local_mempool == null) s.reg() catch {
             std.log.err("mem pool reg failed!\n", .{});
         };
-        _ = key;
-        _ = key_length;
         const total_length = blk: {
             var tlen = if (existing_value != null) existing_value_length else 0;
             for (0..@intCast(num_operands)) |i| {
@@ -160,7 +171,8 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             break :blk tlen;
         };
         const result = local_mempool.?.create(total_length) catch {
-            std.log.err("mem pool create failed! lotal length is {d}\n", .{total_length});
+            std.log.err("mem pool create failed! lotal length is {d}, key is {x}\n", .{ total_length, key[0..key_length] });
+            local_mempool.?.logUsage();
             success.* = 0;
             new_value_length.* = 0;
             // 注意到当内存不足的时候失败了还会无休止地反复调用，改换思路，快速失败。

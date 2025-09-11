@@ -43,7 +43,7 @@ pub fn MpscChannel(MpscQueue: type) type {
             vacancy_sufficient_cond: std.Thread.Condition = .{},
             mutex: std.Thread.Mutex = .{},
         };
-        pub fn claimProduce(self: *@This(), cache: *ProducerLocal, on_wait: ?Pollable) struct { ProduceTicket, *T } {
+        pub fn claimProduce(self: *@This(), cache: *ProducerLocal, on_wait: ?*Pollable) struct { ProduceTicket, *T } {
             if (runtime_safety) {
                 // 对于mpsc_channel而言，任何已申请而未发布的生产都有可能导致死锁。
                 std.debug.assert(cache.unpublished_produce == 0);
@@ -70,7 +70,7 @@ pub fn MpscChannel(MpscQueue: type) type {
                 return .{ ticket, item_ref };
             };
         }
-        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal, on_wait: ?Pollable) ProduceTickets {
+        pub fn claimProduceMultipleExact(self: *@This(), count: usize, cache: *ProducerLocal, on_wait: ?*Pollable) ProduceTickets {
             if (runtime_safety) {
                 // 对于mpsc_channel而言，任何已申请而未发布的生产都有可能导致死锁。
                 std.debug.assert(cache.unpublished_produce == 0);
@@ -113,7 +113,7 @@ pub fn MpscChannel(MpscQueue: type) type {
                 self.consumer_sync.mutex.unlock();
             }
         }
-        pub fn claimConsume(self: *@This(), cache: *ConsumerLocal, on_wait: ?Pollable) !struct { ConsumeTicket, *T } {
+        pub fn claimConsume(self: *@This(), cache: *ConsumerLocal, on_wait: ?*Pollable) !struct { ConsumeTicket, *T } {
             if (runtime_safety) {
                 // 阻止过度申请consume行为导致死锁。
                 std.debug.assert(cache.consume_cursor_to_claim -% cache.consume_cursor_to_release < self.mpsc_queue_ref.getCapacity());

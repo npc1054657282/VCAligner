@@ -1,7 +1,7 @@
 const std = @import("std");
 const Pollable = @This();
 
-runFn: *const fn (*const Pollable, Operation) ?Status,
+runFn: *const fn (*Pollable, Operation) ?Status,
 
 pub const Operation = enum {
     run,
@@ -19,7 +19,7 @@ pub fn create(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func)), a
         allocator: std.mem.Allocator,
         status: Status = .ready,
         runnable: Pollable = .{ .runFn = runFn },
-        fn runFn(runnable: *const Pollable, operation: Operation) ?Status {
+        fn runFn(runnable: *Pollable, operation: Operation) ?Status {
             const closure: *@This() = @alignCast(@fieldParentPtr("runnable", runnable));
             return switch (operation) {
                 .run => switch (closure.status) {
@@ -42,6 +42,6 @@ pub fn create(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func)), a
     return &closure.runnable;
 }
 
-pub fn operate(self: *const Pollable, operation: Operation) ?Status {
+pub fn operate(self: *Pollable, operation: Operation) ?Status {
     return self.runFn(self, operation);
 }

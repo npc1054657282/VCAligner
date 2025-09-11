@@ -1,13 +1,14 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const CliRunner = @import("gvca").cli.Runner;
-const c = @import("gvca").c_helper.c;
-const diag = @import("gvca").diag;
-const Pool = @import("gvca").Pool;
+const gvca = @import("gvca");
+const CliRunner = gvca.cli.Runner;
+const c = gvca.c_helper.c;
+const diag = gvca.diag;
+const Pool = gvca.Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
-const MpscChannel = @import("gvca").MpscChannel;
-const FixedBinaryAppendMergeOperaterState = @import("gvca").rocksdb_custom.FixedBinaryAppendMergeOperaterState;
+const MpscChannel = gvca.MpscChannel;
+const FixedBinaryAppendMergeOperaterState = gvca.rocksdb_custom.FixedBinaryAppendMergeOperaterState;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
@@ -61,12 +62,14 @@ parsers: struct {
         self.wait_group = .{};
         self.lctxs = .empty;
         // 注：实际上的id数量为线程池数量加1，这一点从`pool.init`的实现里就能看出。这是因为创建线程池的线程自己是id 0。
-        for (try self.lctxs.addManyAsSlice(allocator, 1 + n_parserjobs)) |*lctx| {
+        for (try self.lctxs.addManyAsSlice(allocator, 1 + n_parserjobs), 0..) |*lctx, id| {
             lctx.init(channel);
+            try gvca.crash_dump.reg("parser", id, &lctx.dumpable);
         }
     }
     pub fn deinit(self: *Parsers, allocator: std.mem.Allocator) void {
-        for (self.lctxs.items) |*lctx| {
+        for (self.lctxs.items, 0..) |*lctx, id| {
+            gvca.crash_dump.unreg("parser", id);
             lctx.deinit();
         }
         self.lctxs.deinit(allocator);
