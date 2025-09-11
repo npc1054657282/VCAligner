@@ -44,6 +44,7 @@ rocksdb_output: [:0]u8,
 tmp_output_prefix: []u8, // 生成临时文件的文件名前缀。与`rocksdb_output`在同一个父目录下，并由pid与
 // 指代计算密集型任务。rocksdb的flush多为I/O密集型任务，不在`n_jobs`考虑范围内
 n_jobs: usize,
+n_rocksdbjobs: c_int,
 task_queue_capacity_log2: u5,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
@@ -106,9 +107,8 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path"))
     .arg(zargs.Arg.optArg("rocksdb_output", ?[]const u8).long("rocksdb-output").short('o'))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"))
-    .arg(zargs.Arg.optArg("parser_job_weight", u8).long("parser-job-weight").default(3))
-    .arg(zargs.Arg.optArg("rocksdb_job_weight", u8).long("rocksdb-job-weight").default(1))
-    .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(10).ranges(zargs.Ranges(u5).new().u(5, 20)));
+    .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.0))
+    .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)));
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;
@@ -186,16 +186,21 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
 
     const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
     // 在rocksdb那边最大线程数需要使用c整数输入。提前确保它不会溢出。
-    if (n_jobs > std.math.maxInt(c_int)) {
-        std.log.err("Option `jobs` is set unreasonably large.\n", .{});
-        return error.CliArgInvalidInput;
-    }
+    const n_rocksdbjobs: c_int = blk: {
+        const n_rocksdbjobs: f32 = @as(f32, @floatFromInt(n_jobs)) * args.rocksdb_job_weight;
+        if (!std.math.isFinite(n_rocksdbjobs) or n_rocksdbjobs > @as(f32, @floatFromInt(std.math.maxInt(c_int)))) {
+            std.log.err("Option `jobs` or `rocksdb-job-weight` is set unreasonably large.\n", .{});
+            return error.CliArgInvalidInput;
+        }
+        break :blk @intFromFloat(n_rocksdbjobs);
+    };
     return .{ .prep = .{
         .global = CliRunner.Global.initGlobal(args),
         .bare_repo_path = bare_repo_path,
         .rocksdb_output = rocksdb_output,
         .tmp_output_prefix = tmp_output_prefix,
         .n_jobs = n_jobs,
+        .n_rocksdbjobs = n_rocksdbjobs,
         .task_queue_capacity_log2 = args.task_queue_capacity_log2,
     } };
 }

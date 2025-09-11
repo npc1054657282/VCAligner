@@ -10,19 +10,30 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     _ = last_diag;
     // 由于C API没有对`SetDbOptions`的支持，因此只得关闭数据库后，根据修改后的配置重新打开。
     var err_cstr: ?[*:0]u8 = null;
+    const lru_cache = c.rocksdb_cache_create_lru(256 * 1024 * 1024).?;
+    defer c.rocksdb_cache_destroy(lru_cache);
+    const table_options = blk: {
+        const table_options = c.rocksdb_block_based_options_create();
+        c.rocksdb_block_based_options_set_block_cache(table_options, lru_cache);
+        break :blk table_options.?;
+    };
+    defer c.rocksdb_block_based_options_destroy(table_options);
     // 依然让数据库与主列族共用一个options
     const db_options = blk: {
         const db_options = c.rocksdb_options_create();
         c.rocksdb_options_set_create_if_missing(db_options, 0);
         c.rocksdb_options_set_error_if_exists(db_options, 0);
-        c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_jobs));
-        c.rocksdb_options_set_max_background_compactions(db_options, @intCast(ctx.n_jobs));
+        c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_rocksdbjobs));
+        c.rocksdb_options_set_max_background_compactions(db_options, @intCast(ctx.n_rocksdbjobs));
         c.rocksdb_options_set_max_background_flushes(db_options, 1);
         // 依旧禁用自动compaction。我们使用手动compaction，避免撞车。
         c.rocksdb_options_set_disable_auto_compactions(db_options, 1);
+        c.rocksdb_options_set_max_open_files(db_options, 1024);
         // 下面为默认列族配置
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
         c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createFixedBinaryAppendMergeOperater());
+        // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
+        c.rocksdb_options_set_block_based_table_factory(db_options, table_options);
         break :blk db_options.?;
     };
     defer c.rocksdb_options_destroy(db_options);
@@ -66,6 +77,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         c.rocksdb_close(db);
     }
     // 触发手动compaction（整个数据库）
+    std.log.info("Compaction start.\n", .{});
     const compact_options = c.rocksdb_compactoptions_create();
     defer c.rocksdb_compactoptions_destroy(compact_options);
 
@@ -237,4 +249,6 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         std.log.err("rocksdb wait for compact failed! {s}\n", .{std.mem.span(ecstr)});
         return error.RocksdbError;
     }
+    // 导入完毕以后，删除临时的sstfile文件。
+    try std.fs.cwd().deleteFile(sst_file_name);
 }

@@ -311,7 +311,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             .buf = @splat(.{ .item = undefined, .available = .init(~@as(Sequence, 0)) }),
             .produce_cursor_to_claim = .init(0),
             .consume_cursor_to_release = .init(0),
-            .safety = .{},
+            .safety = if (runtime_safety) .{} else {},
         };
         const capacity = 1 << capacity_log2;
         const mask = capacity - 1;

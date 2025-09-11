@@ -3,11 +3,14 @@
 // 但处于保险起见，每次阅读时总是设置它们是更加安全的。
 const std = @import("std");
 const c = @import("c.zig").c;
+const gvca = @import("gvca");
 pub const CommitSeq = @import("cmd_prep/PrepRunner.zig").CommitSeq;
 pub const PathSeq = @import("cmd_prep/PrepRunner.zig").PathSeq;
 
-pub const FixedBinaryAppendMergeOperaterState = struct {
-    failed: [0]u8, // 当失败的时候返回其指针。
+// 内存池是多线程不安全的。理想的方式是每个有需求的线程维护一个线程池。
+threadlocal var local_mempool: ?*MemPool = null;
+
+const MemPool = struct {
     pool1: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 1]u8, .{}),
     pool2: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 2]u8, .{}),
     pool4: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 4]u8, .{}),
@@ -20,9 +23,8 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
     pool512: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 512]u8, .{}),
     pool1024: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 1024]u8, .{}),
     allocator: std.mem.Allocator,
-    pub fn init(allocator: std.mem.Allocator) FixedBinaryAppendMergeOperaterState {
+    pub fn init(allocator: std.mem.Allocator) MemPool {
         return .{
-            .failed = .{},
             .pool1 = .init(allocator),
             .pool2 = .init(allocator),
             .pool4 = .init(allocator),
@@ -37,7 +39,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             .allocator = allocator,
         };
     }
-    pub fn deinit(self: *FixedBinaryAppendMergeOperaterState) void {
+    pub fn deinit(self: *MemPool) void {
         self.pool1.deinit();
         self.pool2.deinit();
         self.pool4.deinit();
@@ -50,7 +52,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         self.pool512.deinit();
         self.pool1024.deinit();
     }
-    fn create(self: *FixedBinaryAppendMergeOperaterState, len: usize) ![]u8 {
+    fn create(self: *MemPool, len: usize) ![]u8 {
         const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
         return switch (fitlen) {
             @sizeOf(CommitSeq) * 1 => try self.pool1.create(),
@@ -67,7 +69,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             else => try self.allocator.alloc(u8, len),
         };
     }
-    fn destroy(self: *FixedBinaryAppendMergeOperaterState, ptr: [*c]u8, len: usize) void {
+    fn destroy(self: *MemPool, ptr: [*c]u8, len: usize) void {
         const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
         switch (fitlen) {
             @sizeOf(CommitSeq) * 1 => self.pool1.destroy(@ptrCast(@alignCast(ptr))),
@@ -83,6 +85,36 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             @sizeOf(CommitSeq) * 1024 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
             else => self.allocator.free(ptr[0..len]),
         }
+    }
+};
+
+pub const FixedBinaryAppendMergeOperaterState = struct {
+    failed: [0]u8, // 当失败的时候返回其指针。
+    mutex: std.Thread.Mutex,
+    mempool_registry: std.ArrayList(*MemPool),
+    allocator: std.mem.Allocator,
+    pub fn init(allocator: std.mem.Allocator) FixedBinaryAppendMergeOperaterState {
+        return .{
+            .failed = .{},
+            .mutex = .{},
+            .mempool_registry = .empty,
+            .allocator = allocator,
+        };
+    }
+    pub fn deinit(self: *FixedBinaryAppendMergeOperaterState) void {
+        for (self.mempool_registry.items) |threadlocal_mempool| {
+            threadlocal_mempool.deinit();
+            self.allocator.destroy(threadlocal_mempool);
+        }
+        self.mempool_registry.deinit(self.allocator);
+    }
+    fn reg(self: *FixedBinaryAppendMergeOperaterState) !void {
+        std.debug.assert(local_mempool == null);
+        local_mempool = try self.allocator.create(MemPool);
+        local_mempool.?.* = .init(gvca.getAllocator());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.mempool_registry.append(self.allocator, local_mempool.?);
     }
     pub fn createFixedBinaryAppendMergeOperater(self: *FixedBinaryAppendMergeOperaterState) *c.rocksdb_mergeoperator_t {
         return c.rocksdb_mergeoperator_create(
@@ -114,7 +146,10 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         success: [*c]u8,
         new_value_length: [*c]usize,
     ) callconv(.c) [*c]u8 {
-        const mem_pools: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
+        const s: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
+        if (local_mempool == null) s.reg() catch {
+            std.log.err("mem pool reg failed!\n", .{});
+        };
         _ = key;
         _ = key_length;
         const total_length = blk: {
@@ -124,12 +159,14 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
             }
             break :blk tlen;
         };
-        const result = mem_pools.create(total_length) catch {
+        const result = local_mempool.?.create(total_length) catch {
             std.log.err("mem pool create failed! lotal length is {d}\n", .{total_length});
             success.* = 0;
             new_value_length.* = 0;
+            // 注意到当内存不足的时候失败了还会无休止地反复调用，改换思路，快速失败。
+            std.process.abort();
             // 分析C API源码发现merge失败时不会检查是否失败都会进行一次对`string`的赋值，如果返回`null`是未定义行为，于是借用state里的failed地址返回。
-            return &mem_pools.failed;
+            return &s.failed;
         };
 
         var offset: usize = 0;
@@ -165,9 +202,9 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
     }
     fn deleteValue(state: ?*anyopaque, value: [*c]const u8, value_length: usize) callconv(.c) void {
         if (value_length == 0) return;
-        const mem_pools: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
+        _ = state;
         // 神秘API设计：`deleteValue`钩子居然要求是个`const`指针，差点让我以为我用错了。检察源码发现居然真就是这么用的。
-        mem_pools.destroy(@constCast(value.?), value_length);
+        local_mempool.?.destroy(@constCast(value.?), value_length);
     }
     fn name(state: ?*anyopaque) callconv(.c) [*c]const u8 {
         _ = state;

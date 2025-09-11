@@ -35,9 +35,15 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_options_set_create_if_missing(db_options, 1);
         c.rocksdb_options_set_error_if_exists(db_options, 1); // 如果db已存在，报错。
         // 设置最大环境线程储量。
-        c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_jobs));
+        c.rocksdb_options_increase_parallelism(db_options, @intCast(ctx.n_rocksdbjobs));
         // 目前仅单线程写入，获取一点微小的性能提升。注：因为全是merge操作，因此`inplace_update_support`无用，不予配置。
         c.rocksdb_options_set_allow_concurrent_memtable_write(db_options, 0);
+        // 重要！默认无限制地打开文件，由于实际打开的文件数量有好几千，将导致无限制的内存提交，最终导致over commit。必须限制
+        c.rocksdb_options_set_max_open_files(db_options, 1024);
+        // 写入阶段采取只写模式，不使用操作系统缓冲区。
+        c.rocksdb_options_set_use_direct_io_for_flush_and_compaction(db_options, 1);
+        // 实战还是磁盘消耗量太大。采用轻量级压缩。只需要创建时设置一次即可，不用每次设置。
+        c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
 
         // 此配置为关键混合配置：同时影响数据库与默认列族的行为。
         // FAQ说这个函数会使用vector memtable。如果是这样的话，对我这种乱序写入的场景就不适合了。
@@ -45,6 +51,8 @@ pub fn task(ctx: *PrepRunner) void {
         // 实际没有修改memtable使用类型的行为，仅仅是全部写入L0以及禁止自动压缩。这些行为都是我需要的，可以放心使用。
         // 这个行为会设置`flush`线程为4。不用担心`flush`线程数影响parser等其他线程，因为这是I/O密集线程，不怎么影响计算线程。
         c.rocksdb_options_prepare_for_bulk_load(db_options);
+        // 进一步增加`flush`线程数，因为发现瓶颈可能在flush
+        c.rocksdb_options_set_max_background_flushes(db_options, @intCast(ctx.n_rocksdbjobs));
 
         // 以下为默认列族相关配置
         // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
@@ -55,6 +63,10 @@ pub fn task(ctx: *PrepRunner) void {
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
+
+        // 增加`write_buffer_size`。目前默认的64MB可能导致多个小sst文件，增大单个sst文件的大小，降低文件数量，以避免文件打开与关闭开销。
+        // 且大块写对磁盘的使用效率增加。提升至128MB。只设置默认列族就够了，其他列族用不着。
+        c.rocksdb_options_set_write_buffer_size(db_options, 128 * 1024 * 1024);
         break :blk db_options.?;
     };
     defer c.rocksdb_options_destroy(db_options);
@@ -196,14 +208,13 @@ pub fn task(ctx: *PrepRunner) void {
         }
         // 销毁一切。
         parsed.arena.deinit();
-    } else |_| {}
+    } else |_| {
+        std.log.info("Parse end.\n", .{});
+    }
     // 后处理：修改配置不再启用 prepare for bulk load
     // 先确保可能写入的列族全部刷新到磁盘。
     const foptions = c.rocksdb_flushoptions_create().?;
-    defer {
-        std.log.info("flush options destroy...\n", .{});
-        c.rocksdb_flushoptions_destroy(foptions);
-    }
+    defer c.rocksdb_flushoptions_destroy(foptions);
     c.rocksdb_flushoptions_set_wait(foptions, 1);
     flush_all: {
         var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
@@ -218,4 +229,5 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :flush_all;
     }
+    std.log.info("Write end. All flushed\n", .{});
 }
