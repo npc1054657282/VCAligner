@@ -56,6 +56,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
             std.log.warn("Retain capacity failed, free all", .{});
         }
     }
+    // 如果commit_seq作为值的操作数，则此行为不必要。如果commit_seq作为键，则此行为有必要。
     lctx.current_task.commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, commit_seq);
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。

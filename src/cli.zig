@@ -3,6 +3,7 @@ const zargs = @import("zargs");
 const diag = @import("diagnostics.zig");
 pub const Runner = union(enum) {
     prep: @import("cmd_prep/PrepRunner.zig"),
+    ana: @import("cmd_ana/AnaRunner.zig"),
     const cmd = blk: {
         var building_cmd = zargs.Command.new("gvca").requireSub("sub")
             .about("git version commit aligner")

@@ -40,10 +40,17 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_options_set_allow_concurrent_memtable_write(db_options, 0);
         // 重要！默认无限制地打开文件，由于实际打开的文件数量有好几千，将导致无限制的内存提交，最终导致over commit。必须限制
         c.rocksdb_options_set_max_open_files(db_options, 1024);
-        // 写入阶段采取只写模式，不使用操作系统缓冲区。
+        // 写入阶段采取只写模式，不使用操作系统缓冲区。这是因为compaction触发晚，因此缓存意义较小，减少内存拷贝。
+        // 在windows测试时，发现有文件删除延迟导致磁盘耗尽的现象，不确定`direct_io`是否有影响。
         c.rocksdb_options_set_use_direct_io_for_flush_and_compaction(db_options, 1);
         // 实战还是磁盘消耗量太大。采用轻量级压缩。只需要创建时设置一次即可，不用每次设置。
         c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        // 发现文件删除延迟导致磁盘耗尽现象。虽然我看文档说compaction会自动删除，不受此配置影响，但是观测的删除依然延迟。增加每分钟一次的删除废弃文件。
+        // 增加以后仍然未解决。后得知应该是删除线程的异步性导致被compaction的文件未能被及时删除，因为删除的线程应该始终未能被执行。
+        // 而flush线程才是被优先执行的。
+        c.rocksdb_options_set_delete_obsolete_files_period_micros(db_options, 30 * 1000000);
+        // 为此，增加SstFileManager检测磁盘限制。
+        // 仍有争议，暂不实现。
 
         // 此配置为关键混合配置：部分影响数据库行为，部分影响默认列族的行为。
         // FAQ说这个函数会使用vector memtable。如果是这样的话，对我这种乱序写入的场景就不适合了。
@@ -77,7 +84,7 @@ pub fn task(ctx: *PrepRunner) void {
         // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
         // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
-        c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createFixedBinaryAppendMergeOperater());
+        c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
@@ -186,7 +193,7 @@ pub fn task(ctx: *PrepRunner) void {
                     diagnostics.clear();
                     gvca.crash_dump.dumpAndCrash();
                 };
-                get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, get_or_put_result.index);
+                get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, @intCast(get_or_put_result.index));
                 // 新的path id - path对，写入writebatch
                 parsed_unit.key.path_seq = get_or_put_result.value_ptr.index;
                 c.rocksdb_writebatch_put_cf(

@@ -8,15 +8,16 @@ const Pool = gvca.Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
 const MpscChannel = gvca.MpscChannel;
-const FixedBinaryAppendMergeOperaterState = gvca.rocksdb_custom.FixedBinaryAppendMergeOperaterState;
+const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOperaterState;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
 const CommitRegistryTable = std.AutoHashMapUnmanaged(c.git_oid, void);
 pub const CommitSeq = CommitRegistryTable.Size;
 // Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
-// 尽管path多数情况下最大值可能不如commit多。简单起见PathSeq设置为符合ArrayHashMap要求的usize。
-pub const PathSeq = usize;
+// 但实际上pathSeq只需要`u32`足矣。
+pub const PathSeq = u32;
+pub const BlobSeq = u32;
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_hash: ?c.git_oid,
@@ -48,6 +49,7 @@ n_jobs: usize,
 n_rocksdbjobs: c_int,
 task_queue_capacity_log2: u5,
 compaction_trigger: c_int,
+// max_allowed_space_usage: u64,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
 repo_id: [:0]u8 = undefined,
@@ -103,7 +105,11 @@ writer: struct {
         //因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
         arena: std.heap.ArenaAllocator,
     },
-    merge_operator_state: FixedBinaryAppendMergeOperaterState,
+    blob_registry: struct {
+        map: std.AutoHashMapUnmanaged(c.git_oid, BlobSeq) = .empty,
+        arena: std.heap.ArenaAllocator,
+    },
+    merge_operator_state: CommitRangesMergeOperaterState,
 } align(std.atomic.cache_line) = undefined,
 
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
@@ -114,7 +120,10 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.5))
     .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)))
     // 0指代禁用自动compaction。
-    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(512));
+    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(64))
+// 与sst file manager有关。是否实现仍有争议，暂不设置。
+// .arg(zargs.Arg.optArg("max_allowed_space_usage", u64).long("max-allowed-space-usage").default(350 * 1024 * 1024 * 1024))
+;
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;
@@ -200,16 +209,19 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         }
         break :blk @intFromFloat(n_rocksdbjobs);
     };
-    return .{ .prep = .{
-        .global = CliRunner.Global.initGlobal(args),
-        .bare_repo_path = bare_repo_path,
-        .rocksdb_output = rocksdb_output,
-        .tmp_output_prefix = tmp_output_prefix,
-        .n_jobs = n_jobs,
-        .n_rocksdbjobs = n_rocksdbjobs,
-        .task_queue_capacity_log2 = args.task_queue_capacity_log2,
-        .compaction_trigger = args.compaction_trigger,
-    } };
+    return .{
+        .prep = .{
+            .global = CliRunner.Global.initGlobal(args),
+            .bare_repo_path = bare_repo_path,
+            .rocksdb_output = rocksdb_output,
+            .tmp_output_prefix = tmp_output_prefix,
+            .n_jobs = n_jobs,
+            .n_rocksdbjobs = n_rocksdbjobs,
+            .task_queue_capacity_log2 = args.task_queue_capacity_log2,
+            .compaction_trigger = args.compaction_trigger,
+            // .max_allowed_space_usage = args.max_allowed_space_usage,
+        },
+    };
 }
 pub fn deinit(self: *PrepRunner, allocator: std.mem.Allocator) void {
     allocator.free(self.bare_repo_path);

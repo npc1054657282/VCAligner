@@ -11,6 +11,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     ctx.writer = .{
         // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
         .path_registry = .{ .arena = .init(gvca.getAllocator()) },
+        .blob_registry = .{ .arena = .init(gvca.getAllocator()) },
         // 默认列族需要merge operator，在后面追加commit。
         .merge_operator_state = undefined,
     };
@@ -18,6 +19,8 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer {
         ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
         ctx.writer.path_registry.arena.deinit();
+        ctx.writer.blob_registry.map.deinit(ctx.writer.blob_registry.arena.allocator());
+        ctx.writer.blob_registry.arena.deinit();
         ctx.writer.merge_operator_state.deinit();
         ctx.writer = undefined;
     }

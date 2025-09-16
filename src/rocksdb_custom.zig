@@ -6,6 +6,9 @@ const c = @import("c.zig").c;
 const gvca = @import("gvca");
 pub const CommitSeq = @import("cmd_prep/PrepRunner.zig").CommitSeq;
 pub const PathSeq = @import("cmd_prep/PrepRunner.zig").PathSeq;
+// 一个范围。高位是范围起始值。低位是范围结束值。
+const commit_range = @import("commit_range.zig");
+const CommitRange = commit_range.CommitRange;
 
 // 内存池是多线程不安全的。理想的方式是每个有需求的线程维护一个线程池。
 threadlocal var local_mempool: ?*MemPool = null;
@@ -22,7 +25,9 @@ const MemPool = struct {
     pool256: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 256]u8, .{}),
     pool512: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 512]u8, .{}),
     pool1024: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 1024]u8, .{}),
+    pool2048: std.heap.MemoryPoolExtra([@sizeOf(CommitSeq) * 2048]u8, .{}),
     allocator: std.mem.Allocator,
+    current_task_len: usize, // 各线程的内存池保存当前merge任务构造内存时的申请长度。根据merge operator的C API可知可行，因为实际上删除是立即进行的。
     pub fn init(allocator: std.mem.Allocator) MemPool {
         return .{
             .pool1 = .init(allocator),
@@ -36,7 +41,9 @@ const MemPool = struct {
             .pool256 = .init(allocator),
             .pool512 = .init(allocator),
             .pool1024 = .init(allocator),
+            .pool2048 = .init(allocator),
             .allocator = allocator,
+            .current_task_len = undefined,
         };
     }
     pub fn deinit(self: *MemPool) void {
@@ -51,6 +58,7 @@ const MemPool = struct {
         self.pool256.deinit();
         self.pool512.deinit();
         self.pool1024.deinit();
+        self.pool2048.deinit();
     }
     fn create(self: *MemPool, len: usize) ![]u8 {
         const fitlen = std.math.ceilPowerOfTwo(usize, len) catch unreachable;
@@ -66,6 +74,7 @@ const MemPool = struct {
             @sizeOf(CommitSeq) * 256 => try self.pool256.create(),
             @sizeOf(CommitSeq) * 512 => try self.pool512.create(),
             @sizeOf(CommitSeq) * 1024 => try self.pool1024.create(),
+            @sizeOf(CommitSeq) * 2048 => try self.pool2048.create(),
             else => try self.allocator.alloc(u8, len),
         };
     }
@@ -83,6 +92,7 @@ const MemPool = struct {
             @sizeOf(CommitSeq) * 256 => self.pool256.destroy(@ptrCast(@alignCast(ptr))),
             @sizeOf(CommitSeq) * 512 => self.pool512.destroy(@ptrCast(@alignCast(ptr))),
             @sizeOf(CommitSeq) * 1024 => self.pool1024.destroy(@ptrCast(@alignCast(ptr))),
+            @sizeOf(CommitSeq) * 2048 => self.pool2048.destroy(@ptrCast(@alignCast(ptr))),
             else => self.allocator.free(ptr[0..len]),
         }
     }
@@ -98,16 +108,17 @@ const MemPool = struct {
         std.log.info("pool256: {d}", .{self.pool256.arena.queryCapacity()});
         std.log.info("pool512: {d}", .{self.pool512.arena.queryCapacity()});
         std.log.info("pool1024: {d}", .{self.pool1024.arena.queryCapacity()});
+        std.log.info("pool2048: {d}", .{self.pool2048.arena.queryCapacity()});
     }
 };
 
-pub const FixedBinaryAppendMergeOperaterState = struct {
+pub const CommitRangesMergeOperaterState = struct {
     failed: [0]u8, // 当失败的时候返回其指针。
     mutex: std.Thread.Mutex,
     mempool_registry: std.ArrayList(*MemPool),
     allocator: std.mem.Allocator,
     dumpable: gvca.CrashDump.Dumpable,
-    pub fn init(self: *FixedBinaryAppendMergeOperaterState, allocator: std.mem.Allocator) !void {
+    pub fn init(self: *CommitRangesMergeOperaterState, allocator: std.mem.Allocator) !void {
         self.* = .{
             .failed = .{},
             .mutex = .{},
@@ -117,7 +128,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         };
         try gvca.crash_dump.reg("mergeop", 0, &self.dumpable);
     }
-    pub fn deinit(self: *FixedBinaryAppendMergeOperaterState) void {
+    pub fn deinit(self: *CommitRangesMergeOperaterState) void {
         gvca.crash_dump.unreg("mergeop", 0);
         for (self.mempool_registry.items) |threadlocal_mempool| {
             threadlocal_mempool.deinit();
@@ -125,7 +136,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         }
         self.mempool_registry.deinit(self.allocator);
     }
-    fn reg(self: *FixedBinaryAppendMergeOperaterState) !void {
+    fn reg(self: *CommitRangesMergeOperaterState) !void {
         std.debug.assert(local_mempool == null);
         local_mempool = try self.allocator.create(MemPool);
         local_mempool.?.* = .init(gvca.getAllocator());
@@ -133,7 +144,7 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         defer self.mutex.unlock();
         try self.mempool_registry.append(self.allocator, local_mempool.?);
     }
-    pub fn createFixedBinaryAppendMergeOperater(self: *FixedBinaryAppendMergeOperaterState) *c.rocksdb_mergeoperator_t {
+    pub fn createCommitRangesMergeOperater(self: *CommitRangesMergeOperaterState) *c.rocksdb_mergeoperator_t {
         return c.rocksdb_mergeoperator_create(
             self,
             // destructor可以是空操作，但是不能没有。
@@ -163,39 +174,84 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         success: [*c]u8,
         new_value_length: [*c]usize,
     ) callconv(.c) [*c]u8 {
-        const s: *FixedBinaryAppendMergeOperaterState = @ptrCast(@alignCast(state.?));
+        const s: *CommitRangesMergeOperaterState = @ptrCast(@alignCast(state.?));
         if (local_mempool == null) s.reg() catch {
             std.log.err("mem pool reg failed!\n", .{});
+            gvca.crash_dump.dumpAndCrash();
         };
-        const total_length = blk: {
+        // 预估结果的最大大小：已存在的值的长度和所有操作数范围化后的总长度。
+        // 已存在的值总是一组范围序列。操作数有两种可能：如果长度为一个CommitSeq，那么它是一个单独的数。如果超过，它也是一组范围序列。
+        // 将一个数重复两次，它就成为一个最小范围序列。
+        // 目前从向前兼容性考虑，CommitSeq是大端字节序保存的，对于单独的数需要一次转换。但是转换为range以后就不再以大端字节序保存了，太麻烦了。
+        const worst_total_length = blk: {
             var tlen = if (existing_value != null) existing_value_length else 0;
             for (0..@intCast(num_operands)) |i| {
-                tlen += operands_list_length[i];
+                const operand_len = operands_list_length[i];
+                if (operand_len == @sizeOf(CommitSeq)) tlen += @sizeOf(CommitRange) else tlen += operand_len;
             }
             break :blk tlen;
         };
-        const result = local_mempool.?.create(total_length) catch {
-            std.log.err("mem pool create failed! lotal length is {d}, key is {x}\n", .{ total_length, key[0..key_length] });
-            success.* = 0;
-            new_value_length.* = 0;
-            // 注意到当内存不足的时候失败了还会无休止地反复调用，改换思路，快速失败。
+        // XXX: 使用最小堆+多路归并排序方案是一种替代，但是对于大量单独的数而言，可能反而是一种负担。目前采用直接平铺所有range的方案。
+        const all_ranges_bytes = local_mempool.?.create(worst_total_length) catch {
+            std.log.err("mem pool create all ranges bytes failed! worst lotal length is {d}, key is {x}", .{ worst_total_length, key[0..key_length] });
             gvca.crash_dump.dumpAndCrash();
-            // 分析C API源码发现merge失败时不会检查是否失败都会进行一次对`string`的赋值，如果返回`null`是未定义行为，于是借用state里的failed地址返回。
-            return &s.failed;
         };
-
+        defer local_mempool.?.destroy(all_ranges_bytes.ptr, worst_total_length);
         var offset: usize = 0;
         if (existing_value != null) {
-            @memcpy(result[offset..].ptr, existing_value[0..existing_value_length]);
+            @memcpy(all_ranges_bytes[offset..].ptr, existing_value[0..existing_value_length]);
             offset += existing_value_length;
         }
         for (0..@intCast(num_operands)) |i| {
             const operand = operands_list[i];
             const operand_len = operands_list_length[i];
-            @memcpy(result[offset..].ptr, operand[0..operand_len]);
-            offset += operand_len;
+            if (operand_len != @sizeOf(CommitSeq)) {
+                @memcpy(all_ranges_bytes[offset..].ptr, operand[0..operand_len]);
+                offset += operand_len;
+            } else {
+                const range: *CommitRange = @ptrCast(@alignCast(all_ranges_bytes[offset..].ptr));
+                // 目前操作数的保存是大端字节序的，目前不修改其逻辑。
+                const commit_seq: CommitSeq = std.mem.readInt(CommitSeq, @ptrCast(operand.?), .big);
+                // 移位是逻辑行为，不受具体本机字节序影响。
+                range.* = commit_range.packStartEnd(commit_seq, commit_seq);
+                offset += @sizeOf(CommitRange);
+            }
         }
-        new_value_length.* = total_length;
+        const all_ranges: []CommitRange = blk: {
+            const all_ranges_ptr: [*]CommitRange = @ptrCast(@alignCast(all_ranges_bytes.ptr));
+            break :blk all_ranges_ptr[0..(worst_total_length / @sizeOf(CommitRange))];
+        };
+        std.sort.pdq(CommitRange, all_ranges, {}, std.sort.asc(CommitRange));
+        const result = local_mempool.?.create(worst_total_length) catch {
+            std.log.err("mem pool create result failed! worst lotal length is {d}, key is {x}", .{ worst_total_length, key[0..key_length] });
+            gvca.crash_dump.dumpAndCrash();
+        };
+        local_mempool.?.current_task_len = worst_total_length;
+        var result_ranges_list: std.ArrayList(CommitRange) = blk: {
+            const result_ranges_ptr: [*]CommitRange = @ptrCast(@alignCast(result.ptr));
+            const result_ranges_slice = result_ranges_ptr[0..(worst_total_length / @sizeOf(CommitRange))];
+            break :blk std.ArrayList(CommitRange).initBuffer(result_ranges_slice);
+        };
+        var maybe_last_range: ?CommitRange = null;
+        for (all_ranges) |new_range| {
+            if (maybe_last_range) |last_range| {
+                const last_start = commit_range.getStart(last_range);
+                const last_end = commit_range.getEnd(last_range);
+                const new_start = commit_range.getStart(new_range);
+                const new_end = commit_range.getEnd(new_range);
+                std.debug.assert(new_start >= last_start);
+                if (new_start > new_end + 1) {
+                    result_ranges_list.appendAssumeCapacity(last_range);
+                    maybe_last_range = new_range;
+                } else if (new_end > last_end) {
+                    maybe_last_range = commit_range.packStartEnd(last_start, new_end);
+                } // 如果`new_end`不超过`last_end`，什么都不做。
+            } else maybe_last_range = new_range;
+        }
+        if (maybe_last_range) |last_range| {
+            result_ranges_list.appendAssumeCapacity(last_range);
+        }
+        new_value_length.* = result_ranges_list.items.len * @sizeOf(CommitRange);
         success.* = 1;
         return result.ptr;
     }
@@ -219,19 +275,20 @@ pub const FixedBinaryAppendMergeOperaterState = struct {
         if (value_length == 0) return;
         _ = state;
         // 神秘API设计：`deleteValue`钩子居然要求是个`const`指针，差点让我以为我用错了。检察源码发现居然真就是这么用的。
-        local_mempool.?.destroy(@constCast(value.?), value_length);
+        // 不要使用`value_length`，使用藏在`local_mempool`里的`current_task_len`。
+        local_mempool.?.destroy(@constCast(value.?), local_mempool.?.current_task_len);
     }
     fn name(state: ?*anyopaque) callconv(.c) [*c]const u8 {
         _ = state;
-        return "FixedBinaryAppendMergeOperater";
+        return "CommitRangesMergeOperater";
     }
     fn dumpFn(dumpable: *gvca.CrashDump.Dumpable) void {
-        const state: *FixedBinaryAppendMergeOperaterState = @alignCast(@fieldParentPtr("dumpable", dumpable));
+        const state: *CommitRangesMergeOperaterState = @alignCast(@fieldParentPtr("dumpable", dumpable));
         for (state.mempool_registry.items, 0..) |threadlocal_mempool, id| {
             std.log.info("mempool usage -{d}", .{id});
-            // threadlocal_mempool.logUsage();
+            threadlocal_mempool.logUsage();
             // 内存池的泄露问题已排除，不打印详情了。
-            _ = threadlocal_mempool;
+            // _ = threadlocal_mempool;
         }
     }
 };

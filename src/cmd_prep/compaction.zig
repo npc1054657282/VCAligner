@@ -33,7 +33,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
         // 下面为默认列族配置
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
-        c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createFixedBinaryAppendMergeOperater());
+        c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
         c.rocksdb_options_set_block_based_table_factory(db_options, table_options);
         break :blk db_options.?;
@@ -234,7 +234,15 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer c.rocksdb_column_family_handle_destroy(cf_pr_pi);
 
     // 将sst文件导入列族
-    const ifo = c.rocksdb_ingestexternalfileoptions_create().?;
+    const ifo = blk: {
+        const ifo = c.rocksdb_ingestexternalfileoptions_create();
+        // 虽然设置了全局序列号，但是仍然警告`At least one SST file opened without unique ID to verify`且`global_seqno=0`
+        // 有人说可能与`prepare_for_bulk_load`有关。
+        // [参见](https://forums.percona.com/t/rocksdb-alter-table-fails-silently-and-drops-all-data-global-seqno-is-required-but-disabled/27038)
+        c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(ifo, 1);
+        c.rocksdb_ingestexternalfileoptions_set_move_files(ifo, 1);
+        break :blk ifo.?;
+    };
     defer c.rocksdb_ingestexternalfileoptions_destroy(ifo);
     const file_list = [_][*:0]const u8{
         sst_file_name,
@@ -252,5 +260,6 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         return error.RocksdbError;
     }
     // 导入完毕以后，删除临时的sstfile文件。
-    try std.fs.cwd().deleteFile(sst_file_name);
+    // 不再需要，因为导入配置为了move files
+    // try std.fs.cwd().deleteFile(sst_file_name);
 }

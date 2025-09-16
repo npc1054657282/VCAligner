@@ -201,3 +201,43 @@ disruptor使用了[availableBuffer的概念](https://github.com/LMAX-Exchange/di
 但在discord讨论以后，我逐渐理清了需求：首先，各个线程在创建之初就获得一个分配器参数的需求是很罕见的：有多少线程必须对同一对象掌握分配权？有，但是不多。如果到处都使用全局分配器，那么不同线程之间原本无需竞争的线程分配需求也产生了竞争，会影响性能。因此，各个线程各自构造本地的新分配器，只有涉及所有权共享资源时，才使用线程安全分配器进行传递。当然，各个资源每次都自己持有一个线程分配器传递可能也并非上策，很可能有很多重复的线程分配器被持有传递了。以mpsc为例，更妙的方案是消费者为每个生产者的分配器都留了一个备份，当涉及某个生产者的临界资源需要消费者内存管理时，消费者读取生产者编号然后直接从对应编号的分配器里去取就行了。
 
 此外，这个全局线程分配器范式的另一个隐忧是可能与`juicy main`提案有冲突。总得而言，尽管这个帖子被不少人赞同，但是我最终认为不应该采纳此范式。
+
+## rocksdb的`errptr`
+
+rocksdb用`SaveError`来管理`errptr`，参考其具体[实现](https://github.com/facebook/rocksdb/blob/799f83a934041b305441b746f1de8b14c0f11810/db/c.cc#L612-L625)。
+
+因此，根据其实现可知：如果原本`errptr`目前保存着一个错误，而这次执行成功，`errptr`会保留前一次的错误。如果目前保存着一个错误，而这次执行失败，那么当前错误会被释放，新错误覆盖前一个错误。
+
+因此，如果想要重试，那么每次都需要先释放原有错误、重置为`nullptr`，然后才能够正确进行下一次复用。
+
+## rocksdb的“lsm文件记录的L0文件很少，但是实际上它以为已删除的文件都没删”的问题
+
+我通过设置L0文件数量来控制写入的减缓和停止。但是实际检查时发现：数据库以为L0文件很少，所以库库写入，可是实际上文件很多，因为经过compaction以后的L0文件逻辑上在lsm里面已经不算入L0文件了，可是实际却没有真正删除。简单地说，lsm认为L0只有几百个文件，但实际上已经积压了3000多个文件了。
+
+因此，由于被compaction后的L0文件未及时删除，导致磁盘空间耗尽，且在进程退出后，这些文件始终驻留。
+
+我的场景是，一个大批量的merge操作写入，没有get行为，同时开启了自动compaction以降低大小。num_level仅有2层（L0和L1）以减小写放大。
+
+rocksdb有一个删除过时文件的细节[wiki](https://github.com/facebook/rocksdb/wiki/Delete-Stale-Files)。其中讨论的几种旧lsm长期保存的情况：迭代器和get肯定没有。而持续压缩行为，根据我的日志来看，日志把自动comcition分为数个文件的多次compaction，毕竟我是自动compaction而不是一次性compaction，因此和我的场景是否存在区别？
+
+开始猜想原因。第一个猜想是操作系统的锅：NTFS接收到了删除操作但是由于磁盘I/O量大而延迟了。但是这个猜想很快排除：如果真的删除操作确实执行，那么不论如何，当程序退出的时候文件没有实际删除，过了一段时间最终操作系统早晚会删除的。但是当因为I/O耗尽程序直接abort的时候，这些文件到最后都没有退出，说明rocksdb确实没有进行这个删除操作。
+
+这里就有另一个猜想：compaction删除L0文件的操作恐怕是异步放到另一个线程里进行的。由于异步，所以由于flush和compaction线程太激烈，线程调度迟迟调度不到它，最终导致实际没执行删除操作。
+
+最后，找到了一个和我的症状非常相似的[issue](https://github.com/facebook/rocksdb/issues/10533)。他主要将问题归咎于`min_pending_output`检查。他的归咎有其理由，因为他正在执行一次完整的compaction，因此符合前面Delete-Stale-Files的wiki指出的持续压缩时compaction的删除引发的问题。这个问题是这样的：所有文件都是从低序号到高序号这么排过去的，每次compaction的时候都是在后面创建了新编号的sst文件，删掉前面的旧编号的sst文件。但是Delete-Stale-Files是这么说的：每次compaction任务和flush任务都会记录新建sst文件编号，在所有新建编号里，比其中最小编号大的所有文件都不会被删除。要命就要命在，rocksdb允许这个新建文件中的最小编号出错，只因它承诺“最终都会被删除”。可不兴这么整啊。
+
+我的问题是否和该issue提出的问题一样呢？虽然他是完整compaction，而我是自动compaction，但是，我的删除操作的表现是类似的：从一个文件节点开始，后续所有文件都不可被删除，这有一些类似`min_pending_out`出错引发的问题。
+
+仔细检查日志，发现问题：L1文件始终为4，从未更改。这意味着，后续的compaction操作并没有增加任何一个L1文件，始终在改动数量相同的文件。这意味着后续的compaction一直是在更新L1文件，没有加入新文件。这的确很可能导致同一个L1文件自第一次被compaction起就被误解为不应被删，同时导致后续的新写入的所有L0文件无法被删除。
+
+后续进一步排查，注意到了，删除操作主要通过日志中的`table_file_deletion`事件进行，而该事件具体执行通过`DeleteScheduler::DeleteFile`，这个函数内部调用`DeleteScheduler::DeleteFileImmediately`，内部又通过`fs_->DeleteFile`执行删除。
+
+我注意到一个关键问题：`DeleteScheduler::DeleteFile`执行的间隔越来越久了。最初一分钟内会执行几次，后来几分钟执行一次，再到后来十几分钟、几十分钟执行一次。每次触发删除时，删除的文件越来越多，而触发时机间隔越来越长，直到最终，磁盘占满了都未触发删除。
+
+`DeleteScheduler::DeleteFile`本质是`SstFileManagerImpl::ScheduleFileDeletion`的内部实现。它实际又是`DeleteDBFile`的内部实现。其实际调用点可能是以下两个函数：`DBImpl::DeleteObsoleteFileImpl`或者`BlobDBImpl::DeleteObsoleteFiles`，根据日志可知调用点的确是`DBImpl::DeleteObsoleteFileImpl`。
+
+`DBImpl::DeleteObsoleteFileImpl`有两个可能的调用路线。其一为`DBImpl::PurgeObsoleteFiles`，这个函数被大量调用，尤其重要的是`Status DBImpl::CompactFiles`、`DBImpl::BackgroundCallFlush`、`DBImpl::BackgroundCallCompaction`都有调用。其二为`DBImpl::SchedulePurge`-`DBImpl::BGWorkPurge`-`DBImpl::BackgroundCallPurge`这条路线，这条路线，`DBImpl::SchedulePurge`把删除放进了高优先级线程里，而它的删除内容对`DBImpl::purge_files_`负责，而`pruge_files_`是由`DBImpl::SchedulePendingPurge`进行填充的，同时，`DBImpl::PurgeObsoleteFiles`如果参数`schedule_only`为真，又会调用`DBImpl::SchedulePendingPurge`，殊途同归了。注意到，`PurgeObsoleteFiles`的`schedule_only`参数默认值为`false`，多数调用点此参数并未设置，所以应当假调用了`PurgeObsoleteFiles`，而不必过多考虑`DBImpl::SchedulePurge`的路线。
+
+而`DBImpl::PurgeObsoleteFiles`路线的一个关键特点是：删除文件的JOB id，和它对应的`compaction`的JOB id是相同的。检查日志，的确有此情况！
+
+详情移步`rocksdb日志分析.md`。结论是遇到的问题的确是`min_pending_out`导致的。
