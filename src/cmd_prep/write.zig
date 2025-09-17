@@ -148,17 +148,17 @@ pub fn task(ctx: *PrepRunner) void {
     };
     defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
 
-    // 键 blob_index - 值 blob 列族
-    // 基本类似于pi2p
-    const cf_bi_b = blk: {
-        const cf_bi_b = c.rocksdb_create_column_family(db, cf_options, "bi2b", @ptrCast(&err_cstr));
+    // 键 blob - 值 blob_index 列族
+    // 反向索引而非正向索引，因为需求不同。
+    const cf_b_bi = blk: {
+        const cf_b_bi = c.rocksdb_create_column_family(db, cf_options, "b2bi", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'bi2b' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.log.err("rocksdb create column family 'b2bi' failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
-        break :blk cf_bi_b.?;
+        break :blk cf_b_bi.?;
     };
-    defer c.rocksdb_column_family_handle_destroy(cf_bi_b);
+    defer c.rocksdb_column_family_handle_destroy(cf_b_bi);
 
     // 键 commit_index - 值 commit 列族
     // 由于commit index由任务发布者线程创建，这个列族无法确保有序写入，除非在写本地线程重新维护一套seq方案而不使用任务发布者提出的方案。
@@ -246,11 +246,11 @@ pub fn task(ctx: *PrepRunner) void {
                 keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
                 c.rocksdb_writebatch_put_cf(
                     wb,
-                    cf_bi_b,
-                    @ptrCast(blob_get_or_put_result.value_ptr),
-                    @sizeOf(BlobSeq),
+                    cf_b_bi,
                     @ptrCast(&blob_get_or_put_result.key_ptr.id),
                     @sizeOf(@TypeOf(blob_get_or_put_result.key_ptr.id)),
+                    @ptrCast(blob_get_or_put_result.value_ptr),
+                    @sizeOf(BlobSeq),
                 );
             } else keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
             keys_buf[i].commit_seq = parsed.commit_seq;
