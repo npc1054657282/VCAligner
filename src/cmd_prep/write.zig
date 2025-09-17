@@ -1,6 +1,7 @@
 const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
 const PathSeq = PrepRunner.PathSeq;
+const BlobSeq = PrepRunner.BlobSeq;
 const gvca = @import("gvca");
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
@@ -18,9 +19,21 @@ pub fn task(ctx: *PrepRunner) void {
     const last_diag = &diagnostics.last_diagnostic;
     _ = last_diag;
 
+    const Key = extern struct {
+        path_seq: PathSeq align(1),
+        blob_seq: BlobSeq align(1),
+    };
+    var keys_buf: [write_batch_threshold * 2]Key = undefined;
+    const keys_list: [write_batch_threshold * 2]*Key = blk: {
+        var keys_list: [write_batch_threshold * 2]*Key = undefined;
+        for (&keys_buf, 0..) |*key_ptr, i| {
+            keys_list[i] = key_ptr;
+        }
+        break :blk keys_list;
+    };
     // 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此总是给write_batch看相同的内容。
     // `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用
-    const keys_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(PrepRunner.Parsed.KeyBuf));
+    const keys_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(Key));
     const values_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(PrepRunner.CommitSeq));
 
     // rocksdb 配置调优……
@@ -107,8 +120,8 @@ pub fn task(ctx: *PrepRunner) void {
     defer c.rocksdb_close(db);
 
     // 默认列族：键是path_index-blob，值由多个commit_index组成，需要前缀提取器。
-    const cf_pi_b_cis = c.rocksdb_get_default_column_family_handle(db).?;
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
+    const cf_pi_bi_cis = c.rocksdb_get_default_column_family_handle(db).?;
+    defer c.rocksdb_column_family_handle_destroy(cf_pi_bi_cis);
 
     // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
     // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
@@ -125,12 +138,24 @@ pub fn task(ctx: *PrepRunner) void {
     const cf_pi_p = blk: {
         const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.log.err("rocksdb create column family 'pi2p' failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
         break :blk cf_pi_p.?;
     };
     defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
+
+    // 键 blob_index - 值 blob 列族
+    // 基本类似于pi2p
+    const cf_bi_b = blk: {
+        const cf_bi_b = c.rocksdb_create_column_family(db, cf_options, "bi2b", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'bi2b' failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :blk cf_bi_b.?;
+    };
+    defer c.rocksdb_column_family_handle_destroy(cf_bi_b);
 
     // 键 commit_index - 值 commit 列族
     // 由于commit index由任务发布者线程创建，这个列族无法确保有序写入，除非在写本地线程重新维护一套seq方案而不使用任务发布者提出的方案。
@@ -177,34 +202,52 @@ pub fn task(ctx: *PrepRunner) void {
                 @sizeOf(@TypeOf(commit_hash.id)),
             );
         }
-        // 就地修改`parsed_unit`中的`key`
-        for (parsed.parsed_units.items) |*parsed_unit| {
-            const get_or_put_result = ctx.writer.path_registry.map.getOrPut(ctx.writer.path_registry.arena.allocator(), parsed_unit.path) catch |err| {
+        // 设置`key`
+        for (parsed.parsed_units.items, 0..) |*parsed_unit, i| {
+            const path_get_or_put_result = ctx.writer.path_registry.map.getOrPut(ctx.writer.path_registry.arena.allocator(), parsed_unit.path) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
                 gvca.crash_dump.dumpAndCrash();
             };
-            if (!get_or_put_result.found_existing) {
+            if (!path_get_or_put_result.found_existing) {
                 // 注意！`getOrPut`会直接把我们用于比较的`parsed_unit.path`作为键。但是`parsed_unit.path`的生存周期实际上并不够！
                 // 因此，我们需要重新设置一个生命周期安全的新key，也就是将当前的`parsed_unit.path`用hash map自己的分配器重新拷贝一份。
                 // 虽然文档让我们不要修改键，但我想我知道我们现在在做什么。
-                get_or_put_result.key_ptr.* = std.mem.Allocator.dupe(ctx.writer.path_registry.arena.allocator(), u8, parsed_unit.path) catch |err| {
+                path_get_or_put_result.key_ptr.* = std.mem.Allocator.dupe(ctx.writer.path_registry.arena.allocator(), u8, parsed_unit.path) catch |err| {
                     diagnostics.log_all(err);
                     diagnostics.clear();
                     gvca.crash_dump.dumpAndCrash();
                 };
-                get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, @intCast(get_or_put_result.index));
+                path_get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, @intCast(path_get_or_put_result.index));
                 // 新的path id - path对，写入writebatch
-                parsed_unit.key.path_seq = get_or_put_result.value_ptr.index;
+                keys_buf[i].path_seq = path_get_or_put_result.value_ptr.index;
                 c.rocksdb_writebatch_put_cf(
                     wb,
                     cf_pi_p,
-                    @ptrCast(&parsed_unit.key.path_seq),
+                    @ptrCast(&path_get_or_put_result.value_ptr.index),
                     @sizeOf(PathSeq),
-                    @ptrCast(parsed_unit.path.ptr),
-                    parsed_unit.path.len,
+                    @ptrCast(path_get_or_put_result.key_ptr.*.ptr),
+                    path_get_or_put_result.key_ptr.*.len,
                 );
-            } else parsed_unit.key.path_seq = get_or_put_result.value_ptr.index;
+            } else keys_buf[i].path_seq = path_get_or_put_result.value_ptr.index;
+            const blob_get_or_put_result = ctx.writer.blob_registry.map.getOrPut(ctx.writer.blob_registry.arena.allocator(), parsed_unit.blob_hash) catch |err| {
+                diagnostics.log_all(err);
+                diagnostics.clear();
+                gvca.crash_dump.dumpAndCrash();
+            };
+            if (!blob_get_or_put_result.found_existing) {
+                // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
+                blob_get_or_put_result.value_ptr.* = std.mem.nativeToBig(BlobSeq, ctx.writer.blob_registry.map.count() - 1);
+                keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
+                c.rocksdb_writebatch_put_cf(
+                    wb,
+                    cf_bi_b,
+                    @ptrCast(blob_get_or_put_result.value_ptr),
+                    @sizeOf(BlobSeq),
+                    @ptrCast(blob_get_or_put_result.key_ptr),
+                    @sizeOf(c.git_oid),
+                );
+            } else keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
         }
         // 检查是否超出阈值。超出阈值立即写入memtable。
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
@@ -217,9 +260,9 @@ pub fn task(ctx: *PrepRunner) void {
         // 批量merge入默认列族
         c.rocksdb_writebatch_mergev_cf(
             wb,
-            cf_pi_b_cis,
-            @intCast(parsed.keys_list.items.len),
-            @ptrCast(parsed.keys_list.items.ptr),
+            cf_pi_bi_cis,
+            @intCast(parsed.parsed_units.items.len),
+            @ptrCast(&keys_list),
             &keys_list_sizes,
             @intCast(parsed.values_list.len),
             @ptrCast(parsed.values_list.ptr),
@@ -243,7 +286,7 @@ pub fn task(ctx: *PrepRunner) void {
     c.rocksdb_flushoptions_set_wait(foptions, 1);
     flush_all: {
         var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
-            cf_pi_b_cis,
+            cf_pi_bi_cis,
             cf_pi_p,
             cf_ci_c,
         };

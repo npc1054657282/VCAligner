@@ -56,15 +56,13 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
             std.log.warn("Retain capacity failed, free all", .{});
         }
     }
-    // 如果commit_seq作为值的操作数，则此行为不必要。如果commit_seq作为键，则此行为有必要。
-    lctx.current_task.commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, commit_seq);
+    lctx.current_task.commit_seq = commit_seq;
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
         .arena = .init(gvca.getAllocator()),
         .commit_hash = commit_hash,
         .commit_seq = undefined,
         .parsed_units = .empty,
-        .keys_list = .empty,
         .values_list = undefined,
     };
     lctx.to_flush.commit_seq = lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq) catch |err| {
@@ -168,13 +166,8 @@ fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_p
 fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *const c.git_oid) !void {
     try lctx.to_flush.parsed_units.append(lctx.to_flush.arena.allocator(), .{
         .path = path,
-        .key = .{
-            .path_seq = undefined,
-            .blob_hash = blob_oid.id,
-        },
+        .blob_hash = blob_oid.*,
     });
-    const key_ptr = &lctx.to_flush.parsed_units.items[lctx.to_flush.parsed_units.items.len - 1].key;
-    try lctx.to_flush.keys_list.append(lctx.to_flush.arena.allocator(), key_ptr);
     if (lctx.to_flush.parsed_units.items.len >= lctx.flush_threshold) {
         try flush_relation_batch(gctx, lctx);
         lctx.to_flush = .{
@@ -182,7 +175,6 @@ fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *con
             .commit_hash = null,
             .commit_seq = undefined,
             .parsed_units = .empty,
-            .keys_list = .empty,
             .values_list = undefined,
         };
         lctx.to_flush.commit_seq = try lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq);

@@ -27,16 +27,11 @@ pub const Parsed = struct {
     // 可能并非必要，因为已经在arena中分配？
     // path_strings: std.ArrayList(u8),
     parsed_units: std.ArrayList(ParsedUnit),
-    keys_list: std.ArrayList(*KeyBuf),
     // 将CommitSeq的指针一次性拷贝len次
     values_list: []*CommitSeq,
-    pub const KeyBuf = extern struct {
-        path_seq: PathSeq align(1), // flush时未赋值，写入前解析赋值。
-        blob_hash: [20]u8 align(1), //目前硬编码，尚未考虑SHA256。未来libgit2升级了可能会考虑。
-    };
     pub const ParsedUnit = struct {
         path: []u8,
-        key: KeyBuf,
+        blob_hash: c.git_oid,
     };
 };
 

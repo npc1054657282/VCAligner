@@ -44,14 +44,16 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     const cf_options = c.rocksdb_options_create().?;
     defer c.rocksdb_options_destroy(cf_options);
 
-    const db, const cf_pi_b_cis, const cf_pi_p, const cf_ci_c = reopen_db: {
+    const db, const cf_pi_bi_cis, const cf_pi_p, const cf_bi_b, const cf_ci_c = reopen_db: {
         const column_family_names = [_][*:0]const u8{
             "default",
             "pi2p",
+            "bi2b",
             "ci2c",
         };
         const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
             db_options,
+            cf_options,
             cf_options,
             cf_options,
         };
@@ -70,11 +72,12 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
             std.log.err("rocksdb reopen failed! {s}\n", .{std.mem.span(ecstr)});
             return error.RocksdbError;
         }
-        break :reopen_db .{ new_db.?, column_family_handles[0].?, column_family_handles[1].?, column_family_handles[2].? };
+        break :reopen_db .{ new_db.?, column_family_handles[0].?, column_family_handles[1].?, column_family_handles[2].?, column_family_handles[3].? };
     };
     defer {
-        c.rocksdb_column_family_handle_destroy(cf_pi_b_cis);
+        c.rocksdb_column_family_handle_destroy(cf_pi_bi_cis);
         c.rocksdb_column_family_handle_destroy(cf_pi_p);
+        c.rocksdb_column_family_handle_destroy(cf_bi_b);
         c.rocksdb_column_family_handle_destroy(cf_ci_c);
         c.rocksdb_close(db);
     }
@@ -139,7 +142,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
             };
             c.rocksdb_approximate_sizes_cf(
                 db,
-                cf_pi_b_cis,
+                cf_pi_bi_cis,
                 1,
                 @ptrCast(&range_start_key),
                 &range_start_key_len,
