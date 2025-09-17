@@ -61,16 +61,9 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
         .arena = .init(gvca.getAllocator()),
         .commit_hash = commit_hash,
-        .commit_seq = undefined,
+        .commit_seq = commit_seq,
         .parsed_units = .empty,
-        .values_list = undefined,
     };
-    lctx.to_flush.commit_seq = lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq) catch |err| {
-        lctx.diagnostics.log_all(err);
-        lctx.diagnostics.clear();
-        gvca.crash_dump.dumpAndCrash();
-    };
-    lctx.to_flush.commit_seq.* = lctx.current_task.commit_seq;
     // 交由写者释放。
 
     const commit: *c.git_commit = blk: {
@@ -173,18 +166,13 @@ fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *con
         lctx.to_flush = .{
             .arena = .init(gvca.getAllocator()),
             .commit_hash = null,
-            .commit_seq = undefined,
+            .commit_seq = lctx.current_task.commit_seq,
             .parsed_units = .empty,
-            .values_list = undefined,
         };
-        lctx.to_flush.commit_seq = try lctx.to_flush.arena.allocator().create(PrepRunner.CommitSeq);
-        lctx.to_flush.commit_seq.* = lctx.current_task.commit_seq;
     }
 }
 
 fn flush_relation_batch(gctx: *PrepRunner, lctx: *Parsing) !void {
-    lctx.to_flush.values_list = try lctx.to_flush.arena.allocator().alloc(*PrepRunner.CommitSeq, lctx.to_flush.parsed_units.items.len);
-    @memset(lctx.to_flush.values_list, lctx.to_flush.commit_seq);
     const ticket, const to_produce: *PrepRunner.Parsed = gctx.channel.claimProduce(&lctx.producer_local, null);
     defer gctx.channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。

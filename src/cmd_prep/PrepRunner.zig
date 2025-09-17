@@ -21,14 +21,12 @@ pub const BlobSeq = u32;
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_hash: ?c.git_oid,
-    commit_seq: *CommitSeq,
+    commit_seq: CommitSeq,
     // XXX: 考虑`MultiArrayList`，但是实际使用有些困难，因为实际上我的需求是要为key与path本身设计列表，也要为key的指针设计列表。
     // 如果`MultiArrayList`的各个成员之间有地址依赖，该怎么设计，我感到头疼。因此目前依然是设计为分开的`ArrayList`
     // 可能并非必要，因为已经在arena中分配？
     // path_strings: std.ArrayList(u8),
     parsed_units: std.ArrayList(ParsedUnit),
-    // 将CommitSeq的指针一次性拷贝len次
-    values_list: []*CommitSeq,
     pub const ParsedUnit = struct {
         path: []u8,
         blob_hash: c.git_oid,
@@ -115,10 +113,7 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.5))
     .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)))
     // 0指代禁用自动compaction。
-    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(64))
-// 与sst file manager有关。是否实现仍有争议，暂不设置。
-// .arg(zargs.Arg.optArg("max_allowed_space_usage", u64).long("max-allowed-space-usage").default(350 * 1024 * 1024 * 1024))
-;
+    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(0));
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;

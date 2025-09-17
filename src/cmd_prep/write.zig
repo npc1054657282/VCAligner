@@ -2,6 +2,7 @@ const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
 const PathSeq = PrepRunner.PathSeq;
 const BlobSeq = PrepRunner.BlobSeq;
+const CommitSeq = PrepRunner.CommitSeq;
 const gvca = @import("gvca");
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
@@ -22,6 +23,7 @@ pub fn task(ctx: *PrepRunner) void {
     const Key = extern struct {
         path_seq: PathSeq align(1),
         blob_seq: BlobSeq align(1),
+        commit_seq: CommitSeq align(1),
     };
     var keys_buf: [write_batch_threshold * 2]Key = undefined;
     const keys_list: [write_batch_threshold * 2]*Key = blk: {
@@ -34,7 +36,8 @@ pub fn task(ctx: *PrepRunner) void {
     // 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此总是给write_batch看相同的内容。
     // `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用
     const keys_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(Key));
-    const values_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(PrepRunner.CommitSeq));
+    const values_list: [write_batch_threshold * 2][*c]const u8 = @splat(null);
+    const values_list_sizes: [write_batch_threshold * 2]usize = @splat(0);
 
     // rocksdb 配置调优……
     var err_cstr: ?[*:0]u8 = null;
@@ -96,8 +99,8 @@ pub fn task(ctx: *PrepRunner) void {
         // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
         // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
         // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq)));
-        c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq) + @sizeOf(BlobSeq)));
+        // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
@@ -191,12 +194,14 @@ pub fn task(ctx: *PrepRunner) void {
         // XXX: 原计划有跨任务的`writebatch`堆积。最终放弃，如果需要跨任务堆积`writebatch`，那么各个任务来的arena就必须延迟释放。
         // 还需要额外管理arena的保存，很麻烦，而且一定要堆那么多才一次性写入未必总是好的，毕竟是无序写。
 
-        // 如果`commit_hash`非空，写入一个commit id- commit对
+        // 如果`commit_hash`非空，写入一个commit id - commit对
+        // XXX: 不在过程中写入，而是在最后拿到preprocess定义的commit registry后整体写入。
+        // 这样可以避免使用临时的parsed的指针，这样就可以允许跨批次写入了，目前每一批都一定要写入。
         if (parsed.commit_hash) |*commit_hash| {
             c.rocksdb_writebatch_put_cf(
                 wb,
                 cf_ci_c,
-                @ptrCast(parsed.commit_seq),
+                @ptrCast(&parsed.commit_seq),
                 @sizeOf(PrepRunner.CommitSeq),
                 @ptrCast(&commit_hash.id),
                 @sizeOf(@TypeOf(commit_hash.id)),
@@ -244,10 +249,11 @@ pub fn task(ctx: *PrepRunner) void {
                     cf_bi_b,
                     @ptrCast(blob_get_or_put_result.value_ptr),
                     @sizeOf(BlobSeq),
-                    @ptrCast(blob_get_or_put_result.key_ptr),
-                    @sizeOf(c.git_oid),
+                    @ptrCast(&blob_get_or_put_result.key_ptr.id),
+                    @sizeOf(@TypeOf(blob_get_or_put_result.key_ptr.id)),
                 );
             } else keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
+            keys_buf[i].commit_seq = parsed.commit_seq;
         }
         // 检查是否超出阈值。超出阈值立即写入memtable。
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
@@ -257,15 +263,15 @@ pub fn task(ctx: *PrepRunner) void {
                 gvca.crash_dump.dumpAndCrash();
             }
         }
-        // 批量merge入默认列族
-        c.rocksdb_writebatch_mergev_cf(
+        // 批量put入默认列族
+        c.rocksdb_writebatch_putv_cf(
             wb,
             cf_pi_bi_cis,
             @intCast(parsed.parsed_units.items.len),
             @ptrCast(&keys_list),
             &keys_list_sizes,
-            @intCast(parsed.values_list.len),
-            @ptrCast(parsed.values_list.ptr),
+            @intCast(parsed.parsed_units.items.len),
+            &values_list,
             &values_list_sizes,
         );
         // 总是写入memtable
