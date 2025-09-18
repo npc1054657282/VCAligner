@@ -12,15 +12,17 @@ const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOper
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
-const CommitRegistryTable = std.AutoHashMapUnmanaged(c.git_oid, void);
-pub const CommitSeq = CommitRegistryTable.Size;
+pub const CommitSeq = u32;
 // Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
 // 但实际上pathSeq只需要`u32`足矣。
 pub const PathSeq = u32;
-pub const BlobSeq = u32;
+pub const PathBlobKey = extern struct {
+    path_seq: PathSeq align(1),
+    blob_hash: c.git_oid align(1),
+};
+pub const PathBlobSeq = u32;
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
-    commit_hash: ?c.git_oid,
     commit_seq: CommitSeq,
     // XXX: 考虑`MultiArrayList`，但是实际使用有些困难，因为实际上我的需求是要为key与path本身设计列表，也要为key的指针设计列表。
     // 如果`MultiArrayList`的各个成员之间有地址依赖，该怎么设计，我感到头疼。因此目前依然是设计为分开的`ArrayList`
@@ -77,9 +79,9 @@ channel: Channel = undefined,
 // 下列内容是在各线程已经被创建后，主线程依旧会修改的可变内容，应缓存行对齐，以避免各线程读取上列对各线程而言的只读内容时遭遇伪共享。
 commit_registry: struct {
     // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
-    // 目前还不知道有什么需要回溯插入顺序的地方，也暂时没想到迭代需求。如果未来有迭代需求，会考虑改用ArrayHashMap。
-    // 目前基于最高查询效率的目的采用HashMap
-    table: CommitRegistryTable = .empty,
+    // 目前需求：查找频繁，最后迭代一次。迭代是无序的。
+    // 目前基于最高查询效率的目的采用HashMap。未来或考虑array hash map。
+    map: std.AutoHashMapUnmanaged(c.git_oid, CommitSeq) = .empty,
     arena: std.heap.ArenaAllocator,
 } align(std.atomic.cache_line) = undefined,
 // 下列内容是写线程会修改，而最终移交给主线程的内容。
@@ -92,14 +94,14 @@ writer: struct {
             // 在写入过程中不记录此值。在全部写入完毕以后，遍历一遍所有的key统计此值。最后排序的依据。
             // 实际使用`rocksdb_approximate_sizes_cf`获取，因此是约数。
             // XXX: 在内存中为每个path都记录一个它的blob的hashmap。怀疑其可行性，宁肯全部写入完毕以后再遍历rocksdb数据库。
-            approximate_blob_cnt: usize,
+            blob_cnt: usize,
         }) = .empty,
         // arena很重要，注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存
         //因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
         arena: std.heap.ArenaAllocator,
     },
-    blob_registry: struct {
-        map: std.AutoHashMapUnmanaged(c.git_oid, BlobSeq) = .empty,
+    path_blob_registry: struct {
+        map: std.AutoHashMapUnmanaged(PathBlobKey, PathBlobSeq) = .empty,
         arena: std.heap.ArenaAllocator,
     },
     merge_operator_state: CommitRangesMergeOperaterState,
@@ -110,7 +112,7 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path"))
     .arg(zargs.Arg.optArg("rocksdb_output", ?[]const u8).long("rocksdb-output").short('o'))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"))
-    .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(1.5))
+    .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(0.5))
     .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)))
     // 0指代禁用自动compaction。
     .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(0));

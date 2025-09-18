@@ -8,6 +8,7 @@ pub const MpscChannel = @import("mpsc_channel.zig").MpscChannel;
 pub const Pool = @import("Pool.zig");
 pub const CrashDump = @import("CrashDump.zig");
 pub const rocksdb_custom = @import("rocksdb_custom.zig");
+pub const commit_range = @import("commit_range.zig");
 
 const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,

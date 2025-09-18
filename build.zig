@@ -29,7 +29,7 @@ fn createGvcaModule(
     });
     const mpsc_queue_options = b.addOptions();
     mpsc_queue_options.addOption(bool, "enable_sequence_type_override_warning", true);
-    mpsc_queue_options.addOption(bool, "enable_small_object_warning", true);
+    mpsc_queue_options.addOption(bool, "enable_small_object_warning", false);
     mpsc_queue_options.addOption(?bool, "runtime_safety", null);
     mpsc_queue_module.addOptions("mpsc_queue_options", mpsc_queue_options);
 

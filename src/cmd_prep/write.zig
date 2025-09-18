@@ -1,7 +1,8 @@
 const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
 const PathSeq = PrepRunner.PathSeq;
-const BlobSeq = PrepRunner.BlobSeq;
+const PathBlobKey = PrepRunner.PathBlobKey;
+const PathBlobSeq = PrepRunner.PathBlobSeq;
 const CommitSeq = PrepRunner.CommitSeq;
 const gvca = @import("gvca");
 const c = gvca.c_helper.c;
@@ -21,8 +22,7 @@ pub fn task(ctx: *PrepRunner) void {
     _ = last_diag;
 
     const Key = extern struct {
-        path_seq: PathSeq align(1),
-        blob_seq: BlobSeq align(1),
+        path_blob_seq: PathBlobSeq align(1),
         commit_seq: CommitSeq align(1),
     };
     var keys_buf: [write_batch_threshold * 2]Key = undefined;
@@ -60,7 +60,8 @@ pub fn task(ctx: *PrepRunner) void {
         // 在windows测试时，发现有文件删除延迟导致磁盘耗尽的现象，不确定`direct_io`是否有影响。
         c.rocksdb_options_set_use_direct_io_for_flush_and_compaction(db_options, 1);
         // 实战还是磁盘消耗量太大。采用轻量级压缩。只需要创建时设置一次即可，不用每次设置。
-        c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        // 对于三元组纯key压缩率不高，有可能导致sst分片更多，因此目前不用压缩看看。
+        // c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
         // 发现文件删除延迟导致磁盘耗尽现象。虽然我看文档说compaction会自动删除，不受此配置影响，但是观测的删除依然延迟。增加每分钟一次的删除废弃文件。
         // 增加以后仍然未解决。后得知应该是删除线程的异步性导致被compaction的文件未能被及时删除，因为删除的线程应该始终未能被执行。
         // 而flush线程才是被优先执行的。
@@ -96,18 +97,18 @@ pub fn task(ctx: *PrepRunner) void {
         }
 
         // 以下为默认列族相关配置
+        // 增加`write_buffer_size`。目前默认的64MB可能导致多个小sst文件，增大单个sst文件的大小，降低文件数量，以避免文件打开与关闭开销。
+        // 只设置默认列族就够了，其他列族用不着。
+        c.rocksdb_options_set_write_buffer_size(db_options, 256 * 1024 * 1024);
+        c.rocksdb_options_set_max_write_buffer_number(db_options, @intCast(ctx.n_rocksdbjobs));
         // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
         // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
         // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq) + @sizeOf(BlobSeq)));
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathBlobSeq)));
         // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。
-
-        // 增加`write_buffer_size`。目前默认的64MB可能导致多个小sst文件，增大单个sst文件的大小，降低文件数量，以避免文件打开与关闭开销。
-        // 且大块写对磁盘的使用效率增加。提升至128MB。只设置默认列族就够了，其他列族用不着。
-        c.rocksdb_options_set_write_buffer_size(db_options, 128 * 1024 * 1024);
         break :blk db_options.?;
     };
     defer c.rocksdb_options_destroy(db_options);
@@ -122,57 +123,9 @@ pub fn task(ctx: *PrepRunner) void {
     };
     defer c.rocksdb_close(db);
 
-    // 默认列族：键是path_index-blob，值由多个commit_index组成，需要前缀提取器。
-    const cf_pi_bi_cis = c.rocksdb_get_default_column_family_handle(db).?;
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_bi_cis);
-
-    // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
-    // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
-    const cf_options = blk: {
-        const cf_options = c.rocksdb_options_create();
-        c.rocksdb_options_prepare_for_bulk_load(cf_options);
-        break :blk cf_options.?;
-    };
-    defer c.rocksdb_options_destroy(cf_options);
-
-    // 键 path_index - 值 path 列族
-    // 由于path index 由本写者线程自己维护，因此这个列族一定可以确保有序写入，理论上完全可以通过sstfilewriter写入。
-    // 不是主要性能问题来源，暂不考虑增加复杂度。
-    const cf_pi_p = blk: {
-        const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
-        if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'pi2p' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash();
-        }
-        break :blk cf_pi_p.?;
-    };
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
-
-    // 键 blob - 值 blob_index 列族
-    // 反向索引而非正向索引，因为需求不同。
-    const cf_b_bi = blk: {
-        const cf_b_bi = c.rocksdb_create_column_family(db, cf_options, "b2bi", @ptrCast(&err_cstr));
-        if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'b2bi' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash();
-        }
-        break :blk cf_b_bi.?;
-    };
-    defer c.rocksdb_column_family_handle_destroy(cf_b_bi);
-
-    // 键 commit_index - 值 commit 列族
-    // 由于commit index由任务发布者线程创建，这个列族无法确保有序写入，除非在写本地线程重新维护一套seq方案而不使用任务发布者提出的方案。
-    // XXX: 另一个方案是，和path rank一样，不在中途写入，而是由任务发布者保存seq，且在全部写入完毕后从任务发布者处接收并一次性写入。
-    // 替代方案优化性能有限，暂不考虑。
-    const cf_ci_c = blk: {
-        const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr));
-        if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash();
-        }
-        break :blk cf_ci_c.?;
-    };
-    defer c.rocksdb_column_family_handle_destroy(cf_ci_c);
+    // 默认列族：键是path_blob_index-commit_index的二元组，值为空。
+    const cf_pbi_ci = c.rocksdb_get_default_column_family_handle(db).?;
+    defer c.rocksdb_column_family_handle_destroy(cf_pbi_ci);
 
     const woptions = blk: {
         const woptions = c.rocksdb_writeoptions_create();
@@ -191,22 +144,8 @@ pub fn task(ctx: *PrepRunner) void {
         const ticket, const parsed: *PrepRunner.Parsed = lease;
         // mpsc队列中消费者不比生产者，生产者写入过程需要尽可能快否则消费者可能卡在慢生产者后面。消费者慢点卡着没逝的。
         defer ctx.channel.releaseConsumedUnsafe(ticket);
-        // XXX: 原计划有跨任务的`writebatch`堆积。最终放弃，如果需要跨任务堆积`writebatch`，那么各个任务来的arena就必须延迟释放。
-        // 还需要额外管理arena的保存，很麻烦，而且一定要堆那么多才一次性写入未必总是好的，毕竟是无序写。
+        // XXX: 跨任务的`writebatch`堆积。目前的默认列族写入三元组不涉及动态内存，考虑实现。
 
-        // 如果`commit_hash`非空，写入一个commit id - commit对
-        // XXX: 不在过程中写入，而是在最后拿到preprocess定义的commit registry后整体写入。
-        // 这样可以避免使用临时的parsed的指针，这样就可以允许跨批次写入了，目前每一批都一定要写入。
-        if (parsed.commit_hash) |*commit_hash| {
-            c.rocksdb_writebatch_put_cf(
-                wb,
-                cf_ci_c,
-                @ptrCast(&parsed.commit_seq),
-                @sizeOf(PrepRunner.CommitSeq),
-                @ptrCast(&commit_hash.id),
-                @sizeOf(@TypeOf(commit_hash.id)),
-            );
-        }
         // 设置`key`
         for (parsed.parsed_units.items, 0..) |*parsed_unit, i| {
             const path_get_or_put_result = ctx.writer.path_registry.map.getOrPut(ctx.writer.path_registry.arena.allocator(), parsed_unit.path) catch |err| {
@@ -223,50 +162,35 @@ pub fn task(ctx: *PrepRunner) void {
                     diagnostics.clear();
                     gvca.crash_dump.dumpAndCrash();
                 };
-                path_get_or_put_result.value_ptr.index = std.mem.nativeToBig(PathSeq, @intCast(path_get_or_put_result.index));
-                // 新的path id - path对，写入writebatch
-                keys_buf[i].path_seq = path_get_or_put_result.value_ptr.index;
-                c.rocksdb_writebatch_put_cf(
-                    wb,
-                    cf_pi_p,
-                    @ptrCast(&path_get_or_put_result.value_ptr.index),
-                    @sizeOf(PathSeq),
-                    @ptrCast(path_get_or_put_result.key_ptr.*.ptr),
-                    path_get_or_put_result.key_ptr.*.len,
-                );
-            } else keys_buf[i].path_seq = path_get_or_put_result.value_ptr.index;
-            const blob_get_or_put_result = ctx.writer.blob_registry.map.getOrPut(ctx.writer.blob_registry.arena.allocator(), parsed_unit.blob_hash) catch |err| {
+                path_get_or_put_result.value_ptr.* = .{
+                    .index = std.mem.nativeToBig(PathSeq, @intCast(path_get_or_put_result.index)),
+                    .blob_cnt = 0, // 接下来很快会因为`path_blob_registry不命中而增加至1。
+                };
+            }
+            const path_blob_key: PathBlobKey = .{
+                .path_seq = path_get_or_put_result.value_ptr.index,
+                .blob_hash = parsed_unit.blob_hash,
+            };
+            const path_blob_get_or_put_result = ctx.writer.path_blob_registry.map.getOrPut(ctx.writer.path_blob_registry.arena.allocator(), path_blob_key) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
                 gvca.crash_dump.dumpAndCrash();
             };
-            if (!blob_get_or_put_result.found_existing) {
+            if (!path_blob_get_or_put_result.found_existing) {
                 // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
-                blob_get_or_put_result.value_ptr.* = std.mem.nativeToBig(BlobSeq, ctx.writer.blob_registry.map.count() - 1);
-                keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
-                c.rocksdb_writebatch_put_cf(
-                    wb,
-                    cf_b_bi,
-                    @ptrCast(&blob_get_or_put_result.key_ptr.id),
-                    @sizeOf(@TypeOf(blob_get_or_put_result.key_ptr.id)),
-                    @ptrCast(blob_get_or_put_result.value_ptr),
-                    @sizeOf(BlobSeq),
-                );
-            } else keys_buf[i].blob_seq = blob_get_or_put_result.value_ptr.*;
-            keys_buf[i].commit_seq = parsed.commit_seq;
-        }
-        // 检查是否超出阈值。超出阈值立即写入memtable。
-        if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
-            c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
-            if (err_cstr) |ecstr| {
-                std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
-                gvca.crash_dump.dumpAndCrash();
+                path_blob_get_or_put_result.value_ptr.* = std.mem.nativeToBig(PathBlobSeq, ctx.writer.path_blob_registry.map.count() - 1);
+                // 如果这是一个新的path-blob组合，path的blob_cnt立即加1。
+                path_get_or_put_result.value_ptr.blob_cnt += 1;
             }
+            keys_buf[i] = .{
+                .path_blob_seq = path_blob_get_or_put_result.value_ptr.*,
+                .commit_seq = parsed.commit_seq,
+            };
         }
         // 批量put入默认列族
         c.rocksdb_writebatch_putv_cf(
             wb,
-            cf_pi_bi_cis,
+            cf_pbi_ci,
             @intCast(parsed.parsed_units.items.len),
             @ptrCast(&keys_list),
             &keys_list_sizes,
@@ -285,6 +209,128 @@ pub fn task(ctx: *PrepRunner) void {
     } else |_| {
         std.log.info("Parse end.\n", .{});
     }
+
+    // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
+    // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
+    const cf_options = blk: {
+        const cf_options = c.rocksdb_options_create();
+        c.rocksdb_options_prepare_for_bulk_load(cf_options);
+        break :blk cf_options.?;
+    };
+    defer c.rocksdb_options_destroy(cf_options);
+
+    // 其他列族写入：基于各个hash map一次性写入所有内容。
+    // 键 commit_index - 值 commit 列族
+    const cf_ci_c = blk: {
+        const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :blk cf_ci_c.?;
+    };
+    defer c.rocksdb_column_family_handle_destroy(cf_ci_c);
+    // 从commit registry写入ci2c列族。目前使用的是hash map，难以保证顺序。故乱序写入。
+    write_ci2c: {
+        var iter = ctx.commit_registry.map.iterator();
+        while (iter.next()) |entry| {
+            c.rocksdb_writebatch_put_cf(
+                wb,
+                cf_ci_c,
+                @ptrCast(entry.value_ptr),
+                @sizeOf(CommitSeq),
+                @ptrCast(&entry.key_ptr.id),
+                @sizeOf(@TypeOf(entry.key_ptr.id)),
+            );
+            if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
+                c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+                if (err_cstr) |ecstr| {
+                    std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
+                    gvca.crash_dump.dumpAndCrash();
+                }
+            }
+        }
+        c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :write_ci2c;
+    }
+    // 键 path_index - 值 path 列族
+    // XXX: 由于用的是array hash map，有序，理论上可以用sst文件直接写入。
+    const cf_pi_p = blk: {
+        const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'pi2p' failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :blk cf_pi_p.?;
+    };
+    defer c.rocksdb_column_family_handle_destroy(cf_pi_p);
+    write_pi2p: {
+        var iter = ctx.writer.path_registry.map.iterator();
+        while (iter.next()) |entry| {
+            c.rocksdb_writebatch_put_cf(
+                wb,
+                cf_pi_p,
+                @ptrCast(&entry.value_ptr.index),
+                @sizeOf(PathSeq),
+                @ptrCast(entry.key_ptr.ptr),
+                entry.key_ptr.len,
+            );
+            if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
+                c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+                if (err_cstr) |ecstr| {
+                    std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
+                    gvca.crash_dump.dumpAndCrash();
+                }
+            }
+        }
+        c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :write_pi2p;
+    }
+    // 键 path_index-blob - 值 path_blob_index 列族
+    const cf_pi_b_pbi = blk: {
+        const cf_pi_b_pbi = c.rocksdb_create_column_family(db, cf_options, "pib2pbi", @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb create column family 'pib2pbi' failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :blk cf_pi_b_pbi.?;
+    };
+    defer c.rocksdb_column_family_handle_destroy(cf_pi_b_pbi);
+    write_pib2pbi: {
+        var iter = ctx.writer.path_blob_registry.map.iterator();
+        while (iter.next()) |entry| {
+            c.rocksdb_writebatch_put_cf(
+                wb,
+                cf_pi_b_pbi,
+                @ptrCast(entry.key_ptr),
+                @sizeOf(PathBlobKey),
+                @ptrCast(entry.value_ptr),
+                @sizeOf(PathBlobSeq),
+            );
+            if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
+                c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+                if (err_cstr) |ecstr| {
+                    std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
+                    gvca.crash_dump.dumpAndCrash();
+                }
+            }
+        }
+        c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+        if (err_cstr) |ecstr| {
+            std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
+            gvca.crash_dump.dumpAndCrash();
+        }
+        break :write_pib2pbi;
+    }
+
     // 后处理：修改配置不再启用 prepare for bulk load
     // 先确保可能写入的列族全部刷新到磁盘。
     const foptions = c.rocksdb_flushoptions_create().?;
@@ -292,7 +338,7 @@ pub fn task(ctx: *PrepRunner) void {
     c.rocksdb_flushoptions_set_wait(foptions, 1);
     flush_all: {
         var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
-            cf_pi_bi_cis,
+            cf_pbi_ci,
             cf_pi_p,
             cf_ci_c,
         };

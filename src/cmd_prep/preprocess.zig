@@ -11,7 +11,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     ctx.writer = .{
         // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
         .path_registry = .{ .arena = .init(gvca.getAllocator()) },
-        .blob_registry = .{ .arena = .init(gvca.getAllocator()) },
+        .path_blob_registry = .{ .arena = .init(gvca.getAllocator()) },
         // 默认列族需要merge operator，在后面追加commit。
         .merge_operator_state = undefined,
     };
@@ -19,8 +19,8 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer {
         ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
         ctx.writer.path_registry.arena.deinit();
-        ctx.writer.blob_registry.map.deinit(ctx.writer.blob_registry.arena.allocator());
-        ctx.writer.blob_registry.arena.deinit();
+        ctx.writer.path_blob_registry.map.deinit(ctx.writer.path_blob_registry.arena.allocator());
+        ctx.writer.path_blob_registry.arena.deinit();
         ctx.writer.merge_operator_state.deinit();
         ctx.writer = undefined;
     }
@@ -75,7 +75,7 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
     std.debug.print("repo-id: {s}\n", .{ctx.repo_id});
     ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     defer {
-        ctx.commit_registry.table.deinit(ctx.commit_registry.arena.allocator());
+        ctx.commit_registry.map.deinit(ctx.commit_registry.arena.allocator());
         ctx.commit_registry.arena.deinit();
         ctx.commit_registry = undefined;
     }
@@ -115,10 +115,10 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     // 参见<https://stackoverflow.com/questions/41050175/why-do-i-see-duplicate-object-ids-when-using-git-odb-foreach>。
     // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
     // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
-    if (ctx.commit_registry.table.contains(id.*)) return 0;
+    if (ctx.commit_registry.map.contains(id.*)) return 0;
     // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
-    const commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, ctx.commit_registry.table.count());
-    ctx.commit_registry.table.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, {}) catch {
+    const commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, ctx.commit_registry.map.count());
+    ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
         std.log.err("Commit regisistry put no clobber failed.\n", .{});
         gvca.crash_dump.dumpAndCrash();
     };

@@ -6,6 +6,7 @@ const c = @import("c.zig").c;
 const gvca = @import("gvca");
 pub const CommitSeq = @import("cmd_prep/PrepRunner.zig").CommitSeq;
 pub const PathSeq = @import("cmd_prep/PrepRunner.zig").PathSeq;
+pub const PathBlobSeq = @import("cmd_prep/PrepRunner.zig").PathBlobSeq;
 // 一个范围。高位是范围起始值。低位是范围结束值。
 const commit_range = @import("commit_range.zig");
 const CommitRange = commit_range.CommitRange;

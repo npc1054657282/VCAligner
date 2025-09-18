@@ -4,7 +4,7 @@ const diag = gvca.diag;
 const PrepRunner = @import("PrepRunner.zig");
 const c = gvca.c_helper.c;
 const PathSeq = PrepRunner.PathSeq;
-const BlobSeq = PrepRunner.BlobSeq;
+const PathBlobSeq = PrepRunner.PathBlobSeq;
 
 // write线程执行完的后续。
 pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
@@ -33,9 +33,10 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 手动compaction的最大字节数应为极大值。
         c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
         // 下面为默认列族配置
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathSeq) + @sizeOf(BlobSeq)));
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathBlobSeq)));
         // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
+        // 实际命中率不高，不用特别注意。
         c.rocksdb_options_set_block_based_table_factory(db_options, table_options);
         break :blk db_options.?;
     };
@@ -45,11 +46,11 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     const cf_options = c.rocksdb_options_create().?;
     defer c.rocksdb_options_destroy(cf_options);
 
-    const db, const cf_pi_bi_cis, const cf_pi_p, const cf_b_bi, const cf_ci_c = reopen_db: {
+    const db, const cf_pbi_ci, const cf_pi_p, const cf_pi_b_pbi, const cf_ci_c = reopen_db: {
         const column_family_names = [_][*:0]const u8{
             "default",
             "pi2p",
-            "b2bi",
+            "pib2pbi",
             "ci2c",
         };
         const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
@@ -76,9 +77,9 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         break :reopen_db .{ new_db.?, column_family_handles[0].?, column_family_handles[1].?, column_family_handles[2].?, column_family_handles[3].? };
     };
     defer {
-        c.rocksdb_column_family_handle_destroy(cf_pi_bi_cis);
+        c.rocksdb_column_family_handle_destroy(cf_pbi_ci);
         c.rocksdb_column_family_handle_destroy(cf_pi_p);
-        c.rocksdb_column_family_handle_destroy(cf_b_bi);
+        c.rocksdb_column_family_handle_destroy(cf_pi_b_pbi);
         c.rocksdb_column_family_handle_destroy(cf_ci_c);
         c.rocksdb_close(db);
     }
@@ -123,49 +124,14 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         std.Thread.sleep(10 * std.time.ns_per_s); // 等待 10s
     }
 
-    // 开始估算各前缀（路径id）对应的blob的数量。
-    block_count_estimate: {
-        var iter = ctx.writer.path_registry.map.iterator();
-        while (iter.next()) |entry| {
-            const prefix = std.mem.toBytes(entry.value_ptr.index);
-            const limit = std.mem.toBytes(entry.value_ptr.index + 1);
-            const range_start_key: [1][*]const u8 = .{
-                &prefix,
-            };
-            const range_start_key_len: [1]usize = .{
-                @sizeOf(@TypeOf(prefix)),
-            };
-            const range_limit_key: [1][*]const u8 = .{
-                &limit,
-            };
-            const range_limit_key_len: [1]usize = .{
-                @sizeOf(@TypeOf(limit)),
-            };
-            c.rocksdb_approximate_sizes_cf(
-                db,
-                cf_pi_bi_cis,
-                1,
-                @ptrCast(&range_start_key),
-                &range_start_key_len,
-                @ptrCast(&range_limit_key),
-                &range_limit_key_len,
-                &entry.value_ptr.approximate_blob_cnt,
-                @ptrCast(&err_cstr),
-            );
-            if (err_cstr) |ecstr| {
-                std.log.err("rocksdb approximate size failed! {s}\n", .{std.mem.span(ecstr)});
-                return error.RocksdbError;
-            }
-        }
-        break :block_count_estimate;
-    }
-    // 对估算值进行排序
+    // 开始cf_pr_pi写入
+    // 对blob_cnt进行排序
     sort: {
         const SortContext = struct {
             map: *const @TypeOf(ctx.writer.path_registry.map),
             pub fn lessThan(sctx: @This(), a_index: usize, b_index: usize) bool {
                 // 基于值中的 blob_cnt 比较。采用降序，符号翻转。
-                return sctx.map.values()[a_index].approximate_blob_cnt > sctx.map.values()[b_index].approximate_blob_cnt;
+                return sctx.map.values()[a_index].blob_cnt > sctx.map.values()[b_index].blob_cnt;
             }
         };
         const sctx: SortContext = .{ .map = &ctx.writer.path_registry.map };

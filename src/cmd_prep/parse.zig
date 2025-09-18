@@ -60,7 +60,6 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
         .arena = .init(gvca.getAllocator()),
-        .commit_hash = commit_hash,
         .commit_seq = commit_seq,
         .parsed_units = .empty,
     };
@@ -165,7 +164,6 @@ fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *con
         try flush_relation_batch(gctx, lctx);
         lctx.to_flush = .{
             .arena = .init(gvca.getAllocator()),
-            .commit_hash = null,
             .commit_seq = lctx.current_task.commit_seq,
             .parsed_units = .empty,
         };
