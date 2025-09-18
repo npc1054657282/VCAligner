@@ -8,7 +8,8 @@ const gvca = @import("gvca");
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
 
-pub const write_batch_threshold = 512;
+pub const putv_threshold = 512;
+pub const write_batch_threshold = 4096 - putv_threshold;
 
 // write线程：完成对于数据库初创时的默认列族、pi2p列族、ci2c列族的写入。此过程与解析线程们同时进行，是mpsc的c端。
 // 此过程对于rocksdb仅写入，无压缩。压缩为写入完毕的后继内容，回归主线程进行。
@@ -25,19 +26,20 @@ pub fn task(ctx: *PrepRunner) void {
         path_blob_seq: PathBlobSeq align(1),
         commit_seq: CommitSeq align(1),
     };
-    var keys_buf: [write_batch_threshold * 2]Key = undefined;
-    const keys_list: [write_batch_threshold * 2]*Key = blk: {
-        var keys_list: [write_batch_threshold * 2]*Key = undefined;
+    var keys_buf: [write_batch_threshold + putv_threshold]Key = undefined;
+    const keys_list: [write_batch_threshold + putv_threshold]*Key = blk: {
+        var keys_list: [write_batch_threshold + putv_threshold]*Key = undefined;
         for (&keys_buf, 0..) |*key_ptr, i| {
             keys_list[i] = key_ptr;
         }
         break :blk keys_list;
     };
+    var keys_buf_cursor: usize = 0;
     // 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此总是给write_batch看相同的内容。
     // `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用
-    const keys_list_sizes: [write_batch_threshold * 2]usize = @splat(@sizeOf(Key));
-    const values_list: [write_batch_threshold * 2][*c]const u8 = @splat(null);
-    const values_list_sizes: [write_batch_threshold * 2]usize = @splat(0);
+    const keys_list_sizes: [putv_threshold]usize = @splat(@sizeOf(Key));
+    const values_list: [putv_threshold][*c]const u8 = @splat(null);
+    const values_list_sizes: [putv_threshold]usize = @splat(0);
 
     // rocksdb 配置调优……
     var err_cstr: ?[*:0]u8 = null;
@@ -147,7 +149,7 @@ pub fn task(ctx: *PrepRunner) void {
         // XXX: 跨任务的`writebatch`堆积。目前的默认列族写入三元组不涉及动态内存，考虑实现。
 
         // 设置`key`
-        for (parsed.parsed_units.items, 0..) |*parsed_unit, i| {
+        for (parsed.parsed_units.items, keys_buf_cursor..) |*parsed_unit, i| {
             const path_get_or_put_result = ctx.writer.path_registry.map.getOrPut(ctx.writer.path_registry.arena.allocator(), parsed_unit.path) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
@@ -192,21 +194,30 @@ pub fn task(ctx: *PrepRunner) void {
             wb,
             cf_pbi_ci,
             @intCast(parsed.parsed_units.items.len),
-            @ptrCast(&keys_list),
+            @ptrCast(&keys_list[keys_buf_cursor]),
             &keys_list_sizes,
             @intCast(parsed.parsed_units.items.len),
             &values_list,
             &values_list_sizes,
         );
-        // 总是写入memtable
+        if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
+            c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
+            if (err_cstr) |ecstr| {
+                std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
+                gvca.crash_dump.dumpAndCrash();
+            }
+            c.rocksdb_writebatch_clear(wb);
+        }
+        keys_buf_cursor = @intCast(c.rocksdb_writebatch_count(wb));
+        // 销毁一切。
+        parsed.arena.deinit();
+    } else |_| {
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
-        // 销毁一切。
-        parsed.arena.deinit();
-    } else |_| {
+        c.rocksdb_writebatch_clear(wb);
         std.log.info("Parse end.\n", .{});
     }
 
@@ -248,6 +259,7 @@ pub fn task(ctx: *PrepRunner) void {
                     std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
                     gvca.crash_dump.dumpAndCrash();
                 }
+                c.rocksdb_writebatch_clear(wb);
             }
         }
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
@@ -255,6 +267,7 @@ pub fn task(ctx: *PrepRunner) void {
             std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
+        c.rocksdb_writebatch_clear(wb);
         break :write_ci2c;
     }
     // 键 path_index - 值 path 列族
@@ -285,6 +298,7 @@ pub fn task(ctx: *PrepRunner) void {
                     std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
                     gvca.crash_dump.dumpAndCrash();
                 }
+                c.rocksdb_writebatch_clear(wb);
             }
         }
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
@@ -292,6 +306,7 @@ pub fn task(ctx: *PrepRunner) void {
             std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
+        c.rocksdb_writebatch_clear(wb);
         break :write_pi2p;
     }
     // 键 path_index-blob - 值 path_blob_index 列族
@@ -321,6 +336,7 @@ pub fn task(ctx: *PrepRunner) void {
                     std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
                     gvca.crash_dump.dumpAndCrash();
                 }
+                c.rocksdb_writebatch_clear(wb);
             }
         }
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
@@ -328,6 +344,7 @@ pub fn task(ctx: *PrepRunner) void {
             std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash();
         }
+        c.rocksdb_writebatch_clear(wb);
         break :write_pib2pbi;
     }
 

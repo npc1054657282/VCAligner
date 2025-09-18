@@ -13,15 +13,15 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         .path_registry = .{ .arena = .init(gvca.getAllocator()) },
         .path_blob_registry = .{ .arena = .init(gvca.getAllocator()) },
         // 默认列族需要merge operator，在后面追加commit。
-        .merge_operator_state = undefined,
+        // .merge_operator_state = undefined,
     };
-    try ctx.writer.merge_operator_state.init(gvca.getAllocator());
+    // try ctx.writer.merge_operator_state.init(gvca.getAllocator());
     defer {
         ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
         ctx.writer.path_registry.arena.deinit();
         ctx.writer.path_blob_registry.map.deinit(ctx.writer.path_blob_registry.arena.allocator());
         ctx.writer.path_blob_registry.arena.deinit();
-        ctx.writer.merge_operator_state.deinit();
+        // ctx.writer.merge_operator_state.deinit();
         ctx.writer = undefined;
     }
     try parseAndWrite(ctx, allocator, last_diag);

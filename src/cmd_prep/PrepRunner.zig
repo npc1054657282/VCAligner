@@ -104,7 +104,7 @@ writer: struct {
         map: std.AutoHashMapUnmanaged(PathBlobKey, PathBlobSeq) = .empty,
         arena: std.heap.ArenaAllocator,
     },
-    merge_operator_state: CommitRangesMergeOperaterState,
+    // merge_operator_state: CommitRangesMergeOperaterState,
 } align(std.atomic.cache_line) = undefined,
 
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
