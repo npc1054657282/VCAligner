@@ -13,7 +13,7 @@ pub const Parsing = struct {
     diagnostics_arena: std.heap.ArenaAllocator,
     diagnostics: diag.Diagnostics,
     producer_local: PrepRunner.Queue.ProducerLocal,
-    comptime flush_threshold: usize = @import("write.zig").putv_threshold,
+    comptime flush_threshold: usize = @import("write.zig").batch_threshold,
     // 以下内容为当前任务的缓存，下一个任务起重置。
     current_task: struct {
         arena: std.heap.ArenaAllocator,

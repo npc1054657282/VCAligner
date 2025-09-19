@@ -9,8 +9,8 @@ const gvca = @import("gvca");
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
 
-pub const putv_threshold = 512;
-pub const write_batch_threshold = 4096 - putv_threshold;
+pub const batch_threshold = 512;
+pub const write_batch_threshold = 4096 - batch_threshold;
 
 // write线程：完成对于数据库初创时的默认列族、pi2p列族、ci2c列族的写入。此过程与解析线程们同时进行，是mpsc的c端。
 // 此过程对于rocksdb仅写入，无压缩。压缩为写入完毕的后继内容，回归主线程进行。
@@ -23,20 +23,8 @@ pub fn task(ctx: *PrepRunner) void {
     const last_diag = &diagnostics.last_diagnostic;
     _ = last_diag;
 
-    var keys_buf: [write_batch_threshold + putv_threshold]Key = undefined;
-    const keys_list: [write_batch_threshold + putv_threshold]*Key = blk: {
-        var keys_list: [write_batch_threshold + putv_threshold]*Key = undefined;
-        for (&keys_buf, 0..) |*key_ptr, i| {
-            keys_list[i] = key_ptr;
-        }
-        break :blk keys_list;
-    };
+    var keys_buf: [write_batch_threshold + batch_threshold]Key = undefined;
     var keys_buf_cursor: usize = 0;
-    // 所有线程公用：对于`rocksdb_writebatch_mergev_cf`，`keys_list_sizes`永远相同，因此总是给write_batch看相同的内容。
-    // `values_list_sizes`同理。注意它们都仅仅适用于`rocksdb_writebatch_mergev_cf`，`writebatch`对默认列族以外的操作不适用
-    const keys_list_sizes: [putv_threshold]usize = @splat(@sizeOf(Key));
-    const values_list: [putv_threshold][*c]const u8 = @splat(null);
-    const values_list_sizes: [putv_threshold]usize = @splat(0);
 
     // rocksdb 配置调优……
     var err_cstr: ?[*:0]u8 = null;
@@ -185,18 +173,15 @@ pub fn task(ctx: *PrepRunner) void {
                 .path_blob_seq = path_blob_get_or_put_result.value_ptr.*,
                 .commit_seq = parsed.commit_seq,
             };
+            c.rocksdb_writebatch_put_cf(
+                wb,
+                cf_pbi_ci,
+                @ptrCast(&keys_buf[i]),
+                @sizeOf(Key),
+                null,
+                0,
+            );
         }
-        // 批量put入默认列族
-        c.rocksdb_writebatch_putv_cf(
-            wb,
-            cf_pbi_ci,
-            @intCast(parsed.parsed_units.items.len),
-            @ptrCast(&keys_list[keys_buf_cursor]),
-            &keys_list_sizes,
-            @intCast(parsed.parsed_units.items.len),
-            &values_list,
-            &values_list_sizes,
-        );
         std.log.debug("putv {d} keys at cursor {d}", .{ parsed.parsed_units.items.len, keys_buf_cursor });
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
             c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
