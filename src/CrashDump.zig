@@ -52,8 +52,9 @@ pub fn unreg(self: *CrashDump, comptime name: []const u8, id: usize) void {
     }
 }
 
-pub fn dumpAndCrash(self: *CrashDump) noreturn {
+pub fn dumpAndCrash(self: *CrashDump, src: std.builtin.SourceLocation) noreturn {
     var iter = self.registry.iterator();
+    std.log.err("crash at {s} {s} line{d}", .{ src.file, src.fn_name, src.line });
     while (iter.next()) |entry| {
         std.log.info("crash log: {s}-{d}", .{ entry.key_ptr.name, entry.key_ptr.id });
         entry.value_ptr.*.dumpFn(entry.value_ptr.*);

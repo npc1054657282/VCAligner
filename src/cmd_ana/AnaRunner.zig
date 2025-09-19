@@ -19,6 +19,7 @@ cf_pi_b_pbi: *c.rocksdb_column_family_handle_t = undefined,
 candidate_parser: struct {
     agenda_parsers: std.ArrayListAligned(struct {
         pi: PathSeq, // 输入。
+        maybe_path: ?[:0]u8 = null,
         maybe_commit_ranges: ?[]gvca.commit_range.CommitRange = null, // 输出，需要注意管理内存
     }, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
     candidates: std.ArrayList(struct {
@@ -48,6 +49,7 @@ candidate_parser: struct {
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         for (self.agenda_parsers.items) |*item| {
             if (item.maybe_commit_ranges) |commit_ranges| allocator.free(commit_ranges);
+            if (item.maybe_path) |path| allocator.free(path);
         }
         self.agenda_parsers.deinit(allocator);
         for (self.candidates.items) |*item| {

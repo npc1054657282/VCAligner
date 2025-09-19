@@ -170,7 +170,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
             c.rocksdb_sstfilewriter_finish(sstwriter, @ptrCast(&err_cstr));
             if (err_cstr) |ecstr| {
                 std.log.err("rocksdb sstfilewriter finish failed! {s}\n", .{std.mem.span(ecstr)});
-                gvca.crash_dump.dumpAndCrash();
+                gvca.crash_dump.dumpAndCrash(@src());
             }
         }
 

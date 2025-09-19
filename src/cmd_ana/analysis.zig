@@ -115,42 +115,68 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
         }
         break :parse_agendas;
     }
+    std.log.info("start candidate.", .{});
     // agendas全部解析完毕。开始依次候选。
-    for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
-        if (agenda.maybe_commit_ranges) |commit_ranges| {
-            // 对于agendas，将它与目前已经存在的所有candidate进行运算。
-            var intersection_success: usize = 0;
-            for (ctx.candidate_parser.candidates.items) |*candidate| {
-                const updated: []CommitRange = try gvca.commit_range.intersection(allocator, candidate.commit_ranges, commit_ranges);
-                if (updated.len == 0) {
-                    // 交集为空，无操作。
-                    allocator.free(updated);
-                    continue;
+    // 此候选集遍历行为重复2次。如果第一次所有候选集都已经完美，则提前结束。
+    var loop: usize = 0;
+    while (do: {
+        for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+            if (agenda.maybe_commit_ranges) |commit_ranges| {
+                // 对于agendas，将它与目前已经存在的所有candidate进行运算。
+                var intersection_success: usize = 0;
+                for (ctx.candidate_parser.candidates.items) |*candidate| {
+                    switch (try gvca.commit_range.intersectionAsymmetric(
+                        allocator,
+                        candidate.commit_ranges,
+                        commit_ranges,
+                    )) {
+                        .equal_to_l1 => {
+                            intersection_success += 1;
+                        }, // 和l1完全相同，无事发生，但视为成功。
+                        .different => |update| {
+                            allocator.free(candidate.commit_ranges);
+                            candidate.commit_ranges = update;
+                            intersection_success += 1;
+                        },
+                        .empty => {}, // 交集为空，无操作
+                    }
                 }
-                // 交集非空，新交集替换原有candidate。
-                allocator.free(candidate.commit_ranges);
-                candidate.commit_ranges = updated;
-                intersection_success += 1;
+                // 如果所有交集皆为空，本agendas成为新候选人。把本agendas拷贝后创建为新的candidate。
+                if (intersection_success == 0) {
+                    std.log.info("append new candidate with path {s}", .{agenda.maybe_path.?});
+                    try ctx.candidate_parser.candidates.append(
+                        allocator,
+                        .{
+                            .commit_ranges = try allocator.dupe(CommitRange, commit_ranges),
+                        },
+                    );
+                }
             }
-            // 如果所有交集皆为空，本agendas成为新候选人。把本agendas拷贝后创建为新的candidate。
-            if (intersection_success == 0) {
-                try ctx.candidate_parser.candidates.append(
-                    allocator,
-                    .{
-                        .commit_ranges = try allocator.dupe(CommitRange, commit_ranges),
-                    },
-                );
-            }
-            // 本agenda的commit_ranges使命完成，释放回归null。
-            // XXX: 也可以不立即释放，到最后deinit的时候一起释放。
-            allocator.free(commit_ranges);
-            agenda.maybe_commit_ranges = null;
+            // 空范围直接跳过。
         }
-        // 空范围直接跳过。
+        var has_bad_candidate: bool = false;
+        for (ctx.candidate_parser.candidates.items) |*candidate| {
+            if (candidate.commit_ranges.len != 1) {
+                has_bad_candidate = true;
+                break;
+            }
+            const start = gvca.commit_range.getStart(candidate.commit_ranges[0]);
+            const end = gvca.commit_range.getEnd(candidate.commit_ranges[0]);
+            if (start != end) {
+                has_bad_candidate = true;
+                break;
+            }
+        }
+        break :do has_bad_candidate;
+    }) {
+        loop += 1;
+        if (loop >= 2) break;
     }
+
     // 最后：对于所有candidate，打印其所有commits。
     std.debug.print("result output.\n", .{});
-    for (ctx.candidate_parser.candidates.items) |*candidate| {
+    for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
+        std.debug.print("candidate {d}\n", .{candidate_index});
         for (candidate.commit_ranges) |range| {
             const ci_native_start = gvca.commit_range.getStart(range);
             const ci_native_end = gvca.commit_range.getEnd(range);
@@ -171,12 +197,12 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                     );
                     if (err_cstr) |ecstr| {
                         std.log.err("rocksdb commit get failed! {s}", .{std.mem.span(ecstr)});
-                        gvca.crash_dump.dumpAndCrash();
+                        gvca.crash_dump.dumpAndCrash(@src());
                     }
                     if (commit_ptr == null) {
                         // 对应的commit不存在
                         std.log.err("rocksdb commit seq {d} not found!", .{ci_native});
-                        gvca.crash_dump.dumpAndCrash();
+                        gvca.crash_dump.dumpAndCrash(@src());
                     }
                     defer c.rocksdb_free(commit_ptr);
                     break :blk .{
@@ -206,25 +232,28 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         );
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb path get failed! {s}", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         }
         if (path_ptr == null) {
             std.log.err("rocksdb path seq {d} not found!", .{std.mem.bigToNative(PathSeq, lctx.pi)});
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         }
         defer c.rocksdb_free(path_ptr);
         var builder: std.ArrayList(u8) = .empty;
-        builder.appendSlice(ts_allocator, gctx.release_path) catch gvca.crash_dump.dumpAndCrash();
-        builder.append(ts_allocator, '/') catch gvca.crash_dump.dumpAndCrash();
-        builder.appendSlice(ts_allocator, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash();
-        break :blk builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash();
+        builder.appendSlice(ts_allocator, gctx.release_path) catch gvca.crash_dump.dumpAndCrash(@src());
+        builder.append(ts_allocator, '/') catch gvca.crash_dump.dumpAndCrash(@src());
+        builder.appendSlice(ts_allocator, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src());
+        break :blk builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src());
     };
-    defer ts_allocator.free(path);
+    defer lctx.maybe_path = path;
     // 检查文件存在性。若存在，计算其hash。
     const path_blob_key: PathBlobKey = .{
         .path_seq = lctx.pi,
         .blob_hash = blk: {
-            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path) catch gvca.crash_dump.dumpAndCrash();
+            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path) catch |err| {
+                std.log.err("{s}", .{@errorName(err)});
+                gvca.crash_dump.dumpAndCrash(@src());
+            };
             if (maybe_blob_hash) |blob_hash| {
                 break :blk blob_hash;
             }
@@ -247,7 +276,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         );
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb path blob seq get failed! {s}", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         }
         if (path_blob_seq_ptr == null) {
             // 对应的blob不存在，直接结束。
@@ -272,7 +301,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 const ci: CommitSeq = std.mem.bytesAsValue(Key, key_ptr[0..klen]).commit_seq;
                 break :blk std.mem.bigToNative(CommitSeq, ci);
             };
-            std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
+            // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
             if (maybe_last_range) |last_range| {
                 const last_start = gvca.commit_range.getStart(last_range);
                 const last_end = gvca.commit_range.getEnd(last_range);
@@ -280,22 +309,22 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 if (ci_native == last_end + 1) {
                     maybe_last_range = gvca.commit_range.packStartEnd(last_start, ci_native);
                 } else {
-                    commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash();
+                    commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());
                     maybe_last_range = gvca.commit_range.packStartEnd(ci_native, ci_native);
                 }
             } else maybe_last_range = gvca.commit_range.packStartEnd(ci_native, ci_native);
         }
         if (maybe_last_range) |last_range| {
-            commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash();
+            commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());
         } else {
             std.log.err("Cannot find any commit with path '{s}' blob {x} pathblobseq {d}", .{
                 path,
                 path_blob_key.blob_hash.id,
                 std.mem.bigToNative(PathBlobSeq, path_blob_seq),
             });
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         }
-        break :commit_ranges commit_ranges.toOwnedSlice(ts_allocator) catch gvca.crash_dump.dumpAndCrash();
+        break :commit_ranges commit_ranges.toOwnedSlice(ts_allocator) catch gvca.crash_dump.dumpAndCrash(@src());
     };
 }
 
@@ -305,9 +334,22 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid
         if (err == error.FileNotFound) {
             return null;
         }
+        std.log.err("accessZ {s} failed", .{path});
+        switch (@import("builtin").os.tag) {
+            // XXX: 针对windows系统的workaround，某些名字的文件如`con`、`nul`windows访问不了，特别网开一面当成不存在。
+            .windows => if (err == error.Unexpected) return null,
+            else => {},
+        }
         return err; // 不存在文件返回null。其他错误上抛。
     };
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        // 存在一种情况：曾经仓库里存在这个文件路径，但现在不存在了，且这个路径变成了一个目录。
+        if (err == error.IsDir) {
+            return null;
+        }
+        std.log.err("openFile {s} failed", .{path});
+        return err;
+    };
     defer file.close();
     const file_size = try file.getEndPos();
     // 构造 Git blob 前缀 "blob <size>\0"

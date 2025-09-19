@@ -71,7 +71,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         };
         break :blk commit.?;
     };
@@ -82,7 +82,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         };
         break :blk tree.?;
     };
@@ -90,13 +90,13 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     parse_tree(gctx, lctx, tree, &@as([0]u8, .{})) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        gvca.crash_dump.dumpAndCrash();
+        gvca.crash_dump.dumpAndCrash(@src());
     };
     // 任务结束时最后刷新一次。
     flush_relation_batch(gctx, lctx) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        gvca.crash_dump.dumpAndCrash();
+        gvca.crash_dump.dumpAndCrash(@src());
     };
     return;
 }

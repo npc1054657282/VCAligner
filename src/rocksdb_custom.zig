@@ -180,7 +180,7 @@ pub const CommitRangesMergeOperaterState = struct {
         const s: *CommitRangesMergeOperaterState = @ptrCast(@alignCast(state.?));
         if (local_mempool == null) s.reg() catch {
             std.log.err("mem pool reg failed!\n", .{});
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         };
         // 预估结果的最大大小：已存在的值的长度和所有操作数范围化后的总长度。
         // 已存在的值总是一组范围序列。操作数有两种可能：如果长度为一个CommitSeq，那么它是一个单独的数。如果超过，它也是一组范围序列。
@@ -197,7 +197,7 @@ pub const CommitRangesMergeOperaterState = struct {
         // XXX: 使用最小堆+多路归并排序方案是一种替代，但是对于大量单独的数而言，可能反而是一种负担。目前采用直接平铺所有range的方案。
         const all_ranges_bytes = local_mempool.?.create(worst_total_length) catch {
             std.log.err("mem pool create all ranges bytes failed! worst lotal length is {d}, key is {x}", .{ worst_total_length, key[0..key_length] });
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         };
         defer local_mempool.?.destroy(all_ranges_bytes.ptr, worst_total_length);
         var offset: usize = 0;
@@ -227,7 +227,7 @@ pub const CommitRangesMergeOperaterState = struct {
         std.sort.pdq(CommitRange, all_ranges, {}, std.sort.asc(CommitRange));
         const result = local_mempool.?.create(worst_total_length) catch {
             std.log.err("mem pool create result failed! worst lotal length is {d}, key is {x}", .{ worst_total_length, key[0..key_length] });
-            gvca.crash_dump.dumpAndCrash();
+            gvca.crash_dump.dumpAndCrash(@src());
         };
         local_mempool.?.current_task_len = worst_total_length;
         var result_ranges_list: std.ArrayList(CommitRange) = blk: {

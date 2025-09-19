@@ -120,7 +120,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     const commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, ctx.commit_registry.map.count());
     ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
         std.log.err("Commit regisistry put no clobber failed.\n", .{});
-        gvca.crash_dump.dumpAndCrash();
+        gvca.crash_dump.dumpAndCrash(@src());
     };
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
     const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);
