@@ -21,6 +21,10 @@ pub const PathBlobKey = extern struct {
     blob_hash: c.git_oid align(1),
 };
 pub const PathBlobSeq = u32;
+pub const Key = extern struct {
+    path_blob_seq: PathBlobSeq align(1),
+    commit_seq: CommitSeq align(1),
+};
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_seq: CommitSeq,

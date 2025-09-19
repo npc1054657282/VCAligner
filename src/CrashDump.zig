@@ -58,5 +58,8 @@ pub fn dumpAndCrash(self: *CrashDump) noreturn {
         std.log.info("crash log: {s}-{d}", .{ entry.key_ptr.name, entry.key_ptr.id });
         entry.value_ptr.*.dumpFn(entry.value_ptr.*);
     }
+    if (@errorReturnTrace()) |trace| {
+        std.debug.dumpStackTrace(trace.*);
+    }
     std.process.abort();
 }

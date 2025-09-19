@@ -1,17 +1,18 @@
 const std = @import("std");
-pub const CommitSeq = @import("rocksdb_custom.zig").CommitSeq;
+const CommitSeq = @import("rocksdb_custom.zig").CommitSeq;
+pub const CommitSeqNative = CommitSeq;
 pub const CommitRange = std.meta.Int(@typeInfo(CommitSeq).int.signedness, @typeInfo(CommitSeq).int.bits * 2);
 
-pub fn getStart(r: CommitRange) CommitSeq {
-    return @intCast(r >> (@sizeOf(CommitSeq) * 8));
+pub fn getStart(r: CommitRange) CommitSeqNative {
+    return @intCast(r >> (@sizeOf(CommitSeqNative) * 8));
 }
 
-pub fn getEnd(r: CommitRange) CommitSeq {
+pub fn getEnd(r: CommitRange) CommitSeqNative {
     return @truncate(r);
 }
 
-pub fn packStartEnd(start: CommitSeq, end: CommitSeq) CommitRange {
-    return (@as(CommitRange, start) << (@sizeOf(CommitSeq) * 8)) | end;
+pub fn packStartEnd(start: CommitSeqNative, end: CommitSeqNative) CommitRange {
+    return (@as(CommitRange, start) << (@sizeOf(CommitSeqNative) * 8)) | end;
 }
 
 // 假定各列表内的range都是从小到大排序的，否则不成立。

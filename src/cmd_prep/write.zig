@@ -4,6 +4,7 @@ const PathSeq = PrepRunner.PathSeq;
 const PathBlobKey = PrepRunner.PathBlobKey;
 const PathBlobSeq = PrepRunner.PathBlobSeq;
 const CommitSeq = PrepRunner.CommitSeq;
+const Key = PrepRunner.Key;
 const gvca = @import("gvca");
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
@@ -22,10 +23,6 @@ pub fn task(ctx: *PrepRunner) void {
     const last_diag = &diagnostics.last_diagnostic;
     _ = last_diag;
 
-    const Key = extern struct {
-        path_blob_seq: PathBlobSeq align(1),
-        commit_seq: CommitSeq align(1),
-    };
     var keys_buf: [write_batch_threshold + putv_threshold]Key = undefined;
     const keys_list: [write_batch_threshold + putv_threshold]*Key = blk: {
         var keys_list: [write_batch_threshold + putv_threshold]*Key = undefined;
@@ -200,6 +197,7 @@ pub fn task(ctx: *PrepRunner) void {
             &values_list,
             &values_list_sizes,
         );
+        std.log.debug("putv {d} keys at cursor {d}", .{ parsed.parsed_units.items.len, keys_buf_cursor });
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
             c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
             if (err_cstr) |ecstr| {
@@ -209,6 +207,7 @@ pub fn task(ctx: *PrepRunner) void {
             c.rocksdb_writebatch_clear(wb);
         }
         keys_buf_cursor = @intCast(c.rocksdb_writebatch_count(wb));
+        std.log.debug("cursor move to {d}", .{keys_buf_cursor});
         // 销毁一切。
         parsed.arena.deinit();
     } else |_| {

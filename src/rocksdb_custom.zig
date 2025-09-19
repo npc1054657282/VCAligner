@@ -7,6 +7,8 @@ const gvca = @import("gvca");
 pub const CommitSeq = @import("cmd_prep/PrepRunner.zig").CommitSeq;
 pub const PathSeq = @import("cmd_prep/PrepRunner.zig").PathSeq;
 pub const PathBlobSeq = @import("cmd_prep/PrepRunner.zig").PathBlobSeq;
+pub const PathBlobKey = @import("cmd_prep/PrepRunner.zig").PathBlobKey;
+pub const Key = @import("cmd_prep/PrepRunner.zig").Key;
 // 一个范围。高位是范围起始值。低位是范围结束值。
 const commit_range = @import("commit_range.zig");
 const CommitRange = commit_range.CommitRange;
@@ -241,7 +243,7 @@ pub const CommitRangesMergeOperaterState = struct {
                 const new_start = commit_range.getStart(new_range);
                 const new_end = commit_range.getEnd(new_range);
                 std.debug.assert(new_start >= last_start);
-                if (new_start > new_end + 1) {
+                if (new_start > last_end + 1) {
                     result_ranges_list.appendAssumeCapacity(last_range);
                     maybe_last_range = new_range;
                 } else if (new_end > last_end) {
