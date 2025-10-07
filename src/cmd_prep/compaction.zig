@@ -63,7 +63,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 其他列族已经不再需要，但是打开的时候必须打开所有列族，否则就报失败。
         const new_db = c.rocksdb_open_column_families(
             db_options,
-            ctx.rocksdb_output,
+            ctx.rocksdb_output.get(),
             column_family_names.len,
             @ptrCast(&column_family_names),
             &column_family_options,
@@ -150,10 +150,13 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     defer c.rocksdb_options_destroy(cf_pr_pi_options);
     // 基于临时文件名前缀确定写入的临时sst文件名。
     const sst_file_name: [:0]u8 = blk: {
-        var sst_file_name_builder: std.ArrayList(u8) = .empty;
-        try sst_file_name_builder.appendSlice(allocator, ctx.tmp_output_prefix);
-        try sst_file_name_builder.appendSlice(allocator, "pr2pi-sst");
-        break :blk try sst_file_name_builder.toOwnedSliceSentinel(allocator, 0);
+        var sst_file_name_writer: std.Io.Writer.Allocating = .init(allocator);
+        try sst_file_name_writer.writer.print("{s}/{d}-{d}-pr2pi-sst", .{
+            std.fs.path.dirname(ctx.rocksdb_output.get()) orelse ".",
+            ctx.proc_stamp.pid,
+            ctx.proc_stamp.ts,
+        });
+        break :blk try sst_file_name_writer.toOwnedSliceSentinel(0);
     };
     defer allocator.free(sst_file_name);
     sst_file_write: {

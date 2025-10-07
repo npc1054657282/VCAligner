@@ -4,7 +4,9 @@ set_policy("check.target_package_licenses", false)
 
 set_toolchains("@zig")
 
-add_requires("libgit2 v1.9.1")
+add_repositories("gvca-repo repo", {rootdir = os.scriptdir()})
+
+add_requires("libgit2 v1.9.1+xdiff_without_regexp")
 add_requires("rocksdb v10.5.1", {configs = {lz4 = true}})
 
 rule("zig.build")

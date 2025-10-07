@@ -41,13 +41,27 @@ pub const Parsed = struct {
 
 global: CliRunner.Global,
 bare_repo_path: [:0]u8,
-rocksdb_output: [:0]u8,
-tmp_output_prefix: []u8, // 生成临时文件的文件名前缀。与`rocksdb_output`在同一个父目录下，并由pid与
+rocksdb_output: union(enum) {
+    manual: [:0]u8,
+    auto: [:0]u8,
+    // 内容仅包含堆上的切片，即指针，不需要使用`*This()`，值传递是安全的。
+    pub fn get(self: @This()) [:0]u8 {
+        return switch (self) {
+            .manual => self.manual,
+            .auto => self.auto,
+        };
+    }
+},
 // 指代计算密集型任务。rocksdb的flush多为I/O密集型任务，不在`n_jobs`考虑范围内
 n_jobs: usize,
 n_rocksdbjobs: c_int,
 task_queue_capacity_log2: u5,
 compaction_trigger: c_int,
+// 采集本进程的pid与一个时间戳，用于生成本进程唯一信息，可用于临时文件命名。
+proc_stamp: struct {
+    pid: gvca.pid.Pid,
+    ts: i128,
+},
 // max_allowed_space_usage: u64,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
@@ -141,60 +155,6 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
     };
     errdefer allocator.free(bare_repo_path);
 
-    const rocksdb_output, const tmp_output_prefix = blk: {
-        const pid = pid: {
-            // 除了windows，其他的pid都是一个整数，唯有windows的pid是一个opaque指针。
-            // 此处zig的实现可能有点问题，违背了POSIX对`pid_t`的规定，此处为一个workaround，将其强转为整数。
-            const pid = std.c.getpid();
-            switch (@import("builtin").os.tag) {
-                .windows => break :pid @intFromPtr(pid),
-                else => break :pid pid,
-            }
-        };
-        const ts = std.time.nanoTimestamp();
-        // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
-        // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
-        // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
-        const maybe_parent_dir: ?[]const u8 = if (args.rocksdb_output) |rocksdb_output| std.fs.path.dirname(rocksdb_output) else "tmp";
-        // 检查父目录是否存在。若不存在，创建之。
-        if (maybe_parent_dir) |parent_dir| {
-            const cwd = std.fs.cwd();
-            cwd.access(parent_dir, .{}) catch |access_err| {
-                switch (access_err) {
-                    error.FileNotFound => cwd.makeDir(parent_dir) catch |mkdir_err| {
-                        switch (mkdir_err) {
-                            // 考虑多进程竞争场景，可能存在同进程已经创建目录的情形。此时是安全的。
-                            error.PathAlreadyExists => {},
-                            else => return mkdir_err,
-                        }
-                    },
-                    else => return access_err,
-                }
-            };
-        }
-        var tmp_output_prefix_writer = std.Io.Writer.Allocating.init(allocator);
-        try tmp_output_prefix_writer.writer.print("{s}/{d}-{d}-", .{
-            maybe_parent_dir orelse ".",
-            pid,
-            ts,
-        });
-        const tmp_output_prefix = try tmp_output_prefix_writer.toOwnedSlice();
-        errdefer allocator.free(tmp_output_prefix);
-        const rocksdb_output = rocksdb_output: {
-            if (args.rocksdb_output) |rocksdb_output| break :rocksdb_output try allocator.dupeZ(u8, rocksdb_output);
-            var rocksdb_output_builder: std.ArrayList(u8) = .empty;
-            try rocksdb_output_builder.appendSlice(allocator, tmp_output_prefix);
-            try rocksdb_output_builder.appendSlice(allocator, "rocksdb-output");
-            break :rocksdb_output try rocksdb_output_builder.toOwnedSliceSentinel(allocator, 0);
-        };
-        errdefer allocator.free(rocksdb_output);
-        break :blk .{ rocksdb_output, tmp_output_prefix };
-    };
-    errdefer {
-        allocator.free(rocksdb_output);
-        allocator.free(tmp_output_prefix);
-    }
-
     const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
     // 在rocksdb那边最大线程数需要使用c整数输入。提前确保它不会溢出。
     const n_rocksdbjobs: c_int = blk: {
@@ -209,21 +169,26 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         .prep = .{
             .global = CliRunner.Global.initGlobal(args),
             .bare_repo_path = bare_repo_path,
-            .rocksdb_output = rocksdb_output,
-            .tmp_output_prefix = tmp_output_prefix,
+            .rocksdb_output = if (args.rocksdb_output) |rocksdb_output| .{
+                .manual = try allocator.dupeZ(u8, rocksdb_output),
+            } else .{ .auto = undefined },
             .n_jobs = n_jobs,
             .n_rocksdbjobs = n_rocksdbjobs,
             .task_queue_capacity_log2 = args.task_queue_capacity_log2,
             .compaction_trigger = args.compaction_trigger,
+            .proc_stamp = .{
+                .pid = gvca.pid.get(),
+                .ts = std.time.nanoTimestamp(),
+            },
             // .max_allowed_space_usage = args.max_allowed_space_usage,
         },
     };
 }
 pub fn deinit(self: *PrepRunner, allocator: std.mem.Allocator) void {
     allocator.free(self.bare_repo_path);
-    self.bare_repo_path = undefined;
-    allocator.free(self.rocksdb_output);
-    self.rocksdb_output = undefined;
-    allocator.free(self.tmp_output_prefix);
-    self.tmp_output_prefix = undefined;
+    switch (self.rocksdb_output) {
+        .manual => allocator.free(self.rocksdb_output.manual),
+        .auto => {},
+    }
+    self.* = undefined;
 }

@@ -25,6 +25,11 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         ctx.writer = undefined;
     }
     try parseAndWrite(ctx, allocator, last_diag);
+    // 如果rocksdb_output并未手动提供，那么它理应在`parseAndWrite`步骤中被自动生成。
+    defer switch (ctx.rocksdb_output) {
+        .manual => {},
+        .auto => allocator.free(ctx.rocksdb_output.auto),
+    };
     // 压缩rocksdb的写入内容。
     try @import("compaction.zig").compaction(ctx, allocator, last_diag);
 }
@@ -73,6 +78,51 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
         ctx.repo_id = undefined;
     }
     std.debug.print("repo-id: {s}\n", .{ctx.repo_id});
+    // 如果rocksdb_output未指定，基于repo_id设置rocksdb_output。
+    switch (ctx.rocksdb_output) {
+        .manual => {},
+        .auto => {
+            ctx.rocksdb_output.auto = blk: {
+                var rocksdb_output_auto_writer: std.Io.Writer.Allocating = .init(allocator);
+                try rocksdb_output_auto_writer.writer.print("tmp/{s}/{d}-{d}-rocksdb", .{
+                    ctx.repo_id,
+                    ctx.proc_stamp.pid,
+                    ctx.proc_stamp.ts,
+                });
+                break :blk try rocksdb_output_auto_writer.toOwnedSliceSentinel(0);
+            };
+        },
+    }
+    errdefer switch (ctx.rocksdb_output) {
+        .manual => {},
+        .auto => allocator.free(ctx.rocksdb_output.auto),
+    };
+    // 创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
+    make_parent_dir: {
+        // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
+        // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
+        // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
+        const maybe_parent_dir: ?[]const u8 = std.fs.path.dirname(ctx.rocksdb_output.get());
+        if (maybe_parent_dir) |parent_dir| {
+            const cwd = std.fs.cwd();
+            cwd.access(parent_dir, .{}) catch |access_err| {
+                switch (access_err) {
+                    error.FileNotFound => cwd.makePath(parent_dir) catch |mkdir_err| {
+                        switch (mkdir_err) {
+                            // 考虑多进程竞争场景，可能存在同进程已经创建目录的情形。此时是安全的。
+                            error.PathAlreadyExists => {},
+                            else => {
+                                std.log.err("make dir {s} error: {s}", .{ parent_dir, @errorName(mkdir_err) });
+                                return mkdir_err;
+                            },
+                        }
+                    },
+                    else => return access_err,
+                }
+            };
+        }
+        break :make_parent_dir;
+    }
     ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     defer {
         ctx.commit_registry.map.deinit(ctx.commit_registry.arena.allocator());

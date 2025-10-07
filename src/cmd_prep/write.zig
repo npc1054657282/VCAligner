@@ -101,7 +101,7 @@ pub fn task(ctx: *PrepRunner) void {
     defer c.rocksdb_options_destroy(db_options);
 
     const db = blk: {
-        const db = c.rocksdb_open(db_options, ctx.rocksdb_output, @ptrCast(&err_cstr));
+        const db = c.rocksdb_open(db_options, ctx.rocksdb_output.get(), @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash(@src());
