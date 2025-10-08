@@ -330,38 +330,99 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
 
 // 模拟计算git的Sha1 blob hash。
 fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid {
-    std.fs.cwd().accessZ(path, .{}) catch |err| {
-        if (err == error.FileNotFound) {
-            return null;
-        }
-        std.log.err("accessZ {s} failed", .{path});
+    const file_or_sym_link: union(enum) {
+        file: std.fs.File,
+        sym_link: void,
+    } = blk: {
+        // 对于git而言，文件的符号链接不应当跟随打开，而是直接基于符号链接文件内容计算blob hash。
+        // 由于zig标准库中的`Dir.openFileZ`系列函数无法指定不跟随符号链接，因此不使用此高级API
+        // 分别使用posix API与windows API来指定不跟随符号链接的文件打开。
         switch (@import("builtin").os.tag) {
-            // XXX: 针对windows系统的workaround，某些名字的文件如`con`、`nul`windows访问不了，特别网开一面当成不存在。
-            .windows => if (err == error.Unexpected) return null,
-            else => {},
+            // NOTE：NTFS系统的符号链接只有在git设置`core.symlinks=true`的情况下才与POSIX符号链接相互转译。
+            // 默认情况下`core.symlinks=false`，这导致如果直接将windows的NTFS符号链接读取为普通文件，
+            // git收录的blob将成为一个空文件。[`core.symlinks=true`是更安全的推荐配置。](https://www.joshkel.com/2018/01/18/symlinks-in-windows/)
+            // 因此，尽管默认`core.symlinks=false`，当我们在windows下遇到了符号链接文件时，依旧优先读取它的符号链接路径并计算blob hash
+            // 我们有理由做如下假设：如果一个windows的release包里还有NTFS的符号链接文件，
+            // 那么我们相信如果该文件在仓库中也存在，那么仓库一定开启了`core.symlinks=true`
+            // 换一个角度做假设：在windows系统上，如果解压一个来自linux系统的包，若结果出现符号链接，则可以相信该符号链接如果在原始git仓库存在，
+            // 则一定是以posix符号链接的形式保存。
+            .windows => {
+                const path_w = try std.os.windows.cStrToPrefixedFileW(std.fs.cwd().fd, path);
+                const file: std.fs.File = .{
+                    .handle = std.os.windows.OpenFile(path_w, .{ .follow_symlinks = false }) catch |err| {
+                        switch (err) {
+                            // NOTE: 在windows系统下，OpenFile默认情况对于目录文件会抛出IsDir错误（与linux等系统行为不同）
+                            // 存在一种情况：曾经仓库里存在这个文件路径，但现在不存在了，且这个路径变成了一个目录。
+                            // 因此对于文件路径实际是目录的情况，当做与`FileNotFound`同等处理即可。
+                            // 此外，windows系统下对于一些linux文件无法访问，例如`con`、`nul`。
+                            // 这些文件在调试模式会直接导致unreachable，而在release模式导致Unexpected。在此放弃访问作为workaround。
+                            // XXX: 考虑事先对文件名进行一次过滤，对于其中出现非法字符的文件事先滤掉，保证debug模式不会崩溃。
+                            error.FileNotFound, error.IsDir, error.Unexpected => return null,
+                            else => return err,
+                        }
+                    },
+                };
+                errdefer file.close();
+                const stat = try file.stat();
+                break :blk switch (stat.kind) {
+                    .sym_link => sym_link: {
+                        file.close();
+                        break :sym_link .sym_link;
+                    },
+                    .file => .{ .file = file },
+                    else => unreachable,
+                };
+            },
+            else => {
+                // 对于posix系统，我们有`fstatat`来事先确定文件状态。
+                // 对于`fstatat`，如果设置`flag`为`AT.SYMLINK_NOFOLLOW`，它的行为与linux的`lstat`相同，但`lstat`不是posix标准，不能跨平台，
+                // 而`fstatat`跨平台性能更好。
+                const stat = std.posix.fstatatZ(std.fs.cwd().fd, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
+                    switch (err) {
+                        error.FileNotFound => return null,
+                        else => return err,
+                    }
+                };
+                break :blk switch (stat.mode & std.posix.S.IFMT) {
+                    // 目录。存在一种情况：曾经仓库里存在这个文件路径，但现在不存在了，且这个路径变成了一个目录。
+                    // 因此对于文件路径实际是目录的情况，当做与`FileNotFound`同等处理即可。
+                    std.posix.S.IFDIR => return null,
+                    // 符号链接
+                    std.posix.S.IFLNK => .sym_link,
+                    // 普通文件
+                    std.posix.S.IFREG => .{ .file = try std.fs.cwd().openFileZ(path, .{}) },
+                    else => unreachable,
+                };
+            },
         }
-        return err; // 不存在文件返回null。其他错误上抛。
     };
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        // 存在一种情况：曾经仓库里存在这个文件路径，但现在不存在了，且这个路径变成了一个目录。
-        if (err == error.IsDir) {
-            return null;
-        }
-        std.log.err("openFile {s} failed", .{path});
-        return err;
+    defer switch (file_or_sym_link) {
+        .file => |file| file.close(),
+        .sym_link => {},
     };
-    defer file.close();
-    const file_size = try file.getEndPos();
-    // 构造 Git blob 前缀 "blob <size>\0"
-    const prefix = try std.fmt.allocPrint(allocator, "blob {}\x00", .{file_size});
-    defer allocator.free(prefix);
+
     var hasher: std.crypto.hash.Sha1 = .init(.{});
-    hasher.update(prefix);
+    // 8192可以确保容纳所有路径长度（linux最大路径一般为4096，windows一般为512），且本身也是一个比较合适的文件读取缓冲区节点，适用于计算hash。
     var buffer: [8192]u8 = undefined;
-    while (true) {
-        const bytes_read = try file.read(&buffer);
-        if (bytes_read == 0) break;
-        hasher.update(buffer[0..bytes_read]);
+    switch (file_or_sym_link) {
+        .sym_link => {
+            const link = try std.fs.cwd().readLinkZ(path, &buffer);
+            const prefix = try std.fmt.allocPrint(allocator, "blob {}\x00", .{link.len});
+            defer allocator.free(prefix);
+            hasher.update(prefix);
+            hasher.update(link);
+        },
+        .file => |file| {
+            const file_size = try file.getEndPos();
+            const prefix = try std.fmt.allocPrint(allocator, "blob {}\x00", .{file_size});
+            defer allocator.free(prefix);
+            hasher.update(prefix);
+            while (true) {
+                const bytes_read = try file.read(&buffer);
+                if (bytes_read == 0) break;
+                hasher.update(buffer[0..bytes_read]);
+            }
+        },
     }
     return .{ .id = hasher.finalResult() };
 }
