@@ -46,9 +46,12 @@ pub fn task(ctx: *PrepRunner) void {
         // 写入阶段采取只写模式，不使用操作系统缓冲区。这是因为compaction触发晚，因此缓存意义较小，减少内存拷贝。
         // 在windows测试时，发现有文件删除延迟导致磁盘耗尽的现象，不确定`direct_io`是否有影响。
         c.rocksdb_options_set_use_direct_io_for_flush_and_compaction(db_options, 1);
-        // 实战还是磁盘消耗量太大。采用轻量级压缩。只需要创建时设置一次即可，不用每次设置。
-        // 对于三元组纯key压缩率不高，有可能导致sst分片更多，因此目前不用压缩看看。
-        // c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        if (ctx.compression) {
+            // 关于压缩：原则上compaction阶段的压缩才影响最终大小，而写入阶段的压缩只影响中间文件大小而不影响最终大小。
+            // 但是，在对postgresql的测试中，如果compaction阶段都不压缩，而只检验写入阶段的压缩，发现写入阶段压缩比不压缩反而快30秒左右（13分50秒与14分36秒的区别）
+            // 这说明中间文件的大小变小实际上由于降低了I/O量，导致中间过程的压缩也反而对性能有益而非有害。
+            c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        }
         // 发现文件删除延迟导致磁盘耗尽现象。虽然我看文档说compaction会自动删除，不受此配置影响，但是观测的删除依然延迟。增加每分钟一次的删除废弃文件。
         // 增加以后仍然未解决。后得知应该是删除线程的异步性导致被compaction的文件未能被及时删除，因为删除的线程应该始终未能被执行。
         // 而flush线程才是被优先执行的。
@@ -182,7 +185,7 @@ pub fn task(ctx: *PrepRunner) void {
                 0,
             );
         }
-        std.log.debug("putv {d} keys at cursor {d}", .{ parsed.parsed_units.items.len, keys_buf_cursor });
+        // std.log.debug("putv {d} keys at cursor {d}", .{ parsed.parsed_units.items.len, keys_buf_cursor });
         if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
             c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
             if (err_cstr) |ecstr| {
@@ -192,7 +195,7 @@ pub fn task(ctx: *PrepRunner) void {
             c.rocksdb_writebatch_clear(wb);
         }
         keys_buf_cursor = @intCast(c.rocksdb_writebatch_count(wb));
-        std.log.debug("cursor move to {d}", .{keys_buf_cursor});
+        // std.log.debug("cursor move to {d}", .{keys_buf_cursor});
         // 销毁一切。
         parsed.arena.deinit();
     } else |_| {
@@ -210,6 +213,9 @@ pub fn task(ctx: *PrepRunner) void {
     const cf_options = blk: {
         const cf_options = c.rocksdb_options_create();
         c.rocksdb_options_prepare_for_bulk_load(cf_options);
+        if (ctx.compression) {
+            c.rocksdb_options_set_compression(cf_options, c.rocksdb_lz4_compression);
+        }
         break :blk cf_options.?;
     };
     defer c.rocksdb_options_destroy(cf_options);

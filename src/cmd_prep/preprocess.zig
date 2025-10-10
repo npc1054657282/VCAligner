@@ -39,7 +39,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
 // 考虑到最终的操作为rocksdb操作最多，或许应当重构为主线程写入，另创建一个线程分发解析，分发解析线程内再创建线程池。
 // 重新思考：另开写线程未尝不可，只是可能要根据情况决定是由线程自己打开rocksdb数据库，还是主线程打开然后让rocksdb数据库持有使用权。
 pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    std.debug.print("verbose: {}, path: {s}\n", .{ ctx.global.verbose, ctx.bare_repo_path });
+    std.debug.print("verbose: {}, compression: {}, path: {s}\n", .{ ctx.global.verbose, ctx.compression, ctx.bare_repo_path });
     var git_error_code = c.git_libgit2_init();
     if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
     defer {

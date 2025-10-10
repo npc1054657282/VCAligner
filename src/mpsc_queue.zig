@@ -98,7 +98,7 @@ test ResolvedSequence {
 pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type {
     const supported_capacity_log2_min = 5;
     const supported_capacity_log2_max = 20;
-    const Dispatcher = comptime blk: {
+    const Dispatcher: type = comptime blk: {
         var union_fields: [supported_capacity_log2_max - supported_capacity_log2_min + 1]std.builtin.Type.UnionField = undefined;
         var enum_fields: [supported_capacity_log2_max - supported_capacity_log2_min + 1]std.builtin.Type.EnumField = undefined;
         for (supported_capacity_log2_min..supported_capacity_log2_max + 1, 0..) |capacity_log2, i| {
@@ -116,7 +116,7 @@ pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type
             union_fields[i] = new_union_field;
             enum_fields[i] = new_enum_field;
         }
-        const TagType = @Type(.{ .@"enum" = .{
+        const Tag: type = @Type(.{ .@"enum" = .{
             .tag_type = std.math.IntFittingRange(supported_capacity_log2_min, supported_capacity_log2_max),
             .fields = &enum_fields,
             .decls = &.{},
@@ -124,7 +124,7 @@ pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type
         } });
         break :blk @Type(.{ .@"union" = .{
             .layout = .auto,
-            .tag_type = TagType,
+            .tag_type = Tag,
             .fields = &union_fields,
             .decls = &.{},
         } });

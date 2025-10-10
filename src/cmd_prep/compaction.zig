@@ -38,12 +38,22 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
         // 实际命中率不高，不用特别注意。
         c.rocksdb_options_set_block_based_table_factory(db_options, table_options);
+        // compaction时仍然创建新的sst文件，因此如果需要压缩，仍要配置。
+        if (ctx.compression) {
+            c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        }
         break :blk db_options.?;
     };
     defer c.rocksdb_options_destroy(db_options);
 
     // 其它列族的选项
-    const cf_options = c.rocksdb_options_create().?;
+    const cf_options = blk: {
+        const cf_options = c.rocksdb_options_create();
+        if (ctx.compression) {
+            c.rocksdb_options_set_compression(cf_options, c.rocksdb_lz4_compression);
+        }
+        break :blk cf_options.?;
+    };
     defer c.rocksdb_options_destroy(cf_options);
 
     const db, const cf_pbi_ci, const cf_pi_p, const cf_pi_b_pbi, const cf_ci_c = reopen_db: {

@@ -57,6 +57,7 @@ n_jobs: usize,
 n_rocksdbjobs: c_int,
 task_queue_capacity_log2: u5,
 compaction_trigger: c_int,
+compression: bool,
 // 采集本进程的pid与一个时间戳，用于生成本进程唯一信息，可用于临时文件命名。
 proc_stamp: struct {
     pid: gvca.pid.Pid,
@@ -133,7 +134,10 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("prep"))
     .arg(zargs.Arg.optArg("rocksdb_job_weight", f32).long("rocksdb-job-weight").default(0.5))
     .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)))
     // 0指代禁用自动compaction。
-    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(0));
+    .arg(zargs.Arg.optArg("compaction_trigger", c_int).long("compaction-trigger").default(0))
+    // 缺省启用compression。手动设置no-compression才能关闭。这是因为经过测试，compression可以将最终rocksdb的大小缩减到无压缩的1/3，且性能不降反升。
+    // 性能提升的原因应该在于随着rocksdb的大小降低，I/O降低。
+    .arg(zargs.Arg.opt("no_compression", bool).long("no-compression"));
 pub fn run(self: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, allocator, last_diag);
     return;
@@ -176,6 +180,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
             .n_rocksdbjobs = n_rocksdbjobs,
             .task_queue_capacity_log2 = args.task_queue_capacity_log2,
             .compaction_trigger = args.compaction_trigger,
+            .compression = !args.no_compression,
             .proc_stamp = .{
                 .pid = gvca.pid.get(),
                 .ts = std.time.nanoTimestamp(),
