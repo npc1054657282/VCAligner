@@ -2,18 +2,19 @@ const std = @import("std");
 const CommitSeqNative = @import("rocksdb_custom.zig").CommitSeqNative;
 const CommitSeq = @import("rocksdb_custom.zig").CommitSeq;
 
-pub const CommitRange: type = std.meta.Int(@typeInfo(CommitSeqNative).int.signedness, @typeInfo(CommitSeqNative).int.bits * 2);
+pub const CommitRangeBacking: type = std.meta.Int(@typeInfo(CommitSeqNative).int.signedness, @typeInfo(CommitSeqNative).int.bits * 2);
+// end为逻辑低位，start为逻辑高位。在逻辑顺序中，start为排序的主要影响者，end为次要影响者。
+pub const CommitRange = packed struct(CommitRangeBacking) {
+    end: CommitSeqNative,
+    start: CommitSeqNative,
+    pub fn packStartEnd(start: CommitSeqNative, end: CommitSeqNative) CommitRange {
+        return .{ .start = start, .end = end };
+    }
+};
 
-pub fn getStart(r: CommitRange) CommitSeqNative {
-    return @intCast(r >> (@sizeOf(CommitSeqNative) * 8));
-}
-
-pub fn getEnd(r: CommitRange) CommitSeqNative {
-    return @truncate(r);
-}
-
-pub fn packStartEnd(start: CommitSeqNative, end: CommitSeqNative) CommitRange {
-    return (@as(CommitRange, start) << (@sizeOf(CommitSeqNative) * 8)) | end;
+// 增序比较函数。就是直接将它当成整数进行比较。
+pub fn asc(_: void, a: CommitRange, b: CommitRange) bool {
+    return @as(CommitRangeBacking, @bitCast(a)) < @as(CommitRangeBacking, @bitCast(b));
 }
 
 // 假定各列表内的range都是从小到大排序的，否则不成立。
@@ -23,10 +24,10 @@ pub fn intersection(allocator: std.mem.Allocator, l1: []const CommitRange, l2: [
     var cursor1: usize = 0;
     var cursor2: usize = 0;
     while (cursor1 < l1.len and cursor2 < l2.len) {
-        const start1 = getStart(l1[cursor1]);
-        const end1 = getEnd(l1[cursor1]);
-        const start2 = getStart(l2[cursor2]);
-        const end2 = getEnd(l2[cursor2]);
+        const start1 = l1[cursor1].start;
+        const end1 = l1[cursor1].end;
+        const start2 = l2[cursor2].start;
+        const end2 = l2[cursor2].end;
         if (end1 < start2) {
             cursor1 += 1;
             continue;
@@ -37,7 +38,7 @@ pub fn intersection(allocator: std.mem.Allocator, l1: []const CommitRange, l2: [
         const inter_start = @max(start1, start2);
         const inter_end = @min(end1, end2);
         std.debug.assert(inter_start <= inter_end);
-        try result.append(allocator, packStartEnd(inter_start, inter_end));
+        try result.append(allocator, .packStartEnd(inter_start, inter_end));
         if (end1 < end2) cursor1 += 1 else if (end2 < end1) cursor2 += 1 else {
             cursor1 += 1;
             cursor2 += 1;
@@ -62,10 +63,10 @@ pub fn intersectionAsymmetric(allocator: std.mem.Allocator, l1: []const CommitRa
     var is_full_match: bool = true;
 
     while (cursor1 < l1.len and cursor2 < l2.len) {
-        const start1 = getStart(l1[cursor1]);
-        const end1 = getEnd(l1[cursor1]);
-        const start2 = getStart(l2[cursor2]);
-        const end2 = getEnd(l2[cursor2]);
+        const start1 = l1[cursor1].start;
+        const end1 = l1[cursor1].end;
+        const start2 = l2[cursor2].start;
+        const end2 = l2[cursor2].end;
         if (end1 < start2) {
             is_full_match = false;
             cursor1 += 1;
@@ -80,7 +81,7 @@ pub fn intersectionAsymmetric(allocator: std.mem.Allocator, l1: []const CommitRa
         if (inter_start != start1 or inter_end != end1) {
             is_full_match = false;
         }
-        try result.append(allocator, packStartEnd(inter_start, inter_end));
+        try result.append(allocator, .packStartEnd(inter_start, inter_end));
         if (end1 < end2) cursor1 += 1 else if (end1 > end2) cursor2 += 1 else {
             cursor1 += 1;
             cursor2 += 1;
@@ -103,9 +104,7 @@ pub fn intersectionAsymmetric(allocator: std.mem.Allocator, l1: []const CommitRa
 pub fn eql(l1: []const CommitRange, l2: []const CommitRange) bool {
     if (l1.len != l2.len) return false;
     for (l1, 0..) |r, i| {
-        if (getStart(r) != getStart(l2[i]) or
-            getEnd(r) != getEnd(l2[i]))
-        {
+        if (r != l2[i]) {
             return false;
         }
     }

@@ -161,8 +161,8 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 has_bad_candidate = true;
                 break;
             }
-            const start = gvca.commit_range.getStart(candidate.commit_ranges[0]);
-            const end = gvca.commit_range.getEnd(candidate.commit_ranges[0]);
+            const start = candidate.commit_ranges[0].start;
+            const end = candidate.commit_ranges[0].end;
             if (start != end) {
                 has_bad_candidate = true;
                 break;
@@ -179,8 +179,8 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
         std.debug.print("candidate {d}\n", .{candidate_index});
         for (candidate.commit_ranges) |range| {
-            const ci_native_start = gvca.commit_range.getStart(range);
-            const ci_native_end = gvca.commit_range.getEnd(range);
+            const ci_native_start = range.start;
+            const ci_native_end = range.end;
             var ci_native = ci_native_start;
             while (ci_native <= ci_native_end) {
                 defer ci_native += 1;
@@ -304,16 +304,16 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             };
             // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
             if (maybe_last_range) |last_range| {
-                const last_start = gvca.commit_range.getStart(last_range);
-                const last_end = gvca.commit_range.getEnd(last_range);
+                const last_start = last_range.start;
+                const last_end = last_range.end;
                 std.debug.assert(ci_native > last_start and last_end >= last_start);
                 if (ci_native == last_end + 1) {
-                    maybe_last_range = gvca.commit_range.packStartEnd(last_start, ci_native);
+                    maybe_last_range = .packStartEnd(last_start, ci_native);
                 } else {
                     commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());
-                    maybe_last_range = gvca.commit_range.packStartEnd(ci_native, ci_native);
+                    maybe_last_range = .packStartEnd(ci_native, ci_native);
                 }
-            } else maybe_last_range = gvca.commit_range.packStartEnd(ci_native, ci_native);
+            } else maybe_last_range = .packStartEnd(ci_native, ci_native);
         }
         if (maybe_last_range) |last_range| {
             commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());

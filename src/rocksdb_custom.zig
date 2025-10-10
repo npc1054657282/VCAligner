@@ -239,7 +239,7 @@ pub const CommitRangesMergeOperaterState = struct {
                 // 目前操作数的保存是大端字节序的，目前不修改其逻辑。
                 const commit_seq_native: CommitSeqNative = std.mem.readInt(CommitSeqNative, @ptrCast(operand.?), CommitSeq.endian);
                 // 移位是逻辑行为，不受具体本机字节序影响。
-                range.* = commit_range.packStartEnd(commit_seq_native, commit_seq_native);
+                range.* = .packStartEnd(commit_seq_native, commit_seq_native);
                 offset += @sizeOf(CommitRange);
             }
         }
@@ -247,7 +247,7 @@ pub const CommitRangesMergeOperaterState = struct {
             const all_ranges_ptr: [*]CommitRange = @ptrCast(@alignCast(all_ranges_bytes.ptr));
             break :blk all_ranges_ptr[0..(worst_total_length / @sizeOf(CommitRange))];
         };
-        std.sort.pdq(CommitRange, all_ranges, {}, std.sort.asc(CommitRange));
+        std.sort.pdq(CommitRange, all_ranges, {}, commit_range.asc);
         const result = local_mempool.?.create(worst_total_length) catch {
             std.log.err("mem pool create result failed! worst lotal length is {d}, key is {x}", .{ worst_total_length, key[0..key_length] });
             gvca.crash_dump.dumpAndCrash(@src());
@@ -261,16 +261,16 @@ pub const CommitRangesMergeOperaterState = struct {
         var maybe_last_range: ?CommitRange = null;
         for (all_ranges) |new_range| {
             if (maybe_last_range) |last_range| {
-                const last_start = commit_range.getStart(last_range);
-                const last_end = commit_range.getEnd(last_range);
-                const new_start = commit_range.getStart(new_range);
-                const new_end = commit_range.getEnd(new_range);
+                const last_start = last_range.start;
+                const last_end = last_range.end;
+                const new_start = new_range.start;
+                const new_end = new_range.end;
                 std.debug.assert(new_start >= last_start);
                 if (new_start > last_end + 1) {
                     result_ranges_list.appendAssumeCapacity(last_range);
                     maybe_last_range = new_range;
                 } else if (new_end > last_end) {
-                    maybe_last_range = commit_range.packStartEnd(last_start, new_end);
+                    maybe_last_range = .packStartEnd(last_start, new_end);
                 } // 如果`new_end`不超过`last_end`，什么都不做。
             } else maybe_last_range = new_range;
         }
