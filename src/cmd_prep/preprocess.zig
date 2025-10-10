@@ -5,7 +5,6 @@ const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 const diag = gvca.diag;
 const Pool = gvca.Pool;
-const PathSeq = PrepRunner.PathSeq;
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     ctx.writer = .{
@@ -167,7 +166,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
     if (ctx.commit_registry.map.contains(id.*)) return 0;
     // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
-    const commit_seq = std.mem.nativeToBig(PrepRunner.CommitSeq, ctx.commit_registry.map.count());
+    const commit_seq: gvca.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
     ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
         std.log.err("Commit regisistry put no clobber failed.\n", .{});
         gvca.crash_dump.dumpAndCrash(@src());

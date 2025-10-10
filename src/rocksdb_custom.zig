@@ -4,11 +4,34 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const gvca = @import("gvca");
-pub const CommitSeq = @import("cmd_prep/PrepRunner.zig").CommitSeq;
-pub const PathSeq = @import("cmd_prep/PrepRunner.zig").PathSeq;
-pub const PathBlobSeq = @import("cmd_prep/PrepRunner.zig").PathBlobSeq;
-pub const PathBlobKey = @import("cmd_prep/PrepRunner.zig").PathBlobKey;
-pub const Key = @import("cmd_prep/PrepRunner.zig").Key;
+fn Seq(comptime Native: type, comptime e: std.builtin.Endian) type {
+    return enum(Native) {
+        _,
+        pub const endian = e;
+        pub fn fromNative(n: Native) @This() {
+            return @enumFromInt(std.mem.nativeTo(Native, n, e));
+        }
+        pub fn toNative(self: @This()) Native {
+            return std.mem.toNative(Native, @intFromEnum(self), e);
+        }
+    };
+}
+pub const CommitSeqNative = u32;
+pub const CommitSeq = Seq(CommitSeqNative, .big);
+// Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
+// 但实际上pathSeq只需要`u32`足矣。
+pub const PathSeqNative = u32;
+pub const PathSeq = Seq(PathSeqNative, .big);
+pub const PathBlobKey = extern struct {
+    path_seq: PathSeq align(1),
+    blob_hash: c.git_oid align(1),
+};
+pub const PathBlobSeqNative = u32;
+pub const PathBlobSeq = Seq(PathBlobSeqNative, .big);
+pub const Key = extern struct {
+    path_blob_seq: PathBlobSeq align(1),
+    commit_seq: CommitSeq align(1),
+};
 // 一个范围。高位是范围起始值。低位是范围结束值。
 const commit_range = @import("commit_range.zig");
 const CommitRange = commit_range.CommitRange;
@@ -214,9 +237,9 @@ pub const CommitRangesMergeOperaterState = struct {
             } else {
                 const range: *CommitRange = @ptrCast(@alignCast(all_ranges_bytes[offset..].ptr));
                 // 目前操作数的保存是大端字节序的，目前不修改其逻辑。
-                const commit_seq: CommitSeq = std.mem.readInt(CommitSeq, @ptrCast(operand.?), .big);
+                const commit_seq_native: CommitSeqNative = std.mem.readInt(CommitSeqNative, @ptrCast(operand.?), CommitSeq.endian);
                 // 移位是逻辑行为，不受具体本机字节序影响。
-                range.* = commit_range.packStartEnd(commit_seq, commit_seq);
+                range.* = commit_range.packStartEnd(commit_seq_native, commit_seq_native);
                 offset += @sizeOf(CommitRange);
             }
         }

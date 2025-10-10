@@ -17,7 +17,7 @@ pub const Parsing = struct {
     // 以下内容为当前任务的缓存，下一个任务起重置。
     current_task: struct {
         arena: std.heap.ArenaAllocator,
-        commit_seq: PrepRunner.CommitSeq,
+        commit_seq: gvca.rocksdb_custom.CommitSeq,
     },
     // 以下内容为当前批次内容，flush过了就重置。
     to_flush: PrepRunner.Parsed,
@@ -41,11 +41,11 @@ pub const Parsing = struct {
         const parsing: *Parsing = @alignCast(@fieldParentPtr("dumpable", dumpable));
         // 注：崩溃时打印不用关注数据即时性，虽然可能有数据竞争，但是获取过时数据不太紧要。
         std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
-        std.log.info("commit_seq: {d}\n", .{std.mem.bigToNative(PrepRunner.CommitSeq, parsing.current_task.commit_seq)});
+        std.log.info("commit_seq: {d}\n", .{parsing.current_task.commit_seq.toNative()});
     }
 };
 
-pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: PrepRunner.CommitSeq) void {
+pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: gvca.rocksdb_custom.CommitSeq) void {
     const lctx: *Parsing = &gctx.parsers.lctxs.items[thrd_id];
     const last_diag = &lctx.diagnostics.last_diagnostic;
     // 进入解析，降低积压的`task_in_queue_count`

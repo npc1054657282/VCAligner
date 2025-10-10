@@ -3,8 +3,8 @@ const gvca = @import("gvca");
 const diag = gvca.diag;
 const PrepRunner = @import("PrepRunner.zig");
 const c = gvca.c_helper.c;
-const PathSeq = PrepRunner.PathSeq;
-const PathBlobSeq = PrepRunner.PathBlobSeq;
+const PathSeq = gvca.rocksdb_custom.PathSeq;
+const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
 
 // write线程执行完的后续。
 pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {

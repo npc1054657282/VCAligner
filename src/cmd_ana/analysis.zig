@@ -7,6 +7,7 @@ const Pool = gvca.Pool;
 const PathSeq = gvca.rocksdb_custom.PathSeq;
 const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
 const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
+const CommitSeqNative = gvca.rocksdb_custom.CommitSeqNative;
 const CommitSeq = gvca.rocksdb_custom.CommitSeq;
 const Key = gvca.rocksdb_custom.Key;
 const CommitRange = gvca.commit_range.CommitRange;
@@ -183,7 +184,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
             var ci_native = ci_native_start;
             while (ci_native <= ci_native_end) {
                 defer ci_native += 1;
-                const ci = std.mem.nativeToBig(CommitSeq, ci_native);
+                const ci: CommitSeq = .fromNative(ci_native);
                 const commit: c.git_oid = blk: {
                     var vallen: usize = undefined;
                     const commit_ptr = c.rocksdb_get_cf(
@@ -235,7 +236,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             gvca.crash_dump.dumpAndCrash(@src());
         }
         if (path_ptr == null) {
-            std.log.err("rocksdb path seq {d} not found!", .{std.mem.bigToNative(PathSeq, lctx.pi)});
+            std.log.err("rocksdb path seq {d} not found!", .{lctx.pi.toNative()});
             gvca.crash_dump.dumpAndCrash(@src());
         }
         defer c.rocksdb_free(path_ptr);
@@ -295,11 +296,11 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         c.rocksdb_iter_seek(pbici_iter, @ptrCast(&path_blob_seq), @sizeOf(PathBlobSeq));
         while (c.rocksdb_iter_valid(pbici_iter) != 0) {
             defer c.rocksdb_iter_next(pbici_iter);
-            const ci_native: gvca.commit_range.CommitSeqNative = blk: {
+            const ci_native: CommitSeqNative = blk: {
                 var klen: usize = undefined;
                 const key_ptr = c.rocksdb_iter_key(pbici_iter, &klen);
                 const ci: CommitSeq = std.mem.bytesAsValue(Key, key_ptr[0..klen]).commit_seq;
-                break :blk std.mem.bigToNative(CommitSeq, ci);
+                break :blk ci.toNative();
             };
             // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
             if (maybe_last_range) |last_range| {
@@ -320,7 +321,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             std.log.err("Cannot find any commit with path '{s}' blob {x} pathblobseq {d}", .{
                 path,
                 path_blob_key.blob_hash.id,
-                std.mem.bigToNative(PathBlobSeq, path_blob_seq),
+                path_blob_seq.toNative(),
             });
             gvca.crash_dump.dumpAndCrash(@src());
         }

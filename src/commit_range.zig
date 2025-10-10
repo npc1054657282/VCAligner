@@ -1,7 +1,8 @@
 const std = @import("std");
+const CommitSeqNative = @import("rocksdb_custom.zig").CommitSeqNative;
 const CommitSeq = @import("rocksdb_custom.zig").CommitSeq;
-pub const CommitSeqNative = CommitSeq;
-pub const CommitRange = std.meta.Int(@typeInfo(CommitSeq).int.signedness, @typeInfo(CommitSeq).int.bits * 2);
+
+pub const CommitRange: type = std.meta.Int(@typeInfo(CommitSeqNative).int.signedness, @typeInfo(CommitSeqNative).int.bits * 2);
 
 pub fn getStart(r: CommitRange) CommitSeqNative {
     return @intCast(r >> (@sizeOf(CommitSeqNative) * 8));

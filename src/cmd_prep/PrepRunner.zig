@@ -8,23 +8,15 @@ const Pool = gvca.Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
 const MpscChannel = gvca.MpscChannel;
-const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOperaterState;
+// const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOperaterState;
+const CommitSeq = gvca.rocksdb_custom.CommitSeq;
+const PathSeq = gvca.rocksdb_custom.PathSeq;
+const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
+const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
+const Key = gvca.rocksdb_custom.Key;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
-pub const CommitSeq = u32;
-// Array hash map的`count()`返回类型为`usize`，与`hash map`的`u32`有显著不同。这是因为涉及索引，用`usize`有很大方便。
-// 但实际上pathSeq只需要`u32`足矣。
-pub const PathSeq = u32;
-pub const PathBlobKey = extern struct {
-    path_seq: PathSeq align(1),
-    blob_hash: c.git_oid align(1),
-};
-pub const PathBlobSeq = u32;
-pub const Key = extern struct {
-    path_blob_seq: PathBlobSeq align(1),
-    commit_seq: CommitSeq align(1),
-};
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
     commit_seq: CommitSeq,

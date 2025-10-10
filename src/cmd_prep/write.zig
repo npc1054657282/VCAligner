@@ -1,11 +1,11 @@
 const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
-const PathSeq = PrepRunner.PathSeq;
-const PathBlobKey = PrepRunner.PathBlobKey;
-const PathBlobSeq = PrepRunner.PathBlobSeq;
-const CommitSeq = PrepRunner.CommitSeq;
-const Key = PrepRunner.Key;
 const gvca = @import("gvca");
+const PathSeq = gvca.rocksdb_custom.PathSeq;
+const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
+const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
+const CommitSeq = gvca.rocksdb_custom.CommitSeq;
+const Key = gvca.rocksdb_custom.Key;
 const c = gvca.c_helper.c;
 const diag = gvca.diag;
 
@@ -153,7 +153,7 @@ pub fn task(ctx: *PrepRunner) void {
                     gvca.crash_dump.dumpAndCrash(@src());
                 };
                 path_get_or_put_result.value_ptr.* = .{
-                    .index = std.mem.nativeToBig(PathSeq, @intCast(path_get_or_put_result.index)),
+                    .index = .fromNative(@intCast(path_get_or_put_result.index)),
                     .blob_cnt = 0, // 接下来很快会因为`path_blob_registry不命中而增加至1。
                 };
             }
@@ -168,7 +168,7 @@ pub fn task(ctx: *PrepRunner) void {
             };
             if (!path_blob_get_or_put_result.found_existing) {
                 // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
-                path_blob_get_or_put_result.value_ptr.* = std.mem.nativeToBig(PathBlobSeq, ctx.writer.path_blob_registry.map.count() - 1);
+                path_blob_get_or_put_result.value_ptr.* = .fromNative(ctx.writer.path_blob_registry.map.count() - 1);
                 // 如果这是一个新的path-blob组合，path的blob_cnt立即加1。
                 path_get_or_put_result.value_ptr.blob_cnt += 1;
             }
