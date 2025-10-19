@@ -19,11 +19,22 @@ cf_pi_b_pbi: *c.rocksdb_column_family_handle_t = undefined,
 candidate_parser: struct {
     agenda_parsers: std.ArrayListAligned(struct {
         pi: PathSeq, // 输入。
-        maybe_path: ?[:0]u8 = null,
-        maybe_commit_ranges: ?[]gvca.commit_range.CommitRange = null, // 输出，需要注意管理内存
+        // XXX: 一个设计思路是，将`path`和`commit_collection`一起放到一个`union(enum)`里判断是否`unparsed`，然后再对`commit_collection`分三种解析结果讨论。
+        // 虽然这个思路看起来很健全，但其实有隐患：path和commit_collection其实是分步骤解析的，而`unparsed`是`undefined`的安全版，以防止错误退出时没能正确析构。
+        // 因此，各自保存各自的`unparsed`才是真实合理的方案。
+        path: union(enum) {
+            unparsed: void,
+            parsed: [:0]u8,
+        } = .unparsed,
+        commit_collection: union(enum) {
+            unparsed: void,
+            path_not_find_in_release: void,
+            path_blob_not_match: void,
+            parsed: gvca.commit_range.CommitCollection,
+        } = .unparsed,
     }, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
     candidates: std.ArrayList(struct {
-        commit_ranges: []gvca.commit_range.CommitRange,
+        commit_collection: gvca.commit_range.CommitCollection,
     }),
     once_get_roptions: *c.struct_rocksdb_readoptions_t, // 用于pi2p、pib2pbi的读取
     prefix_scan_roptions: *c.struct_rocksdb_readoptions_t, // 用于default的读取
@@ -48,12 +59,18 @@ candidate_parser: struct {
     }
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         for (self.agenda_parsers.items) |*item| {
-            if (item.maybe_commit_ranges) |commit_ranges| allocator.free(commit_ranges);
-            if (item.maybe_path) |path| allocator.free(path);
+            switch (item.path) {
+                .parsed => |parsed| allocator.free(parsed),
+                .unparsed => {},
+            }
+            switch (item.commit_collection) {
+                .parsed => |parsed| parsed.deinit(allocator),
+                .unparsed, .path_not_find_in_release, .path_blob_not_match => {},
+            }
         }
         self.agenda_parsers.deinit(allocator);
         for (self.candidates.items) |*item| {
-            allocator.free(item.commit_ranges);
+            item.commit_collection.deinit(allocator);
         }
         self.candidates.deinit(allocator);
         c.rocksdb_readoptions_destroy(self.once_get_roptions);

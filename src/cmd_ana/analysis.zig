@@ -76,6 +76,9 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
 
     ctx.candidate_parser = .init();
     defer ctx.candidate_parser.deinit(allocator);
+    // 一个agenda对应git仓库里的一个可能存在的路径。在创建时，它们已知seq，并很快将从数据库中解析得对应的path（只要rocksdb数据库是正确的，就一定能够解析）
+    // 如果agenda解析后，可能有以下情况：1.在release包中找不到同名文件。2.在release包中找到了同名文件，但是发现release中构造的path-blob对在git仓库找不到对应。
+    // 3.能够找到对应，此情况下一定能够得到一个commit非空集合。
     parse_agendas: {
         var pool: Pool = undefined;
         try pool.init(.{ .allocator = allocator, .n_jobs = ctx.n_jobs - 1 });
@@ -118,67 +121,49 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     }
     std.log.info("start candidate.", .{});
     // agendas全部解析完毕。开始依次候选。
-    // 此候选集遍历行为重复2次。如果第一次所有候选集都已经完美，则提前结束。
-    var loop: usize = 0;
-    while (do: {
-        for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
-            if (agenda.maybe_commit_ranges) |commit_ranges| {
+    for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+        switch (agenda.commit_collection) {
+            .unparsed => unreachable,
+            .path_not_find_in_release, .path_blob_not_match => {},
+            .parsed => |commit_collection| {
                 // 对于agendas，将它与目前已经存在的所有candidate进行运算。
-                var intersection_success: usize = 0;
+                var intersection_success: bool = false;
                 for (ctx.candidate_parser.candidates.items) |*candidate| {
-                    switch (try gvca.commit_range.intersectionAsymmetric(
-                        allocator,
-                        candidate.commit_ranges,
-                        commit_ranges,
-                    )) {
-                        .equal_to_l1 => {
-                            intersection_success += 1;
-                        }, // 和l1完全相同，无事发生，但视为成功。
-                        .different => |update| {
-                            allocator.free(candidate.commit_ranges);
-                            candidate.commit_ranges = update;
-                            intersection_success += 1;
-                        },
-                        .empty => {}, // 交集为空，无操作
+                    switch (try candidate.commit_collection.intersectInPlace(allocator, commit_collection.view())) {
+                        .unchanged, .restricted => intersection_success = intersection_success or true,
+                        .empty => {},
                     }
                 }
                 // 如果所有交集皆为空，本agendas成为新候选人。把本agendas拷贝后创建为新的candidate。
-                if (intersection_success == 0) {
-                    std.log.info("append new candidate with path {s}", .{agenda.maybe_path.?});
-                    try ctx.candidate_parser.candidates.append(
-                        allocator,
-                        .{
-                            .commit_ranges = try allocator.dupe(CommitRange, commit_ranges),
+                if (!intersection_success) {
+                    std.log.info("append new candidate with path {s}", .{agenda.path.parsed});
+                    try ctx.candidate_parser.candidates.append(allocator, .{
+                        .commit_collection = new_candidate_collection: {
+                            var new_candidate_collection: gvca.commit_range.CommitCollection = try commit_collection.view().dupe(allocator);
+                            // 对于新创建的候选集，重新补课，与前面的所有agenda取交集。
+                            for (ctx.candidate_parser.agenda_parsers.items) |*review_agenda| {
+                                if (agenda == review_agenda) break;
+                                switch (review_agenda.commit_collection) {
+                                    .unparsed => unreachable,
+                                    .path_not_find_in_release, .path_blob_not_match => {},
+                                    .parsed => |reviw_commit_collection| {
+                                        _ = try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view());
+                                    },
+                                }
+                            }
+                            break :new_candidate_collection new_candidate_collection;
                         },
-                    );
+                    });
                 }
-            }
-            // 空范围直接跳过。
+            },
         }
-        var has_bad_candidate: bool = false;
-        for (ctx.candidate_parser.candidates.items) |*candidate| {
-            if (candidate.commit_ranges.len != 1) {
-                has_bad_candidate = true;
-                break;
-            }
-            const start = candidate.commit_ranges[0].start;
-            const end = candidate.commit_ranges[0].end;
-            if (start != end) {
-                has_bad_candidate = true;
-                break;
-            }
-        }
-        break :do has_bad_candidate;
-    }) {
-        loop += 1;
-        if (loop >= 2) break;
     }
 
     // 最后：对于所有candidate，打印其所有commits。
     std.debug.print("result output.\n", .{});
     for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
         std.debug.print("candidate {d}\n", .{candidate_index});
-        for (candidate.commit_ranges) |range| {
+        for (candidate.commit_collection.ranges) |range| {
             const ci_native_start = range.start;
             const ci_native_end = range.end;
             var ci_native = ci_native_start;
@@ -246,7 +231,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         builder.appendSlice(ts_allocator, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src());
         break :blk builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src());
     };
-    defer lctx.maybe_path = path;
+    defer lctx.path = .{ .parsed = path };
     // 检查文件存在性。若存在，计算其hash。
     const path_blob_key: PathBlobKey = .{
         .path_seq = lctx.pi,
@@ -259,7 +244,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 break :blk blob_hash;
             }
             // 如果不存在，直接结束。
-            lctx.maybe_commit_ranges = null;
+            lctx.commit_collection = .path_not_find_in_release;
             return;
         },
     };
@@ -281,16 +266,15 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         }
         if (path_blob_seq_ptr == null) {
             // 对应的blob不存在，直接结束。
-            lctx.maybe_commit_ranges = null;
+            lctx.commit_collection = .path_blob_not_match;
             return;
         }
         defer c.rocksdb_free(path_blob_seq_ptr);
         break :blk std.mem.bytesToValue(PathBlobSeq, path_blob_seq_ptr);
     };
     // 将`path_blob_seq`作为前缀查找所有commit。
-    lctx.maybe_commit_ranges = commit_ranges: {
-        var commit_ranges: std.ArrayList(CommitRange) = .empty;
-        var maybe_last_range: ?CommitRange = null;
+    lctx.commit_collection = commit_collection: {
+        var builder: gvca.commit_range.CommitCollection.Builder = .init;
         const pbici_iter = c.rocksdb_create_iterator_cf(gctx.db, gctx.candidate_parser.prefix_scan_roptions, gctx.cf_pbi_ci).?;
         defer c.rocksdb_iter_destroy(pbici_iter);
         c.rocksdb_iter_seek(pbici_iter, @ptrCast(&path_blob_seq), @sizeOf(PathBlobSeq));
@@ -303,29 +287,22 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 break :blk ci.toNative();
             };
             // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
-            if (maybe_last_range) |last_range| {
-                const last_start = last_range.start;
-                const last_end = last_range.end;
-                std.debug.assert(ci_native > last_start and last_end >= last_start);
-                if (ci_native == last_end + 1) {
-                    maybe_last_range = .packStartEnd(last_start, ci_native);
-                } else {
-                    commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());
-                    maybe_last_range = .packStartEnd(ci_native, ci_native);
-                }
-            } else maybe_last_range = .packStartEnd(ci_native, ci_native);
+            builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch gvca.crash_dump.dumpAndCrash(@src());
         }
-        if (maybe_last_range) |last_range| {
-            commit_ranges.append(ts_allocator, last_range) catch gvca.crash_dump.dumpAndCrash(@src());
-        } else {
-            std.log.err("Cannot find any commit with path '{s}' blob {x} pathblobseq {d}", .{
-                path,
-                path_blob_key.blob_hash.id,
-                path_blob_seq.toNative(),
-            });
+        // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
+        break :commit_collection .{ .parsed = builder.toOwnedCommitRanges(ts_allocator) catch |err| {
+            switch (err) {
+                error.EmptyCommitRanges => {
+                    std.log.err("Cannot find any commit with path '{s}' blob {x} pathblobseq {d}", .{
+                        path,
+                        path_blob_key.blob_hash.id,
+                        path_blob_seq.toNative(),
+                    });
+                },
+                else => {},
+            }
             gvca.crash_dump.dumpAndCrash(@src());
-        }
-        break :commit_ranges commit_ranges.toOwnedSlice(ts_allocator) catch gvca.crash_dump.dumpAndCrash(@src());
+        } };
     };
 }
 
