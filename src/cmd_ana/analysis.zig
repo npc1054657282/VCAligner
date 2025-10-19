@@ -287,6 +287,11 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 break :blk ci.toNative();
             };
             // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
+            // 由于`ci_native`来自外部rocksdb数据库解析，需要考虑来自外部的数据库自身存在问题的情况。因此进行一次检查确保`ci_native`是单调递增的。
+            if (!builder.testGreaterNative(ci_native)) {
+                @branchHint(.cold);
+                gvca.crash_dump.dumpAndCrash(@src());
+            }
             builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch gvca.crash_dump.dumpAndCrash(@src());
         }
         // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
