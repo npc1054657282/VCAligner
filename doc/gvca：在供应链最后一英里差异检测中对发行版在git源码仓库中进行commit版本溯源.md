@@ -38,6 +38,19 @@ commit对象保存一个git仓库的一个提交的数据快照与元信息。�
 
 ## Motivation
 
+软件供应链攻击日益威胁软件交付的完整性。交付阶段的软件供应链攻击发生在从源码到发布包的“最后一英里”，是软件供应链攻击的高发阶段。在交付阶段供应链攻击的威胁模型下，假设攻击者无法直接修改受监控的源码仓库，但可通过控制打包交付的流程篡改Release包，例如注入后门或重放历史版本中的漏洞。开源生态下，差异分析通过比较Release包与源码仓库的内容，能够有效检测此类攻击。然而，由于源码仓库的版本管理存在多重困难，版本对齐成为差异分析的关键挑战。
+
+版本对齐困难源于源码仓库tag和Release管理的非标准化特性。开源生态中，版本标签完全依赖开发者自觉，缺乏统一规范（如Semantic Versioning）。分发平台（如npm、PyPI）通常仅验证包完整性（如hash或签名），不强制要求Release包与源码版本对齐，导致追溯困难。具体而言，以下场景加剧了版本对齐的复杂性：
+
+- 无版本标签：许多源码仓库不包含tag或Release，将Release包映射到特定commit无从下手。
+- tag与分发版本不对应：因手动维护或额外构建步骤，源码tag（如v1.2）与分发包版本（如1.2.3）可能不一致，。
+- tag命名不规范：tag名称如“release-1”或“beta”不遵循标准，自动化工具难以解析对应版本。
+- tag丢失：仓库迁移（如 GitHub到GitLab）或清理可能丢失历史tag，尤其是轻量级tag。
+
+现有方案尝试绕过版本对齐，如对源码blob的每行变更构建hash数据库，检查Release包的各文件行是否存在于源码中。然而，Git以文件级blob为单位保存对象，检查行级变更需实时计算tree diff，性能较低（时间复杂度 \( O(n * lines) \)，n 为blob数）。更重要的是，此方案无法检测漏洞重放攻击，历史漏洞的代码行可能存在于源码中，但不应出现在最新包中。
+
+本工作提出了一种高效版本对齐方法，通过预处理构建(p,b)到 commit 集合的逆关系映射和path有序列表，动态筛选Release包的候选commit集合。该方法无需依赖标签，鲁棒处理上述困难场景，通过文件级粒度检测漏洞重放，显著增强供应链完整性。
+
 ## Challenge
 
 ### 从原始commit版本到release版本的黑盒打包过程导致溯源困难
@@ -117,38 +130,92 @@ $$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
 
 为进一步优化写入性能，逆向关系数据库填充过程分为两个阶段：无compaction快速写入阶段和一次性延迟compaction阶段。如此确保初始填充阶段的高写入吞吐量，减小写放大。
 
-Algorithm 1: ConstructInverseMapping
-Input: Git repository object database \(\mathcal{D}\), containing sets of commit objects \(\mathcal{C}\), tree objects \(\mathcal{T}\), and blob objects \(\mathcal{B}\)
-Output: Inverse relation \(\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}\)
+\begin{algorithm}
+\caption{ConstructInverseMapping}
+\begin{algorithmic}[1] % 启用行号
+\Require Git repository object database \(\mathcal{D}\), containing sets of commit objects \(\mathcal{C}\), tree objects \(\mathcal{T}\), and blob objects \(\mathcal{B}\)
+\Ensure Inverse relation \(\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}\)
+\State \(\mathcal{F} \gets \emptyset\) \Comment{Relation of (commit, path, blob)}
+\For{each \(c \in \mathcal{C}\)} \Comment{Iterate through commits}
+    \State \(t \gets \text{GetTopLevelTree}(c)\) \Comment{Get top-level tree object}
+    \State \(\mathcal{P}_c, \mathcal{B}_c \gets \text{ParseTree}(t)\) \Comment{Extract paths and blobs}
+    \For{each \((p, b) \in \mathcal{P}_c \times \mathcal{B}_c\)} \Comment{Process path-blob pairs}
+        \State Add tuple \((c, p, b)\) to \(\mathcal{F}\)
+    \EndFor
+\EndFor
+\State \(\mathcal{F}^{-1} \gets \emptyset\) \Comment{Initialize empty inverse relation}
+\For{each tuple \((c, p, b) \in \mathcal{F}\)} \Comment{Convert to inverse tuples}
+    \State Add tuple \((p, b, c)\) to \(\mathcal{F}^{-1}\)
+\EndFor
+\State Group \(\mathcal{F}^{-1}\) by \((p, b)\) to form sets \(\{(p, b, \{c \mid (p, b, c) \in \mathcal{F}^{-1}\})\}\) \Comment{Create grouped index}
+\State \Return \(\mathcal{F}^{-1}\) \Comment{Output inverse relation index}
+\end{algorithmic}
+\end{algorithm}
 
-1: Initialize an empty relation \(\mathcal{F} \gets \emptyset\) {Relation of (commit, path, blob)}
-2: for each commit \(c \in \mathcal{C}\) do
-3:     \(t \gets \text{GetTopLevelTree}(c)\) {Get top-level tree object}
-4:     \(\mathcal{P}_c, \mathcal{B}_c \gets \text{ParseTree}(t)\) {Extract paths and blobs}
-5:     for each \((p, b) \in \mathcal{P}_c \times \mathcal{B}_c\) do
-6:         Add tuple \((c, p, b)\) to \(\mathcal{F}\)
-7:     end for
-8: end for
-9: Initialize an empty relation \(\mathcal{F}^{-1} \gets \emptyset\)
-10: for each tuple \((c, p, b) \in \mathcal{F}\) do
-11:     Add tuple \((p, b, c)\) to \(\mathcal{F}^{-1}\)
-12: end for
-13: Group \(\mathcal{F}^{-1}\) by \((p, b)\) to form sets \(\{(p, b, \{c \mid (p, b, c) \in \mathcal{F}^{-1}\})\}\)
-14: return \(\mathcal{F}^{-1}\)
+``` mermaid
+flowchart TD
+    Start(["Start"])
+    Input[/"Input Git object database 𝓓 (with 𝓒, 𝓣, 𝓑)"/]
+    InitF["Initialize 𝓕 ← ∅"]
+    LoopC{{"For each c ∈ 𝓒"}}
+    GetTree["t ← GetTopLevelTree(c)"]
+    ParseTree["(𝓟c, 𝓑c) ← ParseTree(t)"]
+    LoopPair{{"For each (p, b) ∈ (𝓟c × 𝓑c)"}}
+    AppendF["Add tuple (c, p, b) to 𝓕"]
+    InitInverse["Initialize 𝓕⁻¹ ← ∅"]
+    LoopTuple{{"For each (c, p, b) ∈ 𝓕"}}
+    AppendInverse["Add tuple (p, b, c) to 𝓕⁻¹"]
+    Group["Group 𝓕⁻¹ by (p, b) → {<br>(p, b, {c | (p, b, c) ∈ 𝓕⁻¹})<br>}"]
+    Output[\"Return 𝓕⁻¹"\]
+    End(["End"])
 
+    %% Flow
+    Start --> Input --> InitF --> LoopC
+    LoopC --> GetTree --> ParseTree --> LoopPair --> AppendF
+    AppendF --> LoopPair
+    LoopPair -->|end| LoopC
+    LoopC -->|end| InitInverse
+    InitInverse --> LoopTuple --> AppendInverse
+    AppendInverse --> LoopTuple 
+    LoopTuple -->|end| Group --> Output --> End
+```
 
-Algorithm 2: RankPathsByUniqueBlobs
-Input: Inverse relation \(\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}\)
-Output: Ranked list \(\mathcal{R}\) of paths, sorted by the number of unique blobs in descending order
+\begin{algorithm}
+\caption{RankPathsByUniqueBlobs}
+\begin{algorithmic}[1] % 启用行号
+\Require Inverse relation \(\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}\)
+\Ensure Ranked list \(\mathcal{R}\) of paths, sorted by the number of unique blobs in descending order
+\State Initialize an empty mapping \(M: \mathcal{P} \to \mathbb{N}\) \Comment{Map from path to unique blob count}
+\For{each path \(p \in \mathcal{P}\)}
+    \State UniqueBlobs \(\gets {b \mid \exists c: (p, b, c) \in \mathcal{F}^{-1}}\) \Comment{Set of unique blobs for path p}
+    \State \(M(p) \gets |\text{UniqueBlobs}|\) \Comment{Count of unique blobs}
+\EndFor
+\State \(\mathcal{R} \gets \emptyset\) \Comment{Initialize empty list}
+\State Sort paths in \(\mathcal{P}\) by (M(p)) in descending order, and append to \(\mathcal{R}\) \Comment{Create ranked list}
+\State \Return \(\mathcal{R}\)
+\end{algorithmic}
+\end{algorithm}
 
-1: Initialize an empty mapping \(M: \mathcal{P} \to \mathbb{N}\) {Map from path to unique blob count}
-2: for each path \(p \in \mathcal{P}\) do
-3:     UniqueBlobs \(\gets \{b \mid \exists c: (p, b, c) \in \mathcal{F}^{-1}\}\) {Set of unique blobs for path p}
-4:     \(M(p) \gets |\text{UniqueBlobs}|\) {Count of unique blobs}
-5: end for
-6: Initialize an empty list \(\mathcal{R} \gets \emptyset\)
-7: Sort paths in \(\mathcal{P}\) by \(M(p)\) in descending order, and append to \(\mathcal{R}\)
-8: return \(\mathcal{R}\)
+```mermaid
+flowchart TD
+    Start(["Start"])
+    Input[/"Input inverse relation <br>𝓕⁻¹ ⊆ 𝓟×𝓑×𝓒"/]
+    InitM["Initialize mapping <br>M: 𝓟 → ℕ"]
+    LoopP{{"For each path p ∈ 𝓟"}}
+    GetBlobs["UniqueBlobs ← <br>{b | ∃c: (p,b,c) ∈ 𝓕⁻¹}"]
+    StoreCount["M(p) ← |UniqueBlobs|"]
+    InitR["Initialize list 𝓡 ← ∅"]
+    Sort["Sort paths in 𝓟 by M(p) <br>descending, store in 𝓡"]
+    Output[\"Return 𝓡"\]
+    End(["End"])
+
+    %% Flow
+    Start --> Input --> InitM --> LoopP
+    LoopP --> GetBlobs --> StoreCount
+    StoreCount --> LoopP
+    LoopP -->|end| InitR
+    InitR --> Sort --> Output --> End
+```
 
 ### 动态commit筛选
 
@@ -169,40 +236,88 @@ Output: Ranked list \(\mathcal{R}\) of paths, sorted by the number of unique blo
 
 筛选过程从包含所有提交的初始候选集 $  \mathcal{C}  $ 开始，依次对每个 $  (p_i, b_i) \in R  $ 与 $  \mathcal{F}^{-1}(p_i, b_i)  $ 取交集。为处理文件来源不一致（如来自不相交commit），gvca维护了一个候选集列表 $  \mathcal{S}  $。对于每个 $  (p_i, b_i)  $，gvca选择性地精炼候选集：若某候选集 $ C $ 的交集 $ C' = C \cap \mathcal{F}^{-1}(p_i, b_i) $ 非空，则更新该候选集为 $   C'   $；若交集为空，则保留原候选集不变。若所有候选集的交集均为空，则从 $  \mathcal{F}^{-1}(p_i, b_i)  $ 创建新候选集，并从 $ R $ 开头到当前位置重新筛选以确保一致性。
 
-Algorithm 3: DynamicCommitFiltering
-Input: Preprocessed release package \( R = \{(p_1, b_1), \dots, (p_n, b_n)\} \), 
-    sorted by path ranking in descending order of blob version count, Inverse relation index \( \mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C} \), 
-    Set of all commits \( \mathcal{C} \)
-Output: List of candidate commit sets \( \mathcal{S} = [C_1, C_2, \dots, C_k] \) for differential analysis
+\begin{algorithm}
+\caption{DynamicCommitFiltering}
+\begin{algorithmic}[1] % 启用行号
+\Require Preprocessed release package \Statex \( R = \{(p_1, b_1), \dots, (p_n, b_n)\} \), sorted by path ranking in descending order of blob version count
+\Require Inverse relation index \( \mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C} \)
+\Ensure List of candidate commit sets \(\mathcal{S}\)
+\State \(\mathcal{S} \gets \emptyset\) \Comment{Init empty candidate set list}
+\For{each \((p_i, b_i) \in R\)} \Comment{Iterate through pairs in ranking order}
+    \State \(\mathcal{S}' \gets \emptyset\) \Comment{Init temporary candidate sets}
+    \State \(hasNonEmptyIntersection \gets \text{False}\) \Comment{Track non-empty intersections}
+    \If{\(\mathcal{S} = \emptyset\)} \Comment{Handle first or empty set}
+        \State \(NewC \gets \mathcal{F}^{-1}(p_i, b_i)\)
+        \If{\(NewC \neq \emptyset\)}
+            \State Append \(NewC\) to \(\mathcal{S}'\)
+            \State \(hasNonEmptyIntersection \gets \text{True}\)
+        \EndIf
+    \Else
+        \For{each \(C_k \in \mathcal{S}\)} \Comment{Process each candidate set}
+            \State \(C_k' \gets C_k \cap \mathcal{F}^{-1}(p_i, b_i)\) \Comment{Compute intersection}
+            \If{\(C_k' \neq \emptyset\)}
+                \State Append \(C_k'\) to \(\mathcal{S}'\)
+                \State \(hasNonEmptyIntersection \gets \text{True}\)
+            \Else
+                \State Append \(C_k\) to \(\mathcal{S}'\)
+            \EndIf
+        \EndFor
+    \EndIf
+    \If{\(\neg hasNonEmptyIntersection\)} \Comment{Create new set if all intersections empty}
+        \State \(NewC \gets \mathcal{F}^{-1}(p_i, b_i)\)
+        \If{\(NewC \neq \emptyset\)}
+            \For{each \((p_j, b_j) \in R\) from index 1 to current index - 1} \Comment{Rescreen prior pairs}
+                \State \(NewC' \gets NewC \cap \mathcal{F}^{-1}(p_j, b_j)\)
+                \If{\(NewC' \neq \emptyset\)}
+                    \State \(NewC \gets NewC'\)
+                \EndIf
+            \EndFor
+            \State Append \(NewC\) to \(\mathcal{S}'\)
+        \EndIf
+    \EndIf
+    \State \(\mathcal{S} \gets \mathcal{S}'\) \Comment{Update candidate sets}
+\EndFor
+\State \Return \(\mathcal{S}\) \Comment{Output final candidate set list}
+\end{algorithmic}
+\end{algorithm}
 
-1: Initialize \( \mathcal{S} \gets [\mathcal{C}] \) {Start with a single candidate set containing all commits}
-2: for each \( (p, b) \in R \) do {Iterate through release package pairs in path ranking order}
-3:     Initialize \( \mathcal{S}' \gets \emptyset \) {Temporary list for updated candidate sets}
-4:     has_non_empty_intersection \(\gets\) False {Track if any non-empty intersection exists}
-5:     for each \( C \in \mathcal{S} \) do {Process each existing candidate set}
-6:         \( C' \gets C \cap \mathcal{F}^{-1}(p, b) \) {Compute intersection with commits for current pair}
-7:         if \( C' \neq \emptyset \) then
-8:             Append \( C' \) to \( \mathcal{S}' \) {Retain non-empty intersections}
-9:             has_non_empty_intersection \(\gets\) True
-10:        end if
-11:    end for
-12:    if not has_non_empty_intersection then {All intersections empty; create new candidate set}
-13:        \( NewC \gets \mathcal{F}^{-1}(p, b) \) {Start with commits for current pair}
-14:        if \( NewC \neq \emptyset \) then
-15:            for each \( (p_j, b_j) \in R \) from index 1 to current index - 1 do {Rescreen from beginning}
-16:                \( NewC \gets NewC \cap \mathcal{F}^{-1}(p_j, b_j) \) {Intersect with previous pairs}
-17:                if \( NewC = \emptyset \) then
-18:                    Break {Stop rescreening if empty}
-19:                end if
-20:            end for
-21:            if \( NewC \neq \emptyset \) then
-22:                Append \( NewC \) to \( \mathcal{S}' \) {Add valid new candidate set}
-23:            end if
-24:        end if
-25:    end if
-26:    \( \mathcal{S} \gets \mathcal{S}' \) {Update candidate sets, pruning empty ones}
-27: end for
-28: return \( \mathcal{S} \) {Return final list of candidate sets for differential analysis}
+``` mermaid
+flowchart TD
+    Start([Start])
+    InputR[/"Input preprocessed release package <br>R = {(p₁,b₁),…,(pₙ,bₙ)}"/]
+    InputInverse[/"Input inverse relation index 𝓕⁻¹ ⊆ 𝓟×𝓑×𝓒"/]
+    InitS["Initialize 𝓢 ← ∅"]
+    LoopR{{"For each (pᵢ,bᵢ) ∈ R <br>(by ranking order)"}}
+    InitLoopR["𝓢′ ← ∅, <br>hasNonEmpty ← False"]
+    CheckS{"If 𝓢 = ∅"}
+    FirstSBranch["NewC ← 𝓕⁻¹(pᵢ,bᵢ)"]
+    FirstSCAppend["If NewC ≠ ∅ then <br>append to 𝓢′, <br>set hasNonEmpty ← True"]
+    LoopSBranch{{"For each Cₖ ∈ 𝓢"}}
+    Intersection["C′ ← Cₖ ∩ 𝓕⁻¹(pᵢ,bᵢ)"]
+    CheckIntersectionEmpty{"If C′ ≠ ∅"}
+    IntersectionNotEmpty["append C′ to 𝓢′, <br>set hasNonEmpty ← True"]
+    IntersectionEmpty["append Cₖ to 𝓢′"]
+    CheckNonEmpty{"If hasNonEmpty"}
+    AllEmpty["NewC ← 𝓕⁻¹(pᵢ,bᵢ)"]
+    Rescreen["If NewC ≠ ∅ then for j < i: NewC ← NewC ∩ 𝓕⁻¹(pⱼ,bⱼ)"]
+    AppendS["Append NewC to 𝓢′"]
+    UpdateS["Update 𝓢 ← 𝓢′"]
+    Output[\"Return 𝓢"\]
+    End(["End"])
+
+    Start --> InputR --> InputInverse --> InitS --> LoopR
+    LoopR --> InitLoopR --> CheckS
+    CheckS -->|yes| FirstSBranch --> FirstSCAppend --> UpdateS
+    CheckS -->|no| LoopSBranch
+    LoopSBranch --> Intersection --> CheckIntersectionEmpty
+    CheckIntersectionEmpty --> |yes| IntersectionNotEmpty --> LoopSBranch
+    CheckIntersectionEmpty --> |no| IntersectionEmpty --> LoopSBranch
+    LoopSBranch --> |end loop| CheckNonEmpty
+    CheckNonEmpty --> |yes| UpdateS
+    CheckNonEmpty --> |no| AllEmpty --> Rescreen --> AppendS --> UpdateS
+    UpdateS --> LoopR
+    LoopR -->|all pairs done| Output --> End
+  ```
 
 #### 后过滤与应用
 

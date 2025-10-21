@@ -45,7 +45,12 @@ pub const CommitCollection = struct {
         /// 在构建过程中添加新值，并假定这个值比已知所有值都要更大，以省去重新排序
         pub fn appendAssumeGreaterNative(self: *Builder, allocator: std.mem.Allocator, ci_native: CommitSeqNative) !void {
             if (self.maybe_last_range) |last_range| {
-                std.debug.assert(ci_native > last_range.end and last_range.end >= last_range.start);
+                if (ci_native <= last_range.end) std.debug.panic(
+                    \\Input a commit seq not greater than last range in builder.  
+                    \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
+                    \\Use the `gvca prep` subcommand to regenerate a valid rocksdb database.
+                , .{});
+                std.debug.assert(last_range.end >= last_range.start);
                 if (ci_native == last_range.end + 1) {
                     self.maybe_last_range = .packStartEnd(last_range.start, ci_native);
                 } else {
@@ -55,13 +60,6 @@ pub const CommitCollection = struct {
             } else {
                 self.maybe_last_range = .packStartEnd(ci_native, ci_native);
             }
-        }
-        pub fn testGreaterNative(self: *Builder, ci_native: CommitSeqNative) bool {
-            if (self.maybe_last_range) |last_range| {
-                std.debug.assert(last_range.end >= last_range.start);
-                return ci_native > last_range.end;
-            }
-            return true;
         }
         /// 将内容转换为一个拥有所有权的CommitRanges
         pub fn toOwnedCommitRanges(self: *Builder, allocator: std.mem.Allocator) !CommitCollection {
