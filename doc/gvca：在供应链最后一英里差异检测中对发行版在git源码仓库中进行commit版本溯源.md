@@ -151,6 +151,44 @@ $$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
 
 为进一步优化写入性能，逆向关系数据库填充过程分为两个阶段：无compaction快速写入阶段和一次性延迟compaction阶段。如此确保初始填充阶段的高写入吞吐量，减小写放大。
 
+![反向数据库构建流程图](反向数据库构建流程图.png)
+
+![反向数据库的构建过程实例](反向数据库的构建过程实例.png)
+
+| Path ID | Path |
+|-------|-------|
+| 1 | test.txt |
+| 2 | new.txt |
+| 3 | bak/test.txt |
+
+| Path Blob ID | Path ID | Blob |
+|-------|-------|-------|
+| 1 | 1 | 83baae |
+| 2 | 1 | 1f7a7a |
+| 3 | 2 | fa49b0 |
+| 4 | 3 | 83baae |
+
+| Commit ID | Commit |
+|-------|-------|
+| 1 | fdf4fc |
+| 2 | cac0ca |
+| 3 | 1a410e |
+
+| Path Blob ID | Commit ID |
+|-------|-------|
+| 1 | 1 |
+| 2 | 2 |
+| 2 | 3 |
+| 3 | 2 |
+| 3 | 3 |
+| 4 | 3 |
+
+| Path Rank | Path ID |
+|-------|-------|
+| 1 | 1 |
+| 2 | 2 |
+| 3 | 3 |
+
 \begin{algorithm}
 \caption{ConstructInverseMapping}
 \begin{algorithmic}[1] % 启用行号
@@ -335,10 +373,12 @@ flowchart TD
     CheckIntersectionEmpty --> |no| IntersectionEmpty --> LoopSBranch
     LoopSBranch --> |end loop| CheckNonEmpty
     CheckNonEmpty --> |yes| UpdateS
-    CheckNonEmpty --> |no| AllEmpty --> Rescreen --> AppendS --> UpdateS
+    CheckNonEmpty --> |no| AllEmpty --> Rescreen --> AppendS --> UpdateS                        
     UpdateS --> LoopR
     LoopR -->|all pairs done| Output --> End
   ```
+
+![release筛选流程图](release筛选流程图.png)
 
 #### 后过滤与应用
 
