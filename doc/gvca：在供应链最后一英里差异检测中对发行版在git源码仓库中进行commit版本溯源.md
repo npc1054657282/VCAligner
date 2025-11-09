@@ -64,7 +64,7 @@ SLSA 被认为是这其中最具生态潜力的供应链安全框架。但是，
 - tag命名不规范：tag名称如“release-1”或“beta”不遵循标准，自动化工具难以解析对应版本。
 - tag丢失：仓库迁移（如 GitHub到GitLab）或清理可能丢失历史tag，尤其是轻量级tag。
 
-Shobe等人[]在针对Google Chrome、GNU gcc 和 Subversion三个开源项目中，依赖手工检查日志的方法识别release版本与commit之间的映射关系，过程手动且繁琐。即使开发一种基于启发式的方法来半自动推断这些映射关系，也需要提供具体的发布命名与分支方案以及来源信息。这样的方案对于大量受以上复杂性因素影响的开源软件包无法适用。
+Shobe等人[On mapping releases to commits in open source systems]在针对Google Chrome、GNU gcc 和 Subversion三个开源项目中，依赖手工检查日志的方法识别release版本与commit之间的映射关系，过程手动且繁琐。即使开发一种基于启发式的方法来半自动推断这些映射关系，也需要提供具体的发布命名与分支方案以及来源信息。这样的方案对于大量受以上复杂性因素影响的开源软件包无法适用。
 
 ## 绕过版本对齐方案的研究存在问题
 
