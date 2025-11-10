@@ -111,7 +111,9 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 const pi_ptr = c.rocksdb_iter_value(pi_iter, &pi_len);
                 break :blk std.mem.bytesToValue(PathSeq, pi_ptr[0..pi_len]);
             };
-            try ctx.candidate_parser.agenda_parsers.append(allocator, .{ .pi = pi });
+            try ctx.candidate_parser.agenda_parsers.append(allocator, .{
+                .pi = pi,
+            });
         }
         for (0..ctx.candidate_parser.agenda_parsers.items.len) |i| {
             // 要求传入的分配器是线程安全的。
@@ -121,48 +123,66 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     }
     std.log.info("start candidate.", .{});
     // agendas全部解析完毕。开始依次候选。
-    for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+    for (ctx.candidate_parser.agenda_parsers.items, 0..) |*agenda, agenda_index| {
         switch (agenda.commit_collection) {
             .unparsed => unreachable,
             .path_not_find_in_release, .path_blob_not_match => {},
             .parsed => |commit_collection| {
                 // 对于agendas，将它与目前已经存在的所有candidate进行运算。
                 var intersection_success: bool = false;
-                for (ctx.candidate_parser.candidates.items) |*candidate| {
-                    switch (try candidate.commit_collection.intersectInPlace(allocator, commit_collection.view())) {
-                        .unchanged, .restricted => intersection_success = intersection_success or true,
+                for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
+                    fallthrough: switch (try candidate.commit_collection.intersectInPlace(allocator, commit_collection.view())) {
+                        .restricted => {
+                            try agenda.affect_candidates_idx.append(allocator, candidate_index);
+                            continue :fallthrough .unchanged;
+                        },
+                        .unchanged => {
+                            intersection_success = intersection_success or true;
+                            try agenda.included_in_candidates_idx.append(allocator, candidate_index);
+                        },
                         .empty => {},
                     }
                 }
                 // 如果所有交集皆为空，本agendas成为新候选人。把本agendas拷贝后创建为新的candidate。
                 if (!intersection_success) {
                     std.log.info("append new candidate with path {s}", .{agenda.path.parsed});
+                    const new_candidate_index = ctx.candidate_parser.candidates.items.len;
                     try ctx.candidate_parser.candidates.append(allocator, .{
                         .commit_collection = new_candidate_collection: {
                             var new_candidate_collection: gvca.commit_range.CommitCollection = try commit_collection.view().dupe(allocator);
                             // 对于新创建的候选集，重新补课，与前面的所有agenda取交集。
                             for (ctx.candidate_parser.agenda_parsers.items) |*review_agenda| {
-                                if (agenda == review_agenda) break;
+                                if (agenda == review_agenda) {
+                                    try agenda.affect_candidates_idx.append(allocator, new_candidate_index);
+                                    try agenda.included_in_candidates_idx.append(allocator, new_candidate_index);
+                                    break;
+                                }
                                 switch (review_agenda.commit_collection) {
                                     .unparsed => unreachable,
                                     .path_not_find_in_release, .path_blob_not_match => {},
                                     .parsed => |reviw_commit_collection| {
-                                        _ = try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view());
+                                        fallthrough: switch (try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view())) {
+                                            .restricted => {
+                                                try agenda.affect_candidates_idx.append(allocator, new_candidate_index);
+                                                continue :fallthrough .unchanged;
+                                            },
+                                            .unchanged => try agenda.included_in_candidates_idx.append(allocator, new_candidate_index),
+                                            .empty => {},
+                                        }
                                     },
                                 }
                             }
                             break :new_candidate_collection new_candidate_collection;
                         },
+                        .created_by_agenda_idx = agenda_index,
                     });
                 }
             },
         }
     }
 
-    // 最后：对于所有candidate，打印其所有commits。
-    std.debug.print("result output.\n", .{});
-    for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
-        std.debug.print("candidate {d}\n", .{candidate_index});
+    // 最后：对于所有candidate，解析其所有commits的实际值。
+    for (ctx.candidate_parser.candidates.items) |*candidate| {
         for (candidate.commit_collection.ranges) |range| {
             const ci_native_start = range.start;
             const ci_native_end = range.end;
@@ -195,17 +215,145 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                         .id = std.mem.bytesToValue(@FieldType(c.git_oid, "id"), commit_ptr),
                     };
                 };
-                // TODO: 更加标准的写入，例如指定写入文件
-                std.debug.print("{x}\n", .{commit.id});
+                try candidate.parsed.append(allocator, commit);
             }
         }
     }
+    // 用agenda_parsers解析得到的所有并非在release包找不到的文件，构造为一个StringHashmap以便于查找。利于构造release_phatom_files。
+    // 所有key均采集自agenda_parses，不维护生存期
+    var repo_paths_map: std.StringHashMapUnmanaged(void) = .empty;
+    build_repo_paths_map: {
+        for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+            switch (agenda.commit_collection) {
+                .parsed, .path_blob_not_match => try repo_paths_map.put(allocator, agenda.path.parsed, {}),
+                else => {},
+            }
+        }
+        break :build_repo_paths_map;
+    }
+    defer repo_paths_map.deinit(allocator);
+    // 最后输出。
+    const f: std.fs.File = switch (ctx.report_output) {
+        .manual => |report_output| try std.fs.cwd().createFileZ(report_output, .{}),
+        .none => std.fs.File.stdout(),
+    };
+    defer switch (ctx.report_output) {
+        .manual => f.close(),
+        .none => {},
+    };
+    const arbitrary_buffer_size = 1024;
+    var output_buffer: [arbitrary_buffer_size]u8 = undefined;
+    var output_writer: std.fs.File.Writer = f.writer(&output_buffer);
+    var stringifier: std.json.Stringify = .{ .writer = &output_writer.interface, .options = .{ .whitespace = .indent_4 } };
+    output: {
+        try stringifier.beginObject();
+        defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
+        try stringifier.objectField("candidates");
+        candidates: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
+                try stringifier.beginObject();
+                defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
+                try stringifier.objectField("idx");
+                try stringifier.write(candidate_index);
+                try stringifier.objectField("created_by");
+                try stringifier.write(ctx.candidate_parser.agenda_parsers.items[candidate.created_by_agenda_idx].path);
+                try stringifier.objectField("commits");
+                commits: {
+                    try stringifier.beginArray();
+                    defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+                    for (candidate.parsed.items) |commit| {
+                        try stringifier.write(std.fmt.bytesToHex(commit.id, .lower));
+                    }
+                    break :commits;
+                }
+            }
+            break :candidates;
+        }
+        try stringifier.objectField("repo_only_files");
+        repo_only_files: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+                switch (agenda.commit_collection) {
+                    .path_not_find_in_release => try stringifier.write(agenda.path.parsed),
+                    else => {},
+                }
+            }
+            break :repo_only_files;
+        }
+        try stringifier.objectField("release_phatom_files");
+        release_phatom_files: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            // 遍历release目录，检查该子目录是否存在于repo_paths_map中
+            var release_dir = try std.fs.cwd().openDirZ(ctx.release_path, .{ .iterate = true });
+            defer release_dir.close();
+            var walker = try release_dir.walk(allocator);
+            while (try walker.next()) |entry| {
+                if (entry.kind == .directory) continue;
+                if (repo_paths_map.contains(entry.path)) continue;
+                try stringifier.write(entry.path);
+            }
+            break :release_phatom_files;
+        }
+        try stringifier.objectField("dismatch_phatom_files");
+        dismatch_phatom_files: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+                switch (agenda.commit_collection) {
+                    .path_blob_not_match => try stringifier.write(agenda.path.parsed),
+                    else => {},
+                }
+            }
+            break :dismatch_phatom_files;
+        }
+        try stringifier.objectField("match_files");
+        match_files: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+                switch (agenda.commit_collection) {
+                    .parsed => {
+                        try stringifier.beginObject();
+                        defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
+                        try stringifier.objectField("path");
+                        try stringifier.write(agenda.path.parsed);
+                        try stringifier.objectField("affect_candidates_idx");
+                        affect_candidates_idx: {
+                            try stringifier.beginArray();
+                            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+                            for (agenda.affect_candidates_idx.items) |candidate_idx| {
+                                try stringifier.write(candidate_idx);
+                            }
+                            break :affect_candidates_idx;
+                        }
+                        try stringifier.objectField("included_in_candidates_idx");
+                        included_in_candidates_idx: {
+                            try stringifier.beginArray();
+                            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+                            for (agenda.included_in_candidates_idx.items) |candidate_idx| {
+                                try stringifier.write(candidate_idx);
+                            }
+                            break :included_in_candidates_idx;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            break :match_files;
+        }
+        break :output;
+    }
+    try output_writer.interface.flush();
 }
 
 fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
     const lctx = &gctx.candidate_parser.agenda_parsers.items[agenda_index];
     var err_cstr: ?[*:0]u8 = null;
-    const path: [:0]u8 = blk: {
+    const release_path: [:0]u8, const path: [:0]u8 = blk: {
         var path_len: usize = undefined;
         const path_ptr = c.rocksdb_get_cf(
             gctx.db,
@@ -229,14 +377,20 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         builder.appendSlice(ts_allocator, gctx.release_path) catch gvca.crash_dump.dumpAndCrash(@src());
         builder.append(ts_allocator, '/') catch gvca.crash_dump.dumpAndCrash(@src());
         builder.appendSlice(ts_allocator, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src());
-        break :blk builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src());
+        break :blk .{
+            builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src()),
+            ts_allocator.dupeZ(u8, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src()),
+        };
     };
-    defer lctx.path = .{ .parsed = path };
+    defer {
+        ts_allocator.free(release_path);
+        lctx.path = .{ .parsed = path };
+    }
     // 检查文件存在性。若存在，计算其hash。
     const path_blob_key: PathBlobKey = .{
         .path_seq = lctx.pi,
         .blob_hash = blk: {
-            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path) catch |err| {
+            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, release_path) catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
                 gvca.crash_dump.dumpAndCrash(@src());
             };

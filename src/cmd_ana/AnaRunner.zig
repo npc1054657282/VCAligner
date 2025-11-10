@@ -10,6 +10,10 @@ const AnaRunner = @This();
 global: CliRunner.Global,
 rocksdb_path: [:0]u8,
 release_path: [:0]u8,
+report_output: union(enum) {
+    manual: [:0]u8,
+    none: void,
+},
 point_lookup_cache_mb: u64,
 n_jobs: usize,
 db: *c.struct_rocksdb_t = undefined,
@@ -32,9 +36,13 @@ candidate_parser: struct {
             path_blob_not_match: void,
             parsed: gvca.commit_range.CommitCollection,
         } = .unparsed,
+        affect_candidates_idx: std.ArrayList(usize) = .empty, // 如果这个agenda让一个candidate在取交集时缩小了，就说这个agenda影响了这个candidate。此处的usize指candidates中的index
+        included_in_candidates_idx: std.ArrayList(usize) = .empty, // 一个agenda只要和candidate取交集不为空，就说这个agenda被这个cadidate包含。此处的usize指candidates中的index
     }, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
     candidates: std.ArrayList(struct {
         commit_collection: gvca.commit_range.CommitCollection,
+        parsed: std.ArrayList(c.git_oid) = .empty,
+        created_by_agenda_idx: usize, // 记录创建这个候选者的agenda，usize是agenda_parsers中的index
     }),
     once_get_roptions: *c.struct_rocksdb_readoptions_t, // 用于pi2p、pib2pbi的读取
     prefix_scan_roptions: *c.struct_rocksdb_readoptions_t, // 用于default的读取
@@ -67,10 +75,13 @@ candidate_parser: struct {
                 .parsed => |parsed| parsed.deinit(allocator),
                 .unparsed, .path_not_find_in_release, .path_blob_not_match => {},
             }
+            item.affect_candidates_idx.deinit(allocator);
+            item.included_in_candidates_idx.deinit(allocator);
         }
         self.agenda_parsers.deinit(allocator);
         for (self.candidates.items) |*item| {
             item.commit_collection.deinit(allocator);
+            item.parsed.deinit(allocator);
         }
         self.candidates.deinit(allocator);
         c.rocksdb_readoptions_destroy(self.once_get_roptions);
@@ -82,6 +93,7 @@ candidate_parser: struct {
 pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("ana"))
     .arg(zargs.Arg.optArg("rocksdb_path", []const u8).long("rocksdb-path"))
     .arg(zargs.Arg.optArg("release_path", []const u8).long("release-path"))
+    .arg(zargs.Arg.optArg("report_output", ?[]const u8).long("report-output").short('o'))
     .arg(zargs.Arg.optArg("point_lookup_cache_mb", u64).long("point-lookup-cache-mb").default(512))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"));
 
@@ -96,6 +108,9 @@ pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) 
             .global = CliRunner.Global.initGlobal(args),
             .rocksdb_path = try allocator.dupeZ(u8, args.rocksdb_path),
             .release_path = try allocator.dupeZ(u8, args.release_path),
+            .report_output = if (args.report_output) |report_output| .{
+                .manual = try allocator.dupeZ(u8, report_output),
+            } else .none,
             .point_lookup_cache_mb = args.point_lookup_cache_mb,
             .n_jobs = n_jobs,
         },
@@ -106,4 +121,9 @@ pub fn deinit(self: *AnaRunner, allocator: std.mem.Allocator) void {
     self.rocksdb_path = undefined;
     allocator.free(self.release_path);
     self.release_path = undefined;
+    switch (self.report_output) {
+        .manual => allocator.free(self.report_output.manual),
+        .none => {},
+    }
+    self.* = undefined;
 }
