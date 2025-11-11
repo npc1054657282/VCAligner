@@ -38,7 +38,7 @@ pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
 // 考虑到最终的操作为rocksdb操作最多，或许应当重构为主线程写入，另创建一个线程分发解析，分发解析线程内再创建线程池。
 // 重新思考：另开写线程未尝不可，只是可能要根据情况决定是由线程自己打开rocksdb数据库，还是主线程打开然后让rocksdb数据库持有使用权。
 pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    std.debug.print("verbose: {}, compression: {}, path: {s}\n", .{ ctx.global.verbose, ctx.compression, ctx.bare_repo_path });
+    std.log.debug("verbose: {}, compression: {}, path: {s}\n", .{ ctx.global.verbose, ctx.compression, ctx.bare_repo_path });
     var git_error_code = c.git_libgit2_init();
     if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
     defer {
@@ -76,7 +76,7 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
         allocator.free(ctx.repo_id);
         ctx.repo_id = undefined;
     }
-    std.debug.print("repo-id: {s}\n", .{ctx.repo_id});
+    std.log.debug("repo-id: {s}\n", .{ctx.repo_id});
     // 如果rocksdb_output未指定，基于repo_id设置rocksdb_output。
     switch (ctx.rocksdb_output) {
         .manual => {},
@@ -143,7 +143,7 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
         ctx.parsers.pool.waitAndWork(&ctx.parsers.wait_group);
         ctx.channel.notifyConsumerDone();
         writer.join();
-        std.log.info("Writer end.\n", .{});
+        std.log.debug("Writer end.\n", .{});
     }
     git_error_code = c.git_odb_foreach(ctx.odb, index_builder_cb, ctx);
     try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);

@@ -11,7 +11,7 @@ pub const rocksdb_custom = @import("rocksdb_custom.zig");
 pub const commit_range = @import("commit_range.zig");
 pub const pid = @import("pid.zig");
 
-const runtime_safety = switch (@import("builtin").mode) {
+pub const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
 };
@@ -52,7 +52,7 @@ pub fn main() !void {
         diagnostics.log_all(err);
         diagnostics.clear();
     };
-    std.log.info("Gvca End.\n", .{});
+    std.log.debug("Gvca End.\n", .{});
 }
 
 test {

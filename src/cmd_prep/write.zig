@@ -205,7 +205,7 @@ pub fn task(ctx: *PrepRunner) void {
             gvca.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
-        std.log.info("Parse end.\n", .{});
+        std.log.debug("Parse end.\n", .{});
     }
 
     // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
@@ -356,5 +356,5 @@ pub fn task(ctx: *PrepRunner) void {
         }
         break :flush_all;
     }
-    std.log.info("Write end. All flushed\n", .{});
+    std.log.debug("Write end. All flushed\n", .{});
 }

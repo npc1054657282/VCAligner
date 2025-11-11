@@ -94,7 +94,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         c.rocksdb_close(db);
     }
     // 触发手动compaction（整个数据库）
-    std.log.info("Compaction start.\n", .{});
+    std.log.debug("Compaction start.\n", .{});
     const compact_options = c.rocksdb_compactoptions_create();
     defer c.rocksdb_compactoptions_destroy(compact_options);
 
@@ -108,30 +108,6 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     if (err_cstr) |ecstr| {
         std.log.err("rocksdb wait for compact failed! {s}\n", .{std.mem.span(ecstr)});
         return error.RocksdbError;
-    }
-
-    // 另一种方案等待 Compaction 完成，为了保险起见，因为不熟悉`rocksdb_wait_for_compact`
-    while (true) {
-        var num_running: u64 = undefined;
-        var err = c.rocksdb_property_int(db, "rocksdb.num-running-compactions", &num_running);
-        if (err != 0) {
-            std.log.err("rocksdb write failed! {d}\n", .{err});
-            return error.RocksdbError;
-        }
-
-        var pending: u64 = undefined;
-        err = c.rocksdb_property_int(db, "rocksdb.compaction-pending", &pending);
-        if (err != 0) {
-            std.log.err("rocksdb write failed! {d}\n", .{err});
-            return error.RocksdbError;
-        }
-
-        if (num_running == 0 and pending == 0) {
-            std.debug.print("Compaction completed.\n", .{});
-            break;
-        }
-        std.debug.print("Waiting for compaction: running={d}, pending={d}\n", .{ num_running, pending });
-        std.Thread.sleep(10 * std.time.ns_per_s); // 等待 10s
     }
 
     // 开始cf_pr_pi写入

@@ -42,10 +42,12 @@ pub fn unreg(self: *CrashDump, comptime name: []const u8, id: usize) void {
         },
         .id = id,
     };
-    // 取消注册前，打印一下日志内容：
-    if (self.registry.get(did)) |dumpable| {
-        std.log.info("unreg log: {s}-{d}", .{ name, id });
-        dumpable.dumpFn(dumpable);
+    // 调试模式下，取消注册前，打印一下日志内容：
+    if (@import("builtin").mode == .Debug) {
+        if (self.registry.get(did)) |dumpable| {
+            std.log.info("unreg log: {s}-{d}", .{ name, id });
+            dumpable.dumpFn(dumpable);
+        }
     }
     if (!self.registry.remove(did)) {
         std.log.warn("Crash dump unreg failed.\n", .{});
