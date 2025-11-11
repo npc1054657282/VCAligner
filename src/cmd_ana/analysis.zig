@@ -121,7 +121,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
         }
         break :parse_agendas;
     }
-    std.log.info("start candidate.", .{});
+    std.log.debug("start candidate.", .{});
     // agendas全部解析完毕。开始依次候选。
     for (ctx.candidate_parser.agenda_parsers.items, 0..) |*agenda, agenda_index| {
         switch (agenda.commit_collection) {
@@ -145,7 +145,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 }
                 // 如果所有交集皆为空，本agendas成为新候选人。把本agendas拷贝后创建为新的candidate。
                 if (!intersection_success) {
-                    std.log.info("append new candidate with path {s}", .{agenda.path.parsed});
+                    std.log.debug("append new candidate with path {s}", .{agenda.path.parsed});
                     const new_candidate_index = ctx.candidate_parser.candidates.items.len;
                     try ctx.candidate_parser.candidates.append(allocator, .{
                         .commit_collection = new_candidate_collection: {
