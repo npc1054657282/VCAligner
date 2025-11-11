@@ -271,18 +271,6 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
             }
             break :candidates;
         }
-        try stringifier.objectField("repo_only_files");
-        repo_only_files: {
-            try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
-            for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
-                switch (agenda.commit_collection) {
-                    .path_not_find_in_release => try stringifier.write(agenda.path.parsed),
-                    else => {},
-                }
-            }
-            break :repo_only_files;
-        }
         try stringifier.objectField("release_phatom_files");
         release_phatom_files: {
             try stringifier.beginArray();
@@ -344,6 +332,18 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 }
             }
             break :match_files;
+        }
+        try stringifier.objectField("repo_only_files");
+        repo_only_files: {
+            try stringifier.beginArray();
+            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
+            for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
+                switch (agenda.commit_collection) {
+                    .path_not_find_in_release => try stringifier.write(agenda.path.parsed),
+                    else => {},
+                }
+            }
+            break :repo_only_files;
         }
         break :output;
     }
