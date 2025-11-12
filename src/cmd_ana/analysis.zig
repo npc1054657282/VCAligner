@@ -126,7 +126,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     for (ctx.candidate_parser.agenda_parsers.items, 0..) |*agenda, agenda_index| {
         switch (agenda.commit_collection) {
             .unparsed => unreachable,
-            .path_not_find_in_release, .path_blob_not_match => {},
+            .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
             .parsed => |commit_collection| {
                 // 对于agendas，将它与目前已经存在的所有candidate进行运算。
                 var intersection_success: bool = false;
@@ -159,7 +159,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                                 }
                                 switch (review_agenda.commit_collection) {
                                     .unparsed => unreachable,
-                                    .path_not_find_in_release, .path_blob_not_match => {},
+                                    .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
                                     .parsed => |reviw_commit_collection| {
                                         fallthrough: switch (try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view())) {
                                             .restricted => {
@@ -247,14 +247,11 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     var stringifier: std.json.Stringify = .{ .writer = &output_writer.interface, .options = .{ .whitespace = .indent_4 } };
     output: {
         try stringifier.beginObject();
-        defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
         try stringifier.objectField("candidates");
         candidates: {
             try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
             for (ctx.candidate_parser.candidates.items, 0..) |*candidate, candidate_index| {
                 try stringifier.beginObject();
-                defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
                 try stringifier.objectField("idx");
                 try stringifier.write(candidate_index);
                 try stringifier.objectField("created_by");
@@ -262,19 +259,20 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 try stringifier.objectField("commits");
                 commits: {
                     try stringifier.beginArray();
-                    defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
                     for (candidate.parsed.items) |commit| {
                         try stringifier.write(std.fmt.bytesToHex(commit.id, .lower));
                     }
+                    try stringifier.endArray();
                     break :commits;
                 }
+                try stringifier.endObject();
             }
+            try stringifier.endArray();
             break :candidates;
         }
         try stringifier.objectField("release_phatom_files");
         release_phatom_files: {
             try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
             // 遍历release目录，检查该子目录是否存在于repo_paths_map中
             var release_dir = try std.fs.cwd().openDirZ(ctx.release_path, .{ .iterate = true });
             defer release_dir.close();
@@ -284,67 +282,69 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                 if (repo_paths_map.contains(entry.path)) continue;
                 try stringifier.write(entry.path);
             }
+            try stringifier.endArray();
             break :release_phatom_files;
         }
         try stringifier.objectField("dismatch_phatom_files");
         dismatch_phatom_files: {
             try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
             for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
                 switch (agenda.commit_collection) {
                     .path_blob_not_match => try stringifier.write(agenda.path.parsed),
                     else => {},
                 }
             }
+            try stringifier.endArray();
             break :dismatch_phatom_files;
         }
         try stringifier.objectField("match_files");
         match_files: {
             try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
             for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
                 switch (agenda.commit_collection) {
                     .parsed => {
                         try stringifier.beginObject();
-                        defer stringifier.endObject() catch gvca.crash_dump.dumpAndCrash(@src());
                         try stringifier.objectField("path");
                         try stringifier.write(agenda.path.parsed);
                         try stringifier.objectField("affect_candidates_idx");
                         affect_candidates_idx: {
                             try stringifier.beginArray();
-                            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
                             for (agenda.affect_candidates_idx.items) |candidate_idx| {
                                 try stringifier.write(candidate_idx);
                             }
+                            try stringifier.endArray();
                             break :affect_candidates_idx;
                         }
                         try stringifier.objectField("included_in_candidates_idx");
                         included_in_candidates_idx: {
                             try stringifier.beginArray();
-                            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
                             for (agenda.included_in_candidates_idx.items) |candidate_idx| {
                                 try stringifier.write(candidate_idx);
                             }
+                            try stringifier.endArray();
                             break :included_in_candidates_idx;
                         }
+                        try stringifier.endObject();
                     },
                     else => {},
                 }
             }
+            try stringifier.endArray();
             break :match_files;
         }
         try stringifier.objectField("repo_only_files");
         repo_only_files: {
             try stringifier.beginArray();
-            defer stringifier.endArray() catch gvca.crash_dump.dumpAndCrash(@src());
             for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
                 switch (agenda.commit_collection) {
                     .path_not_find_in_release => try stringifier.write(agenda.path.parsed),
                     else => {},
                 }
             }
+            try stringifier.endArray();
             break :repo_only_files;
         }
+        try stringifier.endObject();
         break :output;
     }
     try output_writer.interface.flush();
@@ -353,7 +353,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
 fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
     const lctx = &gctx.candidate_parser.agenda_parsers.items[agenda_index];
     var err_cstr: ?[*:0]u8 = null;
-    const release_path: [:0]u8, const path: [:0]u8 = blk: {
+    const path_from_cwd: [:0]u8, const path: [:0]u8 = blk: {
         var path_len: usize = undefined;
         const path_ptr = c.rocksdb_get_cf(
             gctx.db,
@@ -373,24 +373,38 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             gvca.crash_dump.dumpAndCrash(@src());
         }
         defer c.rocksdb_free(path_ptr);
+        const path_from_repo = path_ptr[0..path_len];
+        const path_from_release = path_from_release: {
+            if (gctx.package_directory) |package_directory| {
+                // 相当于`std.mem.startswith`，但是排除了完全相等的情况
+                if (path_from_repo.len > package_directory.len and std.mem.eql(u8, path_from_repo[0..package_directory.len], package_directory)) {
+                    const remainder = path_from_repo[package_directory.len..];
+                    if (remainder[0] == '/') break :path_from_release remainder[1..] else break :path_from_release remainder;
+                } else {
+                    // XXX: 目前的实现，path设定为package_directory下的相对目录，因此如果不在package_directory下，就保持path为unparsed状态。
+                    lctx.commit_collection = .path_not_in_package_directory;
+                    return;
+                }
+            } else break :path_from_release path_from_repo;
+        };
         var builder: std.ArrayList(u8) = .empty;
         builder.appendSlice(ts_allocator, gctx.release_path) catch gvca.crash_dump.dumpAndCrash(@src());
         builder.append(ts_allocator, '/') catch gvca.crash_dump.dumpAndCrash(@src());
-        builder.appendSlice(ts_allocator, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src());
+        builder.appendSlice(ts_allocator, path_from_release) catch gvca.crash_dump.dumpAndCrash(@src());
         break :blk .{
             builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src()),
-            ts_allocator.dupeZ(u8, path_ptr[0..path_len]) catch gvca.crash_dump.dumpAndCrash(@src()),
+            ts_allocator.dupeZ(u8, path_from_release) catch gvca.crash_dump.dumpAndCrash(@src()),
         };
     };
     defer {
-        ts_allocator.free(release_path);
+        ts_allocator.free(path_from_cwd);
         lctx.path = .{ .parsed = path };
     }
     // 检查文件存在性。若存在，计算其hash。
     const path_blob_key: PathBlobKey = .{
         .path_seq = lctx.pi,
         .blob_hash = blk: {
-            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, release_path) catch |err| {
+            const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path_from_cwd) catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
                 gvca.crash_dump.dumpAndCrash(@src());
             };

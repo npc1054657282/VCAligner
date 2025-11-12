@@ -14,6 +14,7 @@ report_output: union(enum) {
     manual: [:0]u8,
     none: void,
 },
+package_directory: ?[:0]u8, // 一些场景下，包对应的是repo的一个子目录而非整个仓库。
 point_lookup_cache_mb: u64,
 n_jobs: usize,
 db: *c.struct_rocksdb_t = undefined,
@@ -26,12 +27,15 @@ candidate_parser: struct {
         // XXX: 一个设计思路是，将`path`和`commit_collection`一起放到一个`union(enum)`里判断是否`unparsed`，然后再对`commit_collection`分三种解析结果讨论。
         // 虽然这个思路看起来很健全，但其实有隐患：path和commit_collection其实是分步骤解析的，而`unparsed`是`undefined`的安全版，以防止错误退出时没能正确析构。
         // 因此，各自保存各自的`unparsed`才是真实合理的方案。
+        // 在当前实现中，如果`commit_collection`为`unparsed`和`path_not_in_package_directory`，`path`保留为`unparsed`。
+        // 如果`commit_collection`为`path_not_find_in_release`、`path_blob_not_match`和`parsed`，`path`将被解析为package_directory下的相对路径。
         path: union(enum) {
             unparsed: void,
             parsed: [:0]u8,
         } = .unparsed,
         commit_collection: union(enum) {
             unparsed: void,
+            path_not_in_package_directory: void,
             path_not_find_in_release: void,
             path_blob_not_match: void,
             parsed: gvca.commit_range.CommitCollection,
@@ -73,7 +77,7 @@ candidate_parser: struct {
             }
             switch (item.commit_collection) {
                 .parsed => |parsed| parsed.deinit(allocator),
-                .unparsed, .path_not_find_in_release, .path_blob_not_match => {},
+                .unparsed, .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
             }
             item.affect_candidates_idx.deinit(allocator);
             item.included_in_candidates_idx.deinit(allocator);
@@ -94,6 +98,7 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("ana"))
     .arg(zargs.Arg.optArg("rocksdb_path", []const u8).long("rocksdb-path"))
     .arg(zargs.Arg.optArg("release_path", []const u8).long("release-path"))
     .arg(zargs.Arg.optArg("report_output", ?[]const u8).long("report-output").short('o'))
+    .arg(zargs.Arg.optArg("package_directory", ?[]const u8).long("package-directory"))
     .arg(zargs.Arg.optArg("point_lookup_cache_mb", u64).long("point-lookup-cache-mb").default(512))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"));
 
@@ -111,6 +116,7 @@ pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) 
             .report_output = if (args.report_output) |report_output| .{
                 .manual = try allocator.dupeZ(u8, report_output),
             } else .none,
+            .package_directory = if (args.package_directory) |package_directory| try allocator.dupeZ(u8, package_directory) else null,
             .point_lookup_cache_mb = args.point_lookup_cache_mb,
             .n_jobs = n_jobs,
         },
@@ -122,8 +128,9 @@ pub fn deinit(self: *AnaRunner, allocator: std.mem.Allocator) void {
     allocator.free(self.release_path);
     self.release_path = undefined;
     switch (self.report_output) {
-        .manual => allocator.free(self.report_output.manual),
+        .manual => |manual| allocator.free(manual),
         .none => {},
     }
+    if (self.package_directory) |package_directory| allocator.free(package_directory);
     self.* = undefined;
 }
