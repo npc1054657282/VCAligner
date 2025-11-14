@@ -386,6 +386,24 @@ flowchart TD
 
 ## Data Collection
 
+### 不良报告
+
+不良报告，包括没有解析得到任何commit结果的报告，系release包几乎没有与repo的同路径文件所致。以及解析所得的候选集中，commit最低的候选集依然包含过量commit，系release包仅有LICENSE等极少数文件在repo中存在同路径文件所致。
+
+#### 未正确设置`package-directory`
+
+cucumber-expressions包：release包实际对应于repo的子目录python，但由于元数据未标注这一点，导致对齐错误。
+dagster-pandas包：release包十几对英语对应repo的子目录python_modules/libraries/dagster-pandas，但元数据未标注这一点。dagster-webserver包同理。
+daytona-api-client包：实际对应repo的子目录api-client-python，元数据未标注。daytona-api-client-async包同理。
+
+#### 错误地设置了`package-directory`
+
+crowdstrike-falconpy包：release包实际对应于整个repo`https://github.com/CrowdStrike/falconpy`，但由于元数据错误地标注release包仅对应整个repo的一个目录，导致路径的对齐错误。
+
+#### 因目录组织重构引发的半不良报告
+
+一些repo的目录组织在实际release的组织中发生了重构。尽管仍有包括`README.md`、`pyproject.toml`、`docs\*`等部分可供进行校验的目录重合工件，但是多数工件的所属目录在repo打包为release时进行了迁移。如`databricks-labs-blueprint`中大量repo中的`src`目录下的文件在分发时被迁移至主目录下，导致生成的报告半不良。
+
 ## gvca与代码差异分析及代码扫描工具的联合应用
 
 ## Threats to Validity

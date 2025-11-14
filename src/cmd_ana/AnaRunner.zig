@@ -116,7 +116,7 @@ pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) 
             .report_output = if (args.report_output) |report_output| .{
                 .manual = try allocator.dupeZ(u8, report_output),
             } else .none,
-            .package_directory = if (args.package_directory) |package_directory| try allocator.dupeZ(u8, package_directory) else null,
+            .package_directory = if (args.package_directory) |package_directory| try normalizePackageDirectory(allocator, package_directory) else null,
             .point_lookup_cache_mb = args.point_lookup_cache_mb,
             .n_jobs = n_jobs,
         },
@@ -133,4 +133,35 @@ pub fn deinit(self: *AnaRunner, allocator: std.mem.Allocator) void {
     }
     if (self.package_directory) |package_directory| allocator.free(package_directory);
     self.* = undefined;
+}
+
+pub fn normalizePackageDirectory(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !?[:0]u8 {
+    if (input.len == 0) return null;
+
+    // 绝对路径不允许
+    if (input[0] == '/') {
+        std.log.err("Option `package-directory` should be a relative path.\n", .{});
+        return error.CliArgInvalidInput;
+    }
+
+    var builder: std.ArrayList(u8) = .empty;
+    errdefer builder.deinit(allocator);
+    var it = std.mem.splitScalar(u8, input, '/');
+    try builder.appendSlice(allocator, blk: {
+        const first = it.first();
+        std.debug.assert(first.len > 0);
+        break :blk first;
+    });
+    while (it.next()) |seg| {
+        if (seg.len == 0) {
+            // 这是 "//" 产生的空 segment → 忽略
+            continue;
+        }
+        try builder.append(allocator, '/');
+        try builder.appendSlice(allocator, seg);
+    }
+    return try builder.toOwnedSliceSentinel(allocator, 0);
 }

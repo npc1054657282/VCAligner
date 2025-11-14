@@ -379,12 +379,12 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 // 相当于`std.mem.startswith`，但是排除了完全相等的情况
                 if (path_from_repo.len > package_directory.len and std.mem.eql(u8, path_from_repo[0..package_directory.len], package_directory)) {
                     const remainder = path_from_repo[package_directory.len..];
-                    if (remainder[0] == '/') break :path_from_release remainder[1..] else break :path_from_release remainder;
-                } else {
-                    // XXX: 目前的实现，path设定为package_directory下的相对目录，因此如果不在package_directory下，就保持path为unparsed状态。
-                    lctx.commit_collection = .path_not_in_package_directory;
-                    return;
+                    if (remainder[0] == '/') break :path_from_release remainder[1..];
+                    // 要求remainder为'/'开头。否则视为非此目录下的文件。（`package_directory`本身已经归一化，末尾不会有'/'）
                 }
+                // XXX: 目前的实现，path设定为package_directory下的相对目录，因此如果不在package_directory下，就保持path为unparsed状态。
+                lctx.commit_collection = .path_not_in_package_directory;
+                return;
             } else break :path_from_release path_from_repo;
         };
         var builder: std.ArrayList(u8) = .empty;
