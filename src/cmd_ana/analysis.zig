@@ -324,6 +324,14 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                             try stringifier.endArray();
                             break :included_in_candidates_idx;
                         }
+                        // 补充：对于匹配的文件，确认它是否是空文件。对于结果有效性的分析有一定帮助。
+                        switch (agenda.is_empty) {
+                            .empty => {
+                                try stringifier.objectField("is_empty");
+                                try stringifier.write(true);
+                            },
+                            else => {},
+                        }
                         try stringifier.endObject();
                     },
                     else => {},
@@ -408,12 +416,21 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 std.log.err("{s}", .{@errorName(err)});
                 gvca.crash_dump.dumpAndCrash(@src());
             };
-            if (maybe_blob_hash) |blob_hash| {
-                break :blk blob_hash;
+            switch (maybe_blob_hash) {
+                .file_empty => {
+                    lctx.is_empty = .empty;
+                    break :blk empty_git_blob_sha1_hash;
+                },
+                .file_not_empty => |blob_hash| {
+                    lctx.is_empty = .not_empty;
+                    break :blk blob_hash;
+                },
+                // 如果不存在，直接结束。
+                .file_not_found => {
+                    lctx.commit_collection = .path_not_find_in_release;
+                    return;
+                },
             }
-            // 如果不存在，直接结束。
-            lctx.commit_collection = .path_not_find_in_release;
-            return;
         },
     };
     // 基于`path_blob_key`查询`path_blob_seq`
@@ -475,7 +492,11 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
 }
 
 // 模拟计算git的Sha1 blob hash。
-fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid {
+fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !union(enum) {
+    file_not_empty: c.git_oid,
+    file_empty: void,
+    file_not_found: void,
+} {
     const file_or_sym_link: union(enum) {
         file: std.fs.File,
         sym_link: void,
@@ -503,7 +524,7 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid
                             // 此外，windows系统下对于一些linux文件无法访问，例如`con`、`nul`。
                             // 这些文件在调试模式会直接导致unreachable，而在release模式导致Unexpected。在此放弃访问作为workaround。
                             // XXX: 考虑事先对文件名进行一次过滤，对于其中出现非法字符的文件事先滤掉，保证debug模式不会崩溃。
-                            error.FileNotFound, error.IsDir, error.Unexpected => return null,
+                            error.FileNotFound, error.IsDir, error.Unexpected => return .file_not_found,
                             else => return err,
                         }
                     },
@@ -525,14 +546,14 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid
                 // 而`fstatat`跨平台性能更好。
                 const stat = std.posix.fstatatZ(std.fs.cwd().fd, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
                     switch (err) {
-                        error.FileNotFound => return null,
+                        error.FileNotFound => return .file_not_found,
                         else => return err,
                     }
                 };
                 break :blk switch (stat.mode & std.posix.S.IFMT) {
                     // 目录。存在一种情况：曾经仓库里存在这个文件路径，但现在不存在了，且这个路径变成了一个目录。
                     // 因此对于文件路径实际是目录的情况，当做与`FileNotFound`同等处理即可。
-                    std.posix.S.IFDIR => return null,
+                    std.posix.S.IFDIR => return .file_not_found,
                     // 符号链接
                     std.posix.S.IFLNK => .sym_link,
                     // 普通文件
@@ -560,6 +581,7 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid
         },
         .file => |file| {
             const file_size = try file.getEndPos();
+            if (file_size == 0) return .file_empty;
             const prefix = try std.fmt.allocPrint(allocator, "blob {}\x00", .{file_size});
             defer allocator.free(prefix);
             hasher.update(prefix);
@@ -570,7 +592,16 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !?c.git_oid
             }
         },
     }
-    return .{ .id = hasher.finalResult() };
+    return .{ .file_not_empty = .{ .id = hasher.finalResult() } };
+}
+
+// 空文件的git blob sha1哈希总是一个确定值。
+const empty_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 } };
+
+test empty_git_blob_sha1_hash {
+    var hasher: std.crypto.hash.Sha1 = .init(.{});
+    hasher.update("blob 0\x00");
+    try std.testing.expectEqual(empty_git_blob_sha1_hash.id, hasher.finalResult());
 }
 
 // 第一步：读取pr2pi列族和pi2p列族，获得一个path和pi的有序列表。

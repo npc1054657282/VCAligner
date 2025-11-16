@@ -40,6 +40,8 @@ candidate_parser: struct {
             path_blob_not_match: void,
             parsed: gvca.commit_range.CommitCollection,
         } = .unparsed,
+        // 标注此文件是否是空文件。它对于结果分析而言有帮助。
+        is_empty: union(enum) { unparsed: void, empty: void, not_empty: void } = .unparsed,
         affect_candidates_idx: std.ArrayList(usize) = .empty, // 如果这个agenda让一个candidate在取交集时缩小了，就说这个agenda影响了这个candidate。此处的usize指candidates中的index
         included_in_candidates_idx: std.ArrayList(usize) = .empty, // 一个agenda只要和candidate取交集不为空，就说这个agenda被这个cadidate包含。此处的usize指candidates中的index
     }, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
