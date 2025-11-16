@@ -390,19 +390,52 @@ flowchart TD
 
 不良报告，包括没有解析得到任何commit结果的报告，系release包几乎没有与repo的同路径文件所致。以及解析所得的候选集中，commit最低的候选集依然包含过量commit，系release包仅有LICENSE等极少数文件在repo中存在同路径文件所致。
 
-#### 未正确设置`package-directory`
+判定不良报告的依据：1.未得到commit候选集的报告。2.得到的commit候选集中，commit数量最低依然超过阈值或commit总量比例，此时检查匹配文件：若匹配文件中，不存在文件内容非空的源代码文件（案例中为.py），则认为是一个不良报告。
 
-cucumber-expressions包：release包实际对应于repo的子目录python，但由于元数据未标注这一点，导致对齐错误。
-dagster-pandas包：release包十几对英语对应repo的子目录python_modules/libraries/dagster-pandas，但元数据未标注这一点。dagster-webserver包同理。
-daytona-api-client包：实际对应repo的子目录api-client-python，元数据未标注。daytona-api-client-async包同理。
+经过手工分析，不良报告的出现系以下原因所致：
 
-#### 错误地设置了`package-directory`
+#### 未设置`package-directory`
 
-crowdstrike-falconpy包：release包实际对应于整个repo`https://github.com/CrowdStrike/falconpy`，但由于元数据错误地标注release包仅对应整个repo的一个目录，导致路径的对齐错误。
+`cucumber-expressions`包、`delta-sharing`、`dify-plugin`、`fastdiff`、`gherkin-official`、`graphframes`包：release包实际对应于repo的子目录`python`，但由于元数据未标注这一点，导致对齐错误。
+`dagster-pandas`包：release包实际对应repo的子目录`python_modules/libraries/dagster-pandas`，但元数据未标注这一点。`dagster-webserver`包同理。
+`daytona-api-client`包：实际对应repo的子目录`api-client-python`，元数据未标注。`daytona-api-client-async`包同理。
+`dbt-core`包：实际对应于子目录`core`，元数据未标注。
+`django-stubs-ext`包：实际对应于子目录`ext`，元数据未标注。
+`emmet-core`包：实际对应于子目录`emmet-core`。
+`firecrawl`和`firecrawl-py`包：实际对应于子目录`apps/python-sdk`。
+`fluent-runtime`包实际对应于子目录`fluent.runtime`。`fluent-syntax`实际对应于子目录`fluent.syntax`。
+`gcloud-aio-auth`包实际对应于子目录`auth`。`gcloud-aio-bigquery`实际对应于子目录`bigquery`。`gcloud-aio-datastore`实际对应于子目录`datastore`。`gcloud-aio-pubsub`实际对应于子目录`pubsub`。`gcloud-aio-storage`实际对应于子目录`storage`。`gcloud-aio-taskqueue`实际对应于子目录`taskqueue`。
+`genai-prices`包实际对应repo子目录`packages/python`。
+`gradio-clienht`包实际对应repo子目录`client/python`。
+`great-expectations-experimental`包实际对应子目录`contrib/experimental`。
+`hdijupyterutils`包实际对应repo`jupyter-incubator/sparkmagic`的子目录`hdijupyterutils`，元数据未标注。
+`imgtool`包实际对应于repo`mcu-tools/mcuboot`的子目录`scripts`，元数据未标注。
+`jsii`包实际对应于repo`aws/jsii`的子目录`packages/@jsii/python-runtime/`，元数据未标注。
 
-#### 因目录组织重构引发的半不良报告
+#### 设置了错误的`package-directory`
 
-一些repo的目录组织在实际release的组织中发生了重构。尽管仍有包括`README.md`、`pyproject.toml`、`docs\*`等部分可供进行校验的目录重合工件，但是多数工件的所属目录在repo打包为release时进行了迁移。如`databricks-labs-blueprint`中大量repo中的`src`目录下的文件在分发时被迁移至主目录下，导致生成的报告半不良。
+`crowdstrike-falconpy`包：release包实际对应于整个repo`https://github.com/CrowdStrike/falconpy`，但由于元数据错误地标注release包仅对应整个repo的一个目录，导致路径的对齐错误。
+`dbt-athena-community`包：release包实际对应子目录`dbt-athena-community`，元数据错误地标注子目录为`dbt-athena`导致无法匹配。
+
+#### 因目录组织重构引发的不良或半不良报告
+
+一些repo的目录组织在实际release的组织中发生了重构。尽管仍有包括`README.md`、`pyproject.toml`、`docs\*`等部分可供进行校验的目录重合工件，但是多数工件的所属目录在repo打包为release时进行了迁移。
+如`databricks-labs-blueprint`中大量repo中的`src`目录下的文件在分发时被迁移至主目录下，导致生成的报告半不良。
+`google-re2`进行了大量复杂的目录组织重构。
+`interpret-core`包实际对应`interpretml/interpret`仓库的`python`子目录，同时，分发包的`interpret/root`目录又实际映射原始仓库的根目录。
+
+#### CRLF问题
+
+`debugpy`、`diff-parser`、`django-json-widget`、`docx2pdf`、`easygui`、`editables`、`filigran-sseclient`、`flask-oauthlib`、`formic2`、`gitdb2`、`gputil`、`graphemeu`、`graphviz`、`imap-tools`、`interegular`、`jschema-to-python`、`json-logging`、`json-formatter`、`jsons`的release包的绝大多数文件以CRLF结尾，而repo的所有文件以LF结尾，导致无法匹配。
+
+在不良报告中，有较多路径存在但无法匹配的幽灵文件，尤其是包含源代码文件（实验中假定以.py为结尾），则推测为CRLF问题。
+
+#### 原始仓库与打包版本差距过大
+
+`disposable-email-domains`不仅release包的目录结构有大量重构，甚至连`READEME.md`和`LICENSE.txt`都不同。
+`dspy-ai`这一release包几乎是空包，仅用于导入依赖`dspy`而没有任何源码。
+`ecos`的release包目录组织重构过大，与repo的目录结构几无重合。
+`gcloud-rest-*`系列包本质是`gcloud-aio-*`系列包的别名，因此是`gcloud-aio-*`系列包的别名目录重构。
 
 ## gvca与代码差异分析及代码扫描工具的联合应用
 

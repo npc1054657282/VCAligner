@@ -163,10 +163,10 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                                     .parsed => |reviw_commit_collection| {
                                         fallthrough: switch (try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view())) {
                                             .restricted => {
-                                                try agenda.affect_candidates_idx.append(allocator, new_candidate_index);
+                                                try review_agenda.affect_candidates_idx.append(allocator, new_candidate_index);
                                                 continue :fallthrough .unchanged;
                                             },
-                                            .unchanged => try agenda.included_in_candidates_idx.append(allocator, new_candidate_index),
+                                            .unchanged => try review_agenda.included_in_candidates_idx.append(allocator, new_candidate_index),
                                             .empty => {},
                                         }
                                     },
