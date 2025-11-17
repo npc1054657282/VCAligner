@@ -2,8 +2,8 @@ const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
 const gvca = @import("gvca");
 const PathSeq = gvca.rocksdb_custom.PathSeq;
-const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
-const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
+const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
+const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
 const CommitSeq = gvca.rocksdb_custom.CommitSeq;
 const Key = gvca.rocksdb_custom.Key;
 const c = gvca.c_helper.c;
@@ -94,7 +94,7 @@ pub fn task(ctx: *PrepRunner) void {
         // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
         // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
         // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathBlobSeq)));
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(BlobPathSeq)));
         // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
@@ -113,9 +113,9 @@ pub fn task(ctx: *PrepRunner) void {
     };
     defer c.rocksdb_close(db);
 
-    // 默认列族：键是path_blob_index-commit_index的二元组，值为空。
-    const cf_pbi_ci = c.rocksdb_get_default_column_family_handle(db).?;
-    defer c.rocksdb_column_family_handle_destroy(cf_pbi_ci);
+    // 默认列族：键是blob_path_index-commit_index的二元组，值为空。
+    const cf_bpi_ci = c.rocksdb_get_default_column_family_handle(db).?;
+    defer c.rocksdb_column_family_handle_destroy(cf_bpi_ci);
 
     const woptions = blk: {
         const woptions = c.rocksdb_writeoptions_create();
@@ -154,31 +154,31 @@ pub fn task(ctx: *PrepRunner) void {
                 };
                 path_get_or_put_result.value_ptr.* = .{
                     .index = .fromNative(@intCast(path_get_or_put_result.index)),
-                    .blob_cnt = 0, // 接下来很快会因为`path_blob_registry不命中而增加至1。
+                    .blob_cnt = 0, // 接下来很快会因为`blob_path_registry不命中而增加至1。
                 };
             }
-            const path_blob_key: PathBlobKey = .{
-                .path_seq = path_get_or_put_result.value_ptr.index,
+            const blob_path_key: BlobPathKey = .{
                 .blob_hash = parsed_unit.blob_hash,
+                .path_seq = path_get_or_put_result.value_ptr.index,
             };
-            const path_blob_get_or_put_result = ctx.writer.path_blob_registry.map.getOrPut(ctx.writer.path_blob_registry.arena.allocator(), path_blob_key) catch |err| {
+            const blob_path_get_or_put_result = ctx.writer.blob_path_registry.map.getOrPut(ctx.writer.blob_path_registry.arena.allocator(), blob_path_key) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
                 gvca.crash_dump.dumpAndCrash(@src());
             };
-            if (!path_blob_get_or_put_result.found_existing) {
+            if (!blob_path_get_or_put_result.found_existing) {
                 // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
-                path_blob_get_or_put_result.value_ptr.* = .fromNative(ctx.writer.path_blob_registry.map.count() - 1);
+                blob_path_get_or_put_result.value_ptr.* = .fromNative(ctx.writer.blob_path_registry.map.count() - 1);
                 // 如果这是一个新的path-blob组合，path的blob_cnt立即加1。
                 path_get_or_put_result.value_ptr.blob_cnt += 1;
             }
             keys_buf[i] = .{
-                .path_blob_seq = path_blob_get_or_put_result.value_ptr.*,
+                .blob_path_seq = blob_path_get_or_put_result.value_ptr.*,
                 .commit_seq = parsed.commit_seq,
             };
             c.rocksdb_writebatch_put_cf(
                 wb,
-                cf_pbi_ci,
+                cf_bpi_ci,
                 @ptrCast(&keys_buf[i]),
                 @sizeOf(Key),
                 null,
@@ -299,31 +299,31 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_writebatch_clear(wb);
         break :write_pi2p;
     }
-    // 键 path_index-blob - 值 path_blob_index 列族
-    const cf_pi_b_pbi = blk: {
-        const cf_pi_b_pbi = c.rocksdb_create_column_family(db, cf_options, "pib2pbi", @ptrCast(&err_cstr));
+    // 键 path_index-blob - 值 blob_path_index 列族
+    const cf_b_pi_bpi = blk: {
+        const cf_b_pi_bpi = c.rocksdb_create_column_family(db, cf_options, "b_pi2bpi", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
-            std.log.err("rocksdb create column family 'pib2pbi' failed! {s}\n", .{std.mem.span(ecstr)});
+            std.log.err("rocksdb create column family 'b_pi2bpi' failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash(@src());
         }
-        break :blk cf_pi_b_pbi.?;
+        break :blk cf_b_pi_bpi.?;
     };
-    defer c.rocksdb_column_family_handle_destroy(cf_pi_b_pbi);
-    write_pib2pbi: {
-        var iter = ctx.writer.path_blob_registry.map.iterator();
+    defer c.rocksdb_column_family_handle_destroy(cf_b_pi_bpi);
+    write_b_pi2bpi: {
+        var iter = ctx.writer.blob_path_registry.map.iterator();
         while (iter.next()) |entry| {
             c.rocksdb_writebatch_put_cf(
                 wb,
-                cf_pi_b_pbi,
+                cf_b_pi_bpi,
                 @ptrCast(entry.key_ptr),
-                @sizeOf(PathBlobKey),
+                @sizeOf(BlobPathKey),
                 @ptrCast(entry.value_ptr),
-                @sizeOf(PathBlobSeq),
+                @sizeOf(BlobPathSeq),
             );
             if (c.rocksdb_writebatch_count(wb) > write_batch_threshold) {
                 c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
                 if (err_cstr) |ecstr| {
-                    std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
+                    std.log.err("rocksdb write b_pi2bpi failed! {s}\n", .{std.mem.span(ecstr)});
                     gvca.crash_dump.dumpAndCrash(@src());
                 }
                 c.rocksdb_writebatch_clear(wb);
@@ -331,11 +331,11 @@ pub fn task(ctx: *PrepRunner) void {
         }
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
-            std.log.err("rocksdb write pib2pbi failed! {s}\n", .{std.mem.span(ecstr)});
+            std.log.err("rocksdb write b_pi2bpi failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
-        break :write_pib2pbi;
+        break :write_b_pi2bpi;
     }
 
     // 后处理：修改配置不再启用 prepare for bulk load
@@ -345,7 +345,7 @@ pub fn task(ctx: *PrepRunner) void {
     c.rocksdb_flushoptions_set_wait(foptions, 1);
     flush_all: {
         var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
-            cf_pbi_ci,
+            cf_bpi_ci,
             cf_pi_p,
             cf_ci_c,
         };

@@ -18,9 +18,9 @@ package_directory: ?[:0]u8, // 一些场景下，包对应的是repo的一个子
 point_lookup_cache_mb: u64,
 n_jobs: usize,
 db: *c.struct_rocksdb_t = undefined,
-cf_pbi_ci: *c.rocksdb_column_family_handle_t = undefined,
+cf_bpi_ci: *c.rocksdb_column_family_handle_t = undefined,
 cf_pi_p: *c.rocksdb_column_family_handle_t = undefined,
-cf_pi_b_pbi: *c.rocksdb_column_family_handle_t = undefined,
+cf_b_pi_bpi: *c.rocksdb_column_family_handle_t = undefined,
 candidate_parser: struct {
     agenda_parsers: std.ArrayListAligned(struct {
         pi: PathSeq, // 输入。
@@ -28,7 +28,7 @@ candidate_parser: struct {
         // 虽然这个思路看起来很健全，但其实有隐患：path和commit_collection其实是分步骤解析的，而`unparsed`是`undefined`的安全版，以防止错误退出时没能正确析构。
         // 因此，各自保存各自的`unparsed`才是真实合理的方案。
         // 在当前实现中，如果`commit_collection`为`unparsed`和`path_not_in_package_directory`，`path`保留为`unparsed`。
-        // 如果`commit_collection`为`path_not_find_in_release`、`path_blob_not_match`和`parsed`，`path`将被解析为package_directory下的相对路径。
+        // 如果`commit_collection`为`path_not_find_in_release`、`blob_path_not_match`和`parsed`，`path`将被解析为package_directory下的相对路径。
         path: union(enum) {
             unparsed: void,
             parsed: [:0]u8,
@@ -37,7 +37,7 @@ candidate_parser: struct {
             unparsed: void,
             path_not_in_package_directory: void,
             path_not_find_in_release: void,
-            path_blob_not_match: void,
+            blob_path_not_match: void,
             parsed: gvca.commit_range.CommitCollection,
         } = .unparsed,
         // 标注此文件是否是空文件。它对于结果分析而言有帮助。
@@ -50,7 +50,7 @@ candidate_parser: struct {
         parsed: std.ArrayList(c.git_oid) = .empty,
         created_by_agenda_idx: usize, // 记录创建这个候选者的agenda，usize是agenda_parsers中的index
     }),
-    once_get_roptions: *c.struct_rocksdb_readoptions_t, // 用于pi2p、pib2pbi的读取
+    once_get_roptions: *c.struct_rocksdb_readoptions_t, // 用于pi2p、b_pi2bpi的读取
     prefix_scan_roptions: *c.struct_rocksdb_readoptions_t, // 用于default的读取
     pub fn init() @This() {
         return .{
@@ -79,7 +79,7 @@ candidate_parser: struct {
             }
             switch (item.commit_collection) {
                 .parsed => |parsed| parsed.deinit(allocator),
-                .unparsed, .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
+                .unparsed, .path_not_find_in_release, .blob_path_not_match, .path_not_in_package_directory => {},
             }
             item.affect_candidates_idx.deinit(allocator);
             item.included_in_candidates_idx.deinit(allocator);

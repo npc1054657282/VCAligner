@@ -22,14 +22,14 @@ pub const CommitSeq = Seq(CommitSeqNative, .big);
 // 但实际上pathSeq只需要`u32`足矣。
 pub const PathSeqNative = u32;
 pub const PathSeq = Seq(PathSeqNative, .big);
-pub const PathBlobKey = extern struct {
-    path_seq: PathSeq align(1),
+pub const BlobPathKey = extern struct {
     blob_hash: c.git_oid align(1),
+    path_seq: PathSeq align(1),
 };
-pub const PathBlobSeqNative = u32;
-pub const PathBlobSeq = Seq(PathBlobSeqNative, .big);
+pub const BlobPathSeqNative = u32;
+pub const BlobPathSeq = Seq(BlobPathSeqNative, .big);
 pub const Key = extern struct {
-    path_blob_seq: PathBlobSeq align(1),
+    blob_path_seq: BlobPathSeq align(1),
     commit_seq: CommitSeq align(1),
 };
 // 一个范围。高位是范围起始值。低位是范围结束值。

@@ -4,7 +4,7 @@ const diag = gvca.diag;
 const PrepRunner = @import("PrepRunner.zig");
 const c = gvca.c_helper.c;
 const PathSeq = gvca.rocksdb_custom.PathSeq;
-const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
+const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
 
 // write线程执行完的后续。
 pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
@@ -33,7 +33,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         // 手动compaction的最大字节数应为极大值。
         c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
         // 下面为默认列族配置
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathBlobSeq)));
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(BlobPathSeq)));
         // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
         // 实际命中率不高，不用特别注意。
@@ -56,11 +56,11 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     };
     defer c.rocksdb_options_destroy(cf_options);
 
-    const db, const cf_pbi_ci, const cf_pi_p, const cf_pi_b_pbi, const cf_ci_c = reopen_db: {
+    const db, const cf_bpi_ci, const cf_pi_p, const cf_b_pi_bpi, const cf_ci_c = reopen_db: {
         const column_family_names = [_][*:0]const u8{
             "default",
             "pi2p",
-            "pib2pbi",
+            "b_pi2bpi",
             "ci2c",
         };
         const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
@@ -87,9 +87,9 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         break :reopen_db .{ new_db.?, column_family_handles[0].?, column_family_handles[1].?, column_family_handles[2].?, column_family_handles[3].? };
     };
     defer {
-        c.rocksdb_column_family_handle_destroy(cf_pbi_ci);
+        c.rocksdb_column_family_handle_destroy(cf_bpi_ci);
         c.rocksdb_column_family_handle_destroy(cf_pi_p);
-        c.rocksdb_column_family_handle_destroy(cf_pi_b_pbi);
+        c.rocksdb_column_family_handle_destroy(cf_b_pi_bpi);
         c.rocksdb_column_family_handle_destroy(cf_ci_c);
         c.rocksdb_close(db);
     }

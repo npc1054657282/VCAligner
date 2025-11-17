@@ -5,8 +5,8 @@ const AnaRunner = @import("AnaRunner.zig");
 const diag = gvca.diag;
 const Pool = gvca.Pool;
 const PathSeq = gvca.rocksdb_custom.PathSeq;
-const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
-const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
+const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
+const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
 const CommitSeqNative = gvca.rocksdb_custom.CommitSeqNative;
 const CommitSeq = gvca.rocksdb_custom.CommitSeq;
 const Key = gvca.rocksdb_custom.Key;
@@ -19,17 +19,17 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
         const db_options = c.rocksdb_options_create();
         c.rocksdb_options_optimize_for_point_lookup(db_options, ctx.point_lookup_cache_mb);
         // 以下为默认列族设置
-        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(PathBlobSeq)));
+        c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(BlobPathSeq)));
         break :blk db_options.?;
     };
     defer c.rocksdb_options_destroy(db_options);
     const cf_options = c.rocksdb_options_create().?;
     defer c.rocksdb_options_destroy(cf_options);
-    ctx.db, ctx.cf_pbi_ci, ctx.cf_pi_p, ctx.cf_pi_b_pbi, const cf_ci_c, const cf_pr_pi = open_db: {
+    ctx.db, ctx.cf_bpi_ci, ctx.cf_pi_p, ctx.cf_b_pi_bpi, const cf_ci_c, const cf_pr_pi = open_db: {
         const column_family_names = [_][*:0]const u8{
             "default",
             "pi2p",
-            "pib2pbi",
+            "b_pi2bpi",
             "ci2c",
             "pr2pi",
         };
@@ -66,9 +66,9 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
         };
     };
     defer {
-        c.rocksdb_column_family_handle_destroy(ctx.cf_pbi_ci);
+        c.rocksdb_column_family_handle_destroy(ctx.cf_bpi_ci);
         c.rocksdb_column_family_handle_destroy(ctx.cf_pi_p);
-        c.rocksdb_column_family_handle_destroy(ctx.cf_pi_b_pbi);
+        c.rocksdb_column_family_handle_destroy(ctx.cf_b_pi_bpi);
         c.rocksdb_column_family_handle_destroy(cf_ci_c);
         c.rocksdb_column_family_handle_destroy(cf_pr_pi);
         c.rocksdb_close(ctx.db);
@@ -126,7 +126,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     for (ctx.candidate_parser.agenda_parsers.items, 0..) |*agenda, agenda_index| {
         switch (agenda.commit_collection) {
             .unparsed => unreachable,
-            .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
+            .path_not_find_in_release, .blob_path_not_match, .path_not_in_package_directory => {},
             .parsed => |commit_collection| {
                 // 对于agendas，将它与目前已经存在的所有candidate进行运算。
                 var intersection_success: bool = false;
@@ -159,7 +159,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                                 }
                                 switch (review_agenda.commit_collection) {
                                     .unparsed => unreachable,
-                                    .path_not_find_in_release, .path_blob_not_match, .path_not_in_package_directory => {},
+                                    .path_not_find_in_release, .blob_path_not_match, .path_not_in_package_directory => {},
                                     .parsed => |reviw_commit_collection| {
                                         fallthrough: switch (try new_candidate_collection.intersectInPlace(allocator, reviw_commit_collection.view())) {
                                             .restricted => {
@@ -225,7 +225,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     build_repo_paths_map: {
         for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
             switch (agenda.commit_collection) {
-                .parsed, .path_blob_not_match => try repo_paths_map.put(allocator, agenda.path.parsed, {}),
+                .parsed, .blob_path_not_match => try repo_paths_map.put(allocator, agenda.path.parsed, {}),
                 else => {},
             }
         }
@@ -290,7 +290,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
             try stringifier.beginArray();
             for (ctx.candidate_parser.agenda_parsers.items) |*agenda| {
                 switch (agenda.commit_collection) {
-                    .path_blob_not_match => try stringifier.write(agenda.path.parsed),
+                    .blob_path_not_match => try stringifier.write(agenda.path.parsed),
                     else => {},
                 }
             }
@@ -409,8 +409,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         lctx.path = .{ .parsed = path };
     }
     // 检查文件存在性。若存在，计算其hash。
-    const path_blob_key: PathBlobKey = .{
-        .path_seq = lctx.pi,
+    const blob_path_key: BlobPathKey = .{
         .blob_hash = blk: {
             const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path_from_cwd) catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
@@ -432,16 +431,17 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 },
             }
         },
+        .path_seq = lctx.pi,
     };
-    // 基于`path_blob_key`查询`path_blob_seq`
-    const path_blob_seq: PathBlobSeq = blk: {
+    // 基于`blob_path_key`查询`blob_path_seq`
+    const blob_path_seq: BlobPathSeq = blk: {
         var vallen: usize = undefined;
-        const path_blob_seq_ptr = c.rocksdb_get_cf(
+        const blob_path_seq_ptr = c.rocksdb_get_cf(
             gctx.db,
             gctx.candidate_parser.once_get_roptions,
-            gctx.cf_pi_b_pbi,
-            @ptrCast(&path_blob_key),
-            @sizeOf(PathBlobKey),
+            gctx.cf_b_pi_bpi,
+            @ptrCast(&blob_path_key),
+            @sizeOf(BlobPathKey),
             &vallen,
             @ptrCast(&err_cstr),
         );
@@ -449,39 +449,38 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             std.log.err("rocksdb path blob seq get failed! {s}", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash(@src());
         }
-        if (path_blob_seq_ptr == null) {
+        if (blob_path_seq_ptr == null) {
             // 对应的blob不存在，直接结束。
-            lctx.commit_collection = .path_blob_not_match;
+            lctx.commit_collection = .blob_path_not_match;
             return;
         }
-        defer c.rocksdb_free(path_blob_seq_ptr);
-        break :blk std.mem.bytesToValue(PathBlobSeq, path_blob_seq_ptr);
+        defer c.rocksdb_free(blob_path_seq_ptr);
+        break :blk std.mem.bytesToValue(BlobPathSeq, blob_path_seq_ptr);
     };
-    // 将`path_blob_seq`作为前缀查找所有commit。
+    // 将`blob_path_seq`作为前缀查找所有commit。
     lctx.commit_collection = commit_collection: {
         var builder: gvca.commit_range.CommitCollection.Builder = .init;
-        const pbici_iter = c.rocksdb_create_iterator_cf(gctx.db, gctx.candidate_parser.prefix_scan_roptions, gctx.cf_pbi_ci).?;
-        defer c.rocksdb_iter_destroy(pbici_iter);
-        c.rocksdb_iter_seek(pbici_iter, @ptrCast(&path_blob_seq), @sizeOf(PathBlobSeq));
-        while (c.rocksdb_iter_valid(pbici_iter) != 0) {
-            defer c.rocksdb_iter_next(pbici_iter);
+        const bpici_iter = c.rocksdb_create_iterator_cf(gctx.db, gctx.candidate_parser.prefix_scan_roptions, gctx.cf_bpi_ci).?;
+        defer c.rocksdb_iter_destroy(bpici_iter);
+        c.rocksdb_iter_seek(bpici_iter, @ptrCast(&blob_path_seq), @sizeOf(BlobPathSeq));
+        while (c.rocksdb_iter_valid(bpici_iter) != 0) {
+            defer c.rocksdb_iter_next(bpici_iter);
             const ci_native: CommitSeqNative = blk: {
                 var klen: usize = undefined;
-                const key_ptr = c.rocksdb_iter_key(pbici_iter, &klen);
+                const key_ptr = c.rocksdb_iter_key(bpici_iter, &klen);
                 const ci: CommitSeq = std.mem.bytesAsValue(Key, key_ptr[0..klen]).commit_seq;
                 break :blk ci.toNative();
             };
-            // std.log.debug("find file {s} blob {x} commitseq {d}", .{ path, path_blob_key.blob_hash.id, ci_native });
             builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch gvca.crash_dump.dumpAndCrash(@src());
         }
         // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
         break :commit_collection .{ .parsed = builder.toOwnedCommitRanges(ts_allocator) catch |err| {
             switch (err) {
                 error.EmptyCommitRanges => {
-                    std.log.err("Cannot find any commit with path '{s}' blob {x} pathblobseq {d}", .{
+                    std.log.err("Cannot find any commit with path '{s}' blob {x} blobpathseq {d}", .{
                         path,
-                        path_blob_key.blob_hash.id,
-                        path_blob_seq.toNative(),
+                        blob_path_key.blob_hash.id,
+                        blob_path_seq.toNative(),
                     });
                 },
                 else => {},
@@ -608,7 +607,7 @@ test empty_git_blob_sha1_hash {
 // 第二步：遍历该列表，下发子任务：
 // 二·一找release_path中是否存在对应路径。
 // 二·二：找到对应路径的文件，若存在，将release_path下的对应文件进行hash。
-// 二·三，根据hash结果，通过pib2pbi寻找是否存在对应的blob id。
+// 二·三，根据hash结果，通过b_pi2bpi寻找是否存在对应的blob id。
 // 二·四：读取default，根据path-blob对前缀匹配，获得所有键，归并为一个commit id range 列表。
 // 第三步：所有子任务执行完成以后，我们得到的是一个commit id range列表的[序列]。现在我们再设置一类commit id range列表的output[集合]。
 // 遍历[序列]，不断将序列的当前commit id range列表与[集合]里的所有commit id range列表取交集。交集为空认为失败。

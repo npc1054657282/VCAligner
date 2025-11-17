@@ -70,7 +70,7 @@ Shobe等人[On mapping releases to commits in open source systems]在针对Googl
 
 Vu等人[Vu DL, Massacci F, Pashchenko I, Plate H, Sabetta A. LastPyMile: identifying the discrepancy between sources and packages. In: Spinellis D, Gousios G, Chechik M, Penta MD, eds. ESEC/FSE ’21: 29th ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering, Athens, Greece, August 23-28, 2021. ACM; 2021:780-792. doi:10.1145/3468264.3468592]尝试绕过版本对齐，如对源码blob的每行变更构建hash数据库，检查Release包的各文件行是否存在于源码中。然而，Git以文件级blob为单位保存对象，检查行级变更需实时计算tree diff，性能较低（时间复杂度 \( O(n * lines) \)，n 为blob数）。更重要的是，此方案无法检测漏洞重放攻击，历史漏洞的代码行可能存在于源码中，但不应出现在最新包中。
 
-本工作提出了一种高效版本对齐方法，通过预处理构建(p,b)到 commit 集合的逆关系映射和path有序列表，动态筛选Release包的候选commit集合。该方法无需依赖标签，鲁棒处理上述困难场景，通过文件级粒度检测漏洞重放，显著增强供应链完整性。
+本工作提出了一种高效版本对齐方法，通过预处理构建(b,p)到 commit 集合的逆关系映射和path有序列表，动态筛选Release包的候选commit集合。该方法无需依赖标签，鲁棒处理上述困难场景，通过文件级粒度检测漏洞重放，显著增强供应链完整性。
 
 ## Challenge
 
@@ -118,36 +118,36 @@ release版本源码可能存在并非来自其源头commit，而是来自其他c
 - $\mathcal{P}$ 是文件路径集合,
 - $\mathcal{B}$ 是数据块对象集合（代表文件内容）
 
-每个元组 $(c, p, b) \in \mathcal{F}$ 表明提交 $c \in \mathcal{C}$ 包含路径为 $p \in \mathcal{P}$ 的文件，其内容由数据块 $b \in \mathcal{B}$ 表示。该关系捕获了从提交到多个 $(p, b)$ 对的一对多映射，因为单个提交可能通过其关联的树对象引用多个文件。
+每个元组 $(c, p, b) \in \mathcal{F}$ 表明提交 $c \in \mathcal{C}$ 包含路径为 $p \in \mathcal{P}$ 的文件，其内容由数据块 $b \in \mathcal{B}$ 表示。该关系捕获了从提交到多个 $(b, p)$ 对的一对多映射，因为单个提交可能通过其关联的树对象引用多个文件。
 
-对git仓库对象模型的实现，存在一个关键观察：不考虑空目录与submodule时，git仓库的对象组织可以视为commit与(文件名路径-文件blob)的一对多映射的集合 \mathcal{F} 。
+对git仓库对象模型的实现，存在一个关键观察：不考虑空目录与submodule时，git仓库的对象组织可以视为commit与(文件blob-文件路径)的一对多映射的集合 \mathcal{F} 。
 
 ![git提交与文件内容关系](git提交与文件内容关系.png)
 
-注意到，通过重组 $\mathcal{F}$ 可推导出逆关系 $\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}$ 。对于给定的文件路径-内容对 $(p, b)$ ，集合 $\{c \in \mathcal{C} \mid (c, p, b) \in \mathcal{F}\}$ 表示路径为 $p$ 且内容为 $b$ 的文件所涉及的所有提交。这种逆向映射同样是一对多关系，因为单个文件路径-内容对可能出现在文件未更改的多个提交中。
+注意到，通过重组 $\mathcal{F}$ 可推导出逆关系 $\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}$ 。对于给定的文件内容-路径对 $(b, p)$ ，集合 $\{c \in \mathcal{C} \mid (c, p, b) \in \mathcal{F}\}$ 表示路径为 $p$ 且内容为 $b$ 的文件所涉及的所有提交。这种逆向映射同样是一对多关系，因为单个文件路径-内容对可能出现在文件未更改的多个提交中。
 
 ![git文件内容与提交关系](git文件内容与提交关系.png)
 
-在release包中，若排除空目录，可将包建模为一组文件路径-内容对 $\{(p, b) \mid p \in \mathcal{P}, b \in \mathcal{B}\}$ ，这些数据源自特定提交的顶层树对象。
+在release包中，若排除空目录，可将包建模为一组文件内容-路径对 $\{(b, p) \mid p \in \mathcal{P}, b \in \mathcal{B}\}$ ，这些数据源自特定提交的顶层树对象。
 
-通过利用逆向关系 $\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}$ ，其中 $\mathcal{C}$ 代表提交集合，我们可以将每个文件路径-内容对 $(p, b)$ 映射到一组提交 $\{c \in \mathcal{C} \mid (c, p, b) \in \mathcal{F}\}$ ，这些提交中位于路径 $p$ 的文件具有内容 $b$ 。给定一个发布包的 $(p, b)$ 对集合，我们可以迭代地求取每对关联的提交集合的交集，以缩小候选提交的范围。形式上，对于一个发布包 $R = \{(p_1, b_1), (p_2, b_2), \dots, (p_n, b_n)\}$ ，候选提交集合的计算方式为：
-$$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
+通过利用逆向关系 $\mathcal{F}^{-1} \subseteq \mathcal{P} \times \mathcal{B} \times \mathcal{C}$ ，其中 $\mathcal{C}$ 代表提交集合，我们可以将每个文件内容-路径对 $(b, p)$ 映射到一组提交 $\{c \in \mathcal{C} \mid (c, b, p) \in \mathcal{F}\}$ ，这些提交中位于路径 $p$ 的文件具有内容 $b$ 。给定一个发布包的 $(b, p)$ 对集合，我们可以迭代地求取每对关联的提交集合的交集，以缩小候选提交的范围。形式上，对于一个发布包 $R = \{(b_1, p_1), (b_2, p_2), \dots, (b_n, p_n)\}$ ，候选提交集合的计算方式为：
+$$C_R = \bigcap_{(b_i, p_i) \in R} \mathcal{F}^{-1}(b_i, p_i).$$
 
 为实现所提出的模型，gvca的实现将包含两个step。Step 1：预处理——建立git仓库逆向关系数据库。Step 2：动态commit筛选——迭代优化给定release包的候选commit集。
 
 ### 预处理
 
-为了实现高效查询反向关系，gvca使用RocksDB构建了一个k-v数据库。RocksDB是一种针对快速前缀查找优化的高性能存储引擎。该数据库专门用于存储文件路径-内容对 $(p, b)$ 与其关联提交记录之间的映射关系，从而快速识别给定发布包对应的候选提交。
+为了实现高效查询反向关系，gvca使用RocksDB构建了一个k-v数据库。RocksDB是一种针对快速前缀查找优化的高性能存储引擎。该数据库专门用于存储文件路径-内容对 $(b, p)$ 与其关联提交记录之间的映射关系，从而快速识别给定发布包对应的候选提交。
 
 为优化存储效率，重复出现的长字符串与哈希值被替换为紧凑的序列标识符，以降低了数据库内存占用。为此，数据库采用多列族设计，实现不同的逻辑功能：
 
 - commit序列映射：存储从commit序列号（编码为紧凑的顺序ID）到对应commit hash的映射关系，减少重复出现的commit hash开销。
 - path序列映射：存储从path序列号（编码为紧凑的顺序ID）到完整的文件路径字符串，减少重复出现的长路径开销。
-- path-blob序列映射：为路径-内容对 $(p, b)$ 分配序列号，并将其与对应的路径序列号和blob hash关联，减少其重复出现开销。
+- blob-path序列映射：为路径-内容对 $(b, p)$ 分配序列号，并将其与对应的路径序列号和blob hash关联，减少其重复出现开销。
 - path排名：基于文件路径在git仓库历史中关联的blob版本的数量记录路径的排名，可用于在分析过程中优先处理频繁修改的路径。
-- 逆向关系索引：核心列族。实现为仅含键的空值列，每个键为复合结构，编码了路径-内容对序列号及commit序列号，表示一个元组 $(p, b, c) \in \mathcal{F}^{-1}$ 。通过将所有信息存储于键中并利用RocksDB的prefix extractor优化前缀搜索能力，该设计能快速检索给定 $(p, b)$ 对的所有提交 $\{c \in \mathcal{C} \mid (c, p, b) \in \mathcal{F}\}$ ，同时保持极低的存储和查询开销。
+- 逆向关系索引：核心列族。实现为仅含键的空值列，每个键为复合结构，编码了路径-内容对序列号及commit序列号，表示一个元组 $(b, p, c) \in \mathcal{F}^{-1}$ 。通过将所有信息存储于键中并利用RocksDB的prefix extractor优化前缀搜索能力，该设计能快速检索给定 $(b, p)$ 对的所有提交 $\{c \in \mathcal{C} \mid (c, p, b) \in \mathcal{F}\}$ ，同时保持极低的存储和查询开销。
 
-预处理step通过遍历git仓库中所有commit，递归解析tree对象的方式提取文件路径-内容关联关系。为加速此过程，commit对象采用并行解析方式，充分利用多核架构高效处理大规模代码库。提取的元组 $(c, p, b) \in \mathcal{F}$ 随后会被转换为反向关系索引中的键值条目 $(p, b, c)$ 。
+预处理step通过遍历git仓库中所有commit，递归解析tree对象的方式提取文件路径-内容关联关系。为加速此过程，commit对象采用并行解析方式，充分利用多核架构高效处理大规模代码库。提取的元组 $(c, p, b) \in \mathcal{F}$ 随后会被转换为反向关系索引中的键值条目 $(b, p, c)$ 。
 
 为进一步优化写入性能，逆向关系数据库填充过程分为两个阶段：无compaction快速写入阶段和一次性延迟compaction阶段。如此确保初始填充阶段的高写入吞吐量，减小写放大。
 
@@ -161,12 +161,12 @@ $$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
 | 2 | new.txt |
 | 3 | bak/test.txt |
 
-| Path Blob ID | Path ID | Blob |
+| Blob | Path ID | Blob Path ID |
 |-------|-------|-------|
-| 1 | 1 | 83baae |
-| 2 | 1 | 1f7a7a |
-| 3 | 2 | fa49b0 |
-| 4 | 3 | 83baae |
+| 1f7a7a | 1 | 2 |
+| 83baae | 1 | 1 |
+| 83baae | 3 | 4 |
+| fa49b0 | 2 | 3 |
 
 | Commit ID | Commit |
 |-------|-------|
@@ -174,7 +174,7 @@ $$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
 | 2 | cac0ca |
 | 3 | 1a410e |
 
-| Path Blob ID | Commit ID |
+| Blob Path ID | Commit ID |
 |-------|-------|
 | 1 | 1 |
 | 2 | 2 |
@@ -204,9 +204,9 @@ $$C_R = \bigcap_{(p_i, b_i) \in R} \mathcal{F}^{-1}(p_i, b_i).$$
 \EndFor
 \State \(\mathcal{F}^{-1} \gets \emptyset\) \Comment{Initialize empty inverse relation}
 \For{each tuple \((c, p, b) \in \mathcal{F}\)} \Comment{Convert to inverse tuples}
-    \State Add tuple \((p, b, c)\) to \(\mathcal{F}^{-1}\)
+    \State Add tuple \((b, p, c)\) to \(\mathcal{F}^{-1}\)
 \EndFor
-\State Group \(\mathcal{F}^{-1}\) by \((p, b)\) to form sets \(\{(p, b, \{c \mid (p, b, c) \in \mathcal{F}^{-1}\})\}\) \Comment{Create grouped index}
+\State Group \(\mathcal{F}^{-1}\) by \((b, p)\) to form sets \(\{(b, p, \{c \mid (b, p, c) \in \mathcal{F}^{-1}\})\}\) \Comment{Create grouped index}
 \State \Return \(\mathcal{F}^{-1}\) \Comment{Output inverse relation index}
 \end{algorithmic}
 \end{algorithm}
@@ -223,8 +223,8 @@ flowchart TD
     AppendF["Add tuple (c, p, b) to 𝓕"]
     InitInverse["Initialize 𝓕⁻¹ ← ∅"]
     LoopTuple{{"For each (c, p, b) ∈ 𝓕"}}
-    AppendInverse["Add tuple (p, b, c) to 𝓕⁻¹"]
-    Group["Group 𝓕⁻¹ by (p, b) → {<br>(p, b, {c | (p, b, c) ∈ 𝓕⁻¹})<br>}"]
+    AppendInverse["Add tuple (b, p, c) to 𝓕⁻¹"]
+    Group["Group 𝓕⁻¹ by (b, p) → {<br>(b, p, {c | (b, p, c) ∈ 𝓕⁻¹})<br>}"]
     Output[\"Return 𝓕⁻¹"\]
     End(["End"])
 
@@ -246,7 +246,7 @@ flowchart TD
 \Ensure Ranked list \(\mathcal{R}\) of paths, sorted by the number of unique blobs in descending order
 \State Initialize an empty mapping \(M: \mathcal{P} \to \mathbb{N}\) \Comment{Map from path to unique blob count}
 \For{each path \(p \in \mathcal{P}\)}
-    \State UniqueBlobs \(\gets {b \mid \exists c: (p, b, c) \in \mathcal{F}^{-1}}\) \Comment{Set of unique blobs for path p}
+    \State UniqueBlobs \(\gets {b \mid \exists c: (b, p, c) \in \mathcal{F}^{-1}}\) \Comment{Set of unique blobs for path p}
     \State \(M(p) \gets |\text{UniqueBlobs}|\) \Comment{Count of unique blobs}
 \EndFor
 \State \(\mathcal{R} \gets \emptyset\) \Comment{Initialize empty list}
@@ -261,7 +261,7 @@ flowchart TD
     Input[/"Input inverse relation <br>𝓕⁻¹ ⊆ 𝓟×𝓑×𝓒"/]
     InitM["Initialize mapping <br>M: 𝓟 → ℕ"]
     LoopP{{"For each path p ∈ 𝓟"}}
-    GetBlobs["UniqueBlobs ← <br>{b | ∃c: (p,b,c) ∈ 𝓕⁻¹}"]
+    GetBlobs["UniqueBlobs ← <br>{b | ∃c: (b,p,c) ∈ 𝓕⁻¹}"]
     StoreCount["M(p) ← |UniqueBlobs|"]
     InitR["Initialize list 𝓡 ← ∅"]
     Sort["Sort paths in 𝓟 by M(p) <br>descending, store in 𝓡"]
@@ -411,6 +411,7 @@ flowchart TD
 `hdijupyterutils`包实际对应repo`jupyter-incubator/sparkmagic`的子目录`hdijupyterutils`，元数据未标注。
 `imgtool`包实际对应于repo`mcu-tools/mcuboot`的子目录`scripts`，元数据未标注。
 `jsii`包实际对应于repo`aws/jsii`的子目录`packages/@jsii/python-runtime/`，元数据未标注。
+`kaleido`包实际对应于repo`plotly/Kaleido`的子目录`src/py`，元数据未标注。
 
 #### 设置了错误的`package-directory`
 
@@ -423,6 +424,7 @@ flowchart TD
 如`databricks-labs-blueprint`中大量repo中的`src`目录下的文件在分发时被迁移至主目录下，导致生成的报告半不良。
 `google-re2`进行了大量复杂的目录组织重构。
 `interpret-core`包实际对应`interpretml/interpret`仓库的`python`子目录，同时，分发包的`interpret/root`目录又实际映射原始仓库的根目录。
+`keras-tuner`包进行了复杂重构，其分发包的`keras_tuner/src`目录映射原始仓库的`keras_tuner`目录。而分发包在此目录之外的其他部分充斥着自动生成文件，部分release文件名可能直接在原始仓库中曾经有同名文件，但这是错误的。
 
 #### CRLF问题
 

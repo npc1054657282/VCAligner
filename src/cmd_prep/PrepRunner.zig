@@ -11,8 +11,8 @@ const MpscChannel = gvca.MpscChannel;
 // const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOperaterState;
 const CommitSeq = gvca.rocksdb_custom.CommitSeq;
 const PathSeq = gvca.rocksdb_custom.PathSeq;
-const PathBlobKey = gvca.rocksdb_custom.PathBlobKey;
-const PathBlobSeq = gvca.rocksdb_custom.PathBlobSeq;
+const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
+const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
 const Key = gvca.rocksdb_custom.Key;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
@@ -111,8 +111,8 @@ writer: struct {
         //因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
         arena: std.heap.ArenaAllocator,
     },
-    path_blob_registry: struct {
-        map: std.AutoHashMapUnmanaged(PathBlobKey, PathBlobSeq) = .empty,
+    blob_path_registry: struct {
+        map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq) = .empty,
         arena: std.heap.ArenaAllocator,
     },
     // merge_operator_state: CommitRangesMergeOperaterState,
