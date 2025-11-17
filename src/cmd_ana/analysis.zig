@@ -25,6 +25,12 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
     defer c.rocksdb_options_destroy(db_options);
     const cf_options = c.rocksdb_options_create().?;
     defer c.rocksdb_options_destroy(cf_options);
+    const cf_b_pi_bpi_options = blk: {
+        const cf_b_pi_bpi_options = c.rocksdb_options_create();
+        c.rocksdb_options_set_prefix_extractor(cf_b_pi_bpi_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
+        break :blk cf_b_pi_bpi_options.?;
+    };
+    defer c.rocksdb_options_destroy(cf_b_pi_bpi_options);
     ctx.db, ctx.cf_bpi_ci, ctx.cf_pi_p, ctx.cf_b_pi_bpi, const cf_ci_c, const cf_pr_pi = open_db: {
         const column_family_names = [_][*:0]const u8{
             "default",
@@ -36,7 +42,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
         const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
             db_options,
             cf_options,
-            cf_options,
+            cf_b_pi_bpi_options,
             cf_options,
             cf_options,
         };

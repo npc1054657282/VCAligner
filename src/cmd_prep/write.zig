@@ -208,7 +208,7 @@ pub fn task(ctx: *PrepRunner) void {
         std.log.debug("Parse end.\n", .{});
     }
 
-    // 为其它列族设置单独的默认配置（它们不需要前缀提取器和merge operator）
+    // 为其它列族设置单独的默认配置(除了cf_b_pi_bpi以外）（它们不需要前缀提取器和merge operator）
     // 尽管可能的写入方式仍然存在一些区别，简单考虑依旧使用相同的配置。
     const cf_options = blk: {
         const cf_options = c.rocksdb_options_create();
@@ -300,8 +300,19 @@ pub fn task(ctx: *PrepRunner) void {
         break :write_pi2p;
     }
     // 键 path_index-blob - 值 blob_path_index 列族
+    // cf_b_pi_bpi需要做一个前缀提取器以加速基于blob快速检索其所有pi。
+    const cf_b_pi_bpi_options = blk: {
+        const cf_b_pi_bpi_options = c.rocksdb_options_create();
+        c.rocksdb_options_prepare_for_bulk_load(cf_b_pi_bpi_options);
+        if (ctx.compression) {
+            c.rocksdb_options_set_compression(cf_b_pi_bpi_options, c.rocksdb_lz4_compression);
+        }
+        c.rocksdb_options_set_prefix_extractor(cf_b_pi_bpi_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
+        break :blk cf_b_pi_bpi_options.?;
+    };
+    defer c.rocksdb_options_destroy(cf_b_pi_bpi_options);
     const cf_b_pi_bpi = blk: {
-        const cf_b_pi_bpi = c.rocksdb_create_column_family(db, cf_options, "b_pi2bpi", @ptrCast(&err_cstr));
+        const cf_b_pi_bpi = c.rocksdb_create_column_family(db, cf_b_pi_bpi_options, "b_pi2bpi", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'b_pi2bpi' failed! {s}\n", .{std.mem.span(ecstr)});
             gvca.crash_dump.dumpAndCrash(@src());

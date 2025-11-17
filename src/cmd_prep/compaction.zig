@@ -46,7 +46,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     };
     defer c.rocksdb_options_destroy(db_options);
 
-    // 其它列族的选项
+    // 非默认列族（除cf_b_pi_bpi外）的选项
     const cf_options = blk: {
         const cf_options = c.rocksdb_options_create();
         if (ctx.compression) {
@@ -55,6 +55,16 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         break :blk cf_options.?;
     };
     defer c.rocksdb_options_destroy(cf_options);
+    // cf_b_pi_bpi的选项
+    const cf_b_pi_bpi_options = blk: {
+        const cf_b_pi_bpi_options = c.rocksdb_options_create();
+        if (ctx.compression) {
+            c.rocksdb_options_set_compression(cf_b_pi_bpi_options, c.rocksdb_lz4_compression);
+        }
+        c.rocksdb_options_set_prefix_extractor(cf_b_pi_bpi_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
+        break :blk cf_b_pi_bpi_options.?;
+    };
+    defer c.rocksdb_options_destroy(cf_b_pi_bpi_options);
 
     const db, const cf_bpi_ci, const cf_pi_p, const cf_b_pi_bpi, const cf_ci_c = reopen_db: {
         const column_family_names = [_][*:0]const u8{
@@ -66,7 +76,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         const column_family_options: [column_family_names.len]?*const c.rocksdb_options_t = .{
             db_options,
             cf_options,
-            cf_options,
+            cf_b_pi_bpi_options,
             cf_options,
         };
         var column_family_handles: [column_family_names.len]?*c.rocksdb_column_family_handle_t = undefined;
