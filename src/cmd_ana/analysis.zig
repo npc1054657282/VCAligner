@@ -530,7 +530,17 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !union(enum
                             // 这些文件在调试模式会直接导致unreachable，而在release模式导致Unexpected。在此放弃访问作为workaround。
                             // XXX: 考虑事先对文件名进行一次过滤，对于其中出现非法字符的文件事先滤掉，保证debug模式不会崩溃。
                             error.FileNotFound, error.IsDir, error.Unexpected => return .file_not_found,
-                            else => return err,
+                            // NOTE: 实践中发现，仓库中可能存在一些恶意构造的commit，这些commit把文件名设计为一个极长值。
+                            // 为了不让此类commit影响解析过程，过长的repo path将直接判定为`file_not_found`。
+                            error.NameTooLong => {
+                                std.log.warn("NameTooLong repo path! path: {s}", .{path});
+                                return .file_not_found;
+                            },
+                            else => {
+                                const src = @src();
+                                std.log.err("{s} at {s} {s} line{d} path: {s}", .{ @errorName(err), src.file, src.fn_name, src.line, path });
+                                return err;
+                            },
                         }
                     },
                 };
@@ -552,7 +562,17 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !union(enum
                 const stat = std.posix.fstatatZ(std.fs.cwd().fd, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
                     switch (err) {
                         error.FileNotFound => return .file_not_found,
-                        else => return err,
+                        // NOTE: 实践中发现，仓库中可能存在一些恶意构造的commit，这些commit把文件名设计为一个极长值。
+                        // 为了不让此类commit影响解析过程，过长的repo path将直接判定为`file_not_found`。
+                        error.NameTooLong => {
+                            std.log.warn("NameTooLong repo path! path: {s}", .{path});
+                            return .file_not_found;
+                        },
+                        else => {
+                            const src = @src();
+                            std.log.err("{s} at {s} {s} line{d} path: {s}", .{ @errorName(err), src.file, src.fn_name, src.line, path });
+                            return err;
+                        },
                     }
                 };
                 break :blk switch (stat.mode & std.posix.S.IFMT) {
