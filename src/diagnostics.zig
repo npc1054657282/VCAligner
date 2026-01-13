@@ -34,8 +34,8 @@ pub const Diagnostics = struct {
 };
 
 pub const Diagnostic = union {
-    DiagnosticGIT_ERROR: c_helper.DiagnosticGIT_ERROR,
-    DiagnosticUnknownCError: c_helper.DiagnosticUnknownCError,
+    GIT_ERROR: c_helper.DiagnosticGIT_ERROR,
+    UnknownCError: c_helper.DiagnosticUnknownCError,
     pub fn enterStack(last_diagnostic: *@This(), last_error: anyerror) !void {
         var diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
         if (diagnostics.double_error != null) {
