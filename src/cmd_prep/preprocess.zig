@@ -1,26 +1,22 @@
 const std = @import("std");
-const gvca = @import("gvca");
-const c_helper = gvca.c_helper;
+const vcaligner = @import("vcaligner");
+const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
-const diag = gvca.diag;
-const Pool = gvca.Pool;
+const diag = vcaligner.diag;
+const Pool = vcaligner.Pool;
 
 pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     ctx.writer = .{
         // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
-        .path_registry = .{ .arena = .init(gvca.getAllocator()) },
-        .blob_path_registry = .{ .arena = .init(gvca.getAllocator()) },
-        // 默认列族需要merge operator，在后面追加commit。
-        // .merge_operator_state = undefined,
+        .path_registry = .{ .arena = .init(vcaligner.getAllocator()) },
+        .blob_path_registry = .{ .arena = .init(vcaligner.getAllocator()) },
     };
-    // try ctx.writer.merge_operator_state.init(gvca.getAllocator());
     defer {
         ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
         ctx.writer.path_registry.arena.deinit();
         ctx.writer.blob_path_registry.map.deinit(ctx.writer.blob_path_registry.arena.allocator());
         ctx.writer.blob_path_registry.arena.deinit();
-        // ctx.writer.merge_operator_state.deinit();
         ctx.writer = undefined;
     }
     try parseAndWrite(ctx, allocator, last_diag);
@@ -166,10 +162,10 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
     if (ctx.commit_registry.map.contains(id.*)) return 0;
     // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
-    const commit_seq: gvca.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
+    const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
     ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
         std.log.err("Commit regisistry put no clobber failed.\n", .{});
-        gvca.crash_dump.dumpAndCrash(@src());
+        vcaligner.crash_dump.dumpAndCrash(@src());
     };
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
     const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);

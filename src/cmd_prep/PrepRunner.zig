@@ -1,19 +1,18 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const gvca = @import("gvca");
-const CliRunner = gvca.cli.Runner;
-const c = gvca.c_helper.c;
-const diag = gvca.diag;
-const Pool = gvca.Pool;
+const vcaligner = @import("vcaligner");
+const CliRunner = vcaligner.cli.Runner;
+const c = vcaligner.c_helper.c;
+const diag = vcaligner.diag;
+const Pool = vcaligner.Pool;
 const PrepRunner = @This();
 const mpsc_queue = @import("mpsc_queue");
-const MpscChannel = gvca.MpscChannel;
-// const CommitRangesMergeOperaterState = gvca.rocksdb_custom.CommitRangesMergeOperaterState;
-const CommitSeq = gvca.rocksdb_custom.CommitSeq;
-const PathSeq = gvca.rocksdb_custom.PathSeq;
-const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
-const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
-const Key = gvca.rocksdb_custom.Key;
+const MpscChannel = vcaligner.MpscChannel;
+const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
+const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
+const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const Key = vcaligner.rocksdb_custom.Key;
 
 pub const Queue = mpsc_queue.AnyMpscQueue(Parsed, null);
 pub const Channel = MpscChannel(Queue);
@@ -52,7 +51,7 @@ compaction_trigger: c_int,
 compression: bool,
 // 采集本进程的pid与一个时间戳，用于生成本进程唯一信息，可用于临时文件命名。
 proc_stamp: struct {
-    pid: gvca.pid.Pid,
+    pid: vcaligner.pid.Pid,
     ts: i128,
 },
 // max_allowed_space_usage: u64,
@@ -73,12 +72,12 @@ parsers: struct {
         // 注：实际上的id数量为线程池数量加1，这一点从`pool.init`的实现里就能看出。这是因为创建线程池的线程自己是id 0。
         for (try self.lctxs.addManyAsSlice(allocator, 1 + n_parserjobs), 0..) |*lctx, id| {
             lctx.init(channel);
-            try gvca.crash_dump.reg("parser", id, &lctx.dumpable);
+            try vcaligner.crash_dump.reg("parser", id, &lctx.dumpable);
         }
     }
     pub fn deinit(self: *Parsers, allocator: std.mem.Allocator) void {
         for (self.lctxs.items, 0..) |*lctx, id| {
-            gvca.crash_dump.unreg("parser", id);
+            vcaligner.crash_dump.unreg("parser", id);
             lctx.deinit();
         }
         self.lctxs.deinit(allocator);
@@ -174,7 +173,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
             .compaction_trigger = args.compaction_trigger,
             .compression = !args.no_compression,
             .proc_stamp = .{
-                .pid = gvca.pid.get(),
+                .pid = vcaligner.pid.get(),
                 .ts = std.time.nanoTimestamp(),
             },
             // .max_allowed_space_usage = args.max_allowed_space_usage,

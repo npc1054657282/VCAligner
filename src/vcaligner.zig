@@ -1,4 +1,4 @@
-const gvca = @import("gvca.zig");
+const vcaligner = @import("vcaligner.zig");
 const std = @import("std");
 const zargs = @import("zargs");
 pub const cli = @import("cli.zig");
@@ -52,7 +52,7 @@ pub fn main() !void {
         diagnostics.log_all(err);
         diagnostics.clear();
     };
-    std.log.debug("Gvca End.\n", .{});
+    std.log.debug("VCAligner End.\n", .{});
 }
 
 test {

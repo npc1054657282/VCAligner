@@ -48,7 +48,7 @@ pub const CommitCollection = struct {
                 if (ci_native <= last_range.end) std.debug.panic(
                     \\Input a commit seq not greater than last range in builder.  
                     \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
-                    \\Use the `gvca prep` subcommand to regenerate a valid rocksdb database.
+                    \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
                 , .{});
                 std.debug.assert(last_range.end >= last_range.start);
                 if (ci_native == last_range.end + 1) {

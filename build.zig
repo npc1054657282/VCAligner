@@ -12,7 +12,7 @@ fn readBuildConfig(allocator: std.mem.Allocator) !BuildConfig {
     return parsed.value;
 }
 
-fn createGvcaModule(
+fn createVcalignerModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -33,8 +33,8 @@ fn createGvcaModule(
     mpsc_queue_options.addOption(?bool, "runtime_safety", null);
     mpsc_queue_module.addOptions("mpsc_queue_options", mpsc_queue_options);
 
-    const gvca_module = b.createModule(.{
-        .root_source_file = b.path("src/gvca.zig"),
+    const vcaligner_module = b.createModule(.{
+        .root_source_file = b.path("src/vcaligner.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -42,24 +42,24 @@ fn createGvcaModule(
         .sanitize_c = .full,
     });
     for (build_config.add_include_paths) |include_path| {
-        gvca_module.addIncludePath(.{ .cwd_relative = include_path });
+        vcaligner_module.addIncludePath(.{ .cwd_relative = include_path });
     }
     for (build_config.add_library_paths) |library_path| {
-        gvca_module.addLibraryPath(.{ .cwd_relative = library_path });
+        vcaligner_module.addLibraryPath(.{ .cwd_relative = library_path });
     }
     for (build_config.link_system_librarys) |system_library| {
-        gvca_module.linkSystemLibrary(system_library, .{});
+        vcaligner_module.linkSystemLibrary(system_library, .{});
     }
 
-    gvca_module.addImport("gvca", gvca_module);
+    vcaligner_module.addImport("vcaligner", vcaligner_module);
 
-    gvca_module.addImport("mpsc_queue", mpsc_queue_module);
+    vcaligner_module.addImport("mpsc_queue", mpsc_queue_module);
 
-    gvca_module.addImport("zargs", b.dependency("zargs", .{
+    vcaligner_module.addImport("zargs", b.dependency("zargs", .{
         .target = target,
         .optimize = optimize,
     }).module("zargs"));
-    return gvca_module;
+    return vcaligner_module;
 }
 
 pub fn build(b: *std.Build) void {
@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe_module = createGvcaModule(
+    const exe_module = createVcalignerModule(
         b,
         target,
         optimize,
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const exe = b.addExecutable(.{
-        .name = "gvca",
+        .name = "vcaligner",
         .root_module = exe_module,
     });
     b.installArtifact(exe);
@@ -102,8 +102,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_exe.step);
 
-    const exe_check = b.addExecutable(.{ .name = "gvca", .root_module = exe_module });
-    const check = b.step("check", "Check if gvca compiles");
+    const exe_check = b.addExecutable(.{ .name = "vcaligner", .root_module = exe_module });
+    const check = b.step("check", "Check if vcaligner compiles");
     check.dependOn(&exe_check.step);
 
     const test_filters: []const []const u8 = b.option(
@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     for (test_targets) |test_target| {
         const unit_tests = b.addTest(.{
-            .root_module = createGvcaModule(
+            .root_module = createVcalignerModule(
                 b,
                 b.resolveTargetQuery(test_target),
                 optimize,

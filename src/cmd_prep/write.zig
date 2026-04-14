@@ -1,13 +1,13 @@
 const std = @import("std");
 const PrepRunner = @import("PrepRunner.zig");
-const gvca = @import("gvca");
-const PathSeq = gvca.rocksdb_custom.PathSeq;
-const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
-const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
-const CommitSeq = gvca.rocksdb_custom.CommitSeq;
-const Key = gvca.rocksdb_custom.Key;
-const c = gvca.c_helper.c;
-const diag = gvca.diag;
+const vcaligner = @import("vcaligner");
+const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
+const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
+const Key = vcaligner.rocksdb_custom.Key;
+const c = vcaligner.c_helper.c;
+const diag = vcaligner.diag;
 
 pub const batch_threshold = 512;
 pub const write_batch_threshold = 4096 - batch_threshold;
@@ -16,7 +16,7 @@ pub const write_batch_threshold = 4096 - batch_threshold;
 // 此过程对于rocksdb仅写入，无压缩。压缩为写入完毕的后继内容，回归主线程进行。
 pub fn task(ctx: *PrepRunner) void {
     // 写线程本地分配器。都是c分配器。
-    const allocator = gvca.getAllocator();
+    const allocator = vcaligner.getAllocator();
     const diagnostics_arena = std.heap.ArenaAllocator.init(allocator);
     defer diagnostics_arena.deinit();
     var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
@@ -107,7 +107,7 @@ pub fn task(ctx: *PrepRunner) void {
         const db = c.rocksdb_open(db_options, ctx.rocksdb_output.get(), @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         break :blk db.?;
     };
@@ -141,7 +141,7 @@ pub fn task(ctx: *PrepRunner) void {
             const path_get_or_put_result = ctx.writer.path_registry.map.getOrPut(ctx.writer.path_registry.arena.allocator(), parsed_unit.path) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
-                gvca.crash_dump.dumpAndCrash(@src());
+                vcaligner.crash_dump.dumpAndCrash(@src());
             };
             if (!path_get_or_put_result.found_existing) {
                 // 注意！`getOrPut`会直接把我们用于比较的`parsed_unit.path`作为键。但是`parsed_unit.path`的生存周期实际上并不够！
@@ -150,7 +150,7 @@ pub fn task(ctx: *PrepRunner) void {
                 path_get_or_put_result.key_ptr.* = std.mem.Allocator.dupe(ctx.writer.path_registry.arena.allocator(), u8, parsed_unit.path) catch |err| {
                     diagnostics.log_all(err);
                     diagnostics.clear();
-                    gvca.crash_dump.dumpAndCrash(@src());
+                    vcaligner.crash_dump.dumpAndCrash(@src());
                 };
                 path_get_or_put_result.value_ptr.* = .{
                     .index = .fromNative(@intCast(path_get_or_put_result.index)),
@@ -164,7 +164,7 @@ pub fn task(ctx: *PrepRunner) void {
             const blob_path_get_or_put_result = ctx.writer.blob_path_registry.map.getOrPut(ctx.writer.blob_path_registry.arena.allocator(), blob_path_key) catch |err| {
                 diagnostics.log_all(err);
                 diagnostics.clear();
-                gvca.crash_dump.dumpAndCrash(@src());
+                vcaligner.crash_dump.dumpAndCrash(@src());
             };
             if (!blob_path_get_or_put_result.found_existing) {
                 // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
@@ -190,7 +190,7 @@ pub fn task(ctx: *PrepRunner) void {
             c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
             if (err_cstr) |ecstr| {
                 std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
-                gvca.crash_dump.dumpAndCrash(@src());
+                vcaligner.crash_dump.dumpAndCrash(@src());
             }
             c.rocksdb_writebatch_clear(wb);
         }
@@ -202,7 +202,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb write failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
         std.log.debug("Parse end.\n", .{});
@@ -226,7 +226,7 @@ pub fn task(ctx: *PrepRunner) void {
         const cf_ci_c = c.rocksdb_create_column_family(db, cf_options, "ci2c", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'ci2c' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         break :blk cf_ci_c.?;
     };
@@ -247,7 +247,7 @@ pub fn task(ctx: *PrepRunner) void {
                 c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
                 if (err_cstr) |ecstr| {
                     std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
-                    gvca.crash_dump.dumpAndCrash(@src());
+                    vcaligner.crash_dump.dumpAndCrash(@src());
                 }
                 c.rocksdb_writebatch_clear(wb);
             }
@@ -255,7 +255,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb write ci2c failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
         break :write_ci2c;
@@ -266,7 +266,7 @@ pub fn task(ctx: *PrepRunner) void {
         const cf_pi_p = c.rocksdb_create_column_family(db, cf_options, "pi2p", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'pi2p' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         break :blk cf_pi_p.?;
     };
@@ -286,7 +286,7 @@ pub fn task(ctx: *PrepRunner) void {
                 c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
                 if (err_cstr) |ecstr| {
                     std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
-                    gvca.crash_dump.dumpAndCrash(@src());
+                    vcaligner.crash_dump.dumpAndCrash(@src());
                 }
                 c.rocksdb_writebatch_clear(wb);
             }
@@ -294,7 +294,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb write pi2p failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
         break :write_pi2p;
@@ -315,7 +315,7 @@ pub fn task(ctx: *PrepRunner) void {
         const cf_b_pi_bpi = c.rocksdb_create_column_family(db, cf_b_pi_bpi_options, "b_pi2bpi", @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb create column family 'b_pi2bpi' failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         break :blk cf_b_pi_bpi.?;
     };
@@ -335,7 +335,7 @@ pub fn task(ctx: *PrepRunner) void {
                 c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
                 if (err_cstr) |ecstr| {
                     std.log.err("rocksdb write b_pi2bpi failed! {s}\n", .{std.mem.span(ecstr)});
-                    gvca.crash_dump.dumpAndCrash(@src());
+                    vcaligner.crash_dump.dumpAndCrash(@src());
                 }
                 c.rocksdb_writebatch_clear(wb);
             }
@@ -343,7 +343,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_write(db, woptions, wb, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb write b_pi2bpi failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         c.rocksdb_writebatch_clear(wb);
         break :write_b_pi2bpi;
@@ -363,7 +363,7 @@ pub fn task(ctx: *PrepRunner) void {
         c.rocksdb_flush_cfs(db, foptions, &column_family, column_family.len, @ptrCast(&err_cstr));
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb flush failed! {s}\n", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         break :flush_all;
     }

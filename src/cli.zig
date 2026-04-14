@@ -5,7 +5,7 @@ pub const Runner = union(enum) {
     prep: @import("cmd_prep/PrepRunner.zig"),
     ana: @import("cmd_ana/AnaRunner.zig"),
     const cmd = blk: {
-        var building_cmd = zargs.Command.new("gvca").requireSub("sub")
+        var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
             .about("git version commit aligner")
             .version("0.0.0")
             .author("npc1054657282");

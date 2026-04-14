@@ -1,11 +1,11 @@
 const std = @import("std");
 const Channel = @import("PrepRunner.zig").Channel;
-const gvca = @import("gvca");
-const c_helper = gvca.c_helper;
+const vcaligner = @import("vcaligner");
+const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const PrepRunner = @import("PrepRunner.zig");
 
-const diag = @import("gvca").diag;
+const diag = @import("vcaligner").diag;
 
 pub const Parsing = struct {
     // 线程局部分配器。虽然本程序实践中使用c_allocator，因此实际上没有什么局部性。
@@ -17,15 +17,15 @@ pub const Parsing = struct {
     // 以下内容为当前任务的缓存，下一个任务起重置。
     current_task: struct {
         arena: std.heap.ArenaAllocator,
-        commit_seq: gvca.rocksdb_custom.CommitSeq,
+        commit_seq: vcaligner.rocksdb_custom.CommitSeq,
     },
     // 以下内容为当前批次内容，flush过了就重置。
     to_flush: PrepRunner.Parsed,
     // 当全局崩溃时，打印相关信息。目前打印arena分配的空间大小。
-    dumpable: gvca.CrashDump.Dumpable,
+    dumpable: vcaligner.CrashDump.Dumpable,
 
     pub fn init(self: *Parsing, channel: *Channel) void {
-        self.allocator = gvca.getAllocator();
+        self.allocator = vcaligner.getAllocator();
         self.diagnostics_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.diagnostics = .{ .arena = self.diagnostics_arena };
         self.producer_local = channel.mpsc_queue_ref.initProducerLocal();
@@ -37,7 +37,7 @@ pub const Parsing = struct {
         self.current_task.arena.deinit();
         self.* = undefined;
     }
-    fn dumpFn(dumpable: *gvca.CrashDump.Dumpable) void {
+    fn dumpFn(dumpable: *vcaligner.CrashDump.Dumpable) void {
         const parsing: *Parsing = @alignCast(@fieldParentPtr("dumpable", dumpable));
         // 注：崩溃时打印不用关注数据即时性，虽然可能有数据竞争，但是获取过时数据不太紧要。
         std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
@@ -45,7 +45,7 @@ pub const Parsing = struct {
     }
 };
 
-pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: gvca.rocksdb_custom.CommitSeq) void {
+pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_seq: vcaligner.rocksdb_custom.CommitSeq) void {
     const lctx: *Parsing = &gctx.parsers.lctxs.items[thrd_id];
     const last_diag = &lctx.diagnostics.last_diagnostic;
     // 进入解析，降低积压的`task_in_queue_count`
@@ -59,7 +59,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     lctx.current_task.commit_seq = commit_seq;
     lctx.to_flush = .{
         // 原理上，`to_flush`每次重置的arena使用的是一个新创建的分配器。此处实践总是使用c分配器。
-        .arena = .init(gvca.getAllocator()),
+        .arena = .init(vcaligner.getAllocator()),
         .commit_seq = commit_seq,
         .parsed_units = .empty,
     };
@@ -71,7 +71,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         };
         break :blk commit.?;
     };
@@ -82,7 +82,7 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
         c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| {
             lctx.diagnostics.log_all(err);
             lctx.diagnostics.clear();
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         };
         break :blk tree.?;
     };
@@ -90,13 +90,13 @@ pub fn task(thrd_id: usize, gctx: *PrepRunner, commit_hash: c.git_oid, commit_se
     parse_tree(gctx, lctx, tree, &@as([0]u8, .{})) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        gvca.crash_dump.dumpAndCrash(@src());
+        vcaligner.crash_dump.dumpAndCrash(@src());
     };
     // 任务结束时最后刷新一次。
     flush_relation_batch(gctx, lctx) catch |err| {
         lctx.diagnostics.log_all(err);
         lctx.diagnostics.clear();
-        gvca.crash_dump.dumpAndCrash(@src());
+        vcaligner.crash_dump.dumpAndCrash(@src());
     };
     return;
 }
@@ -163,7 +163,7 @@ fn append_relation(gctx: *PrepRunner, lctx: *Parsing, path: []u8, blob_oid: *con
     if (lctx.to_flush.parsed_units.items.len >= lctx.flush_threshold) {
         try flush_relation_batch(gctx, lctx);
         lctx.to_flush = .{
-            .arena = .init(gvca.getAllocator()),
+            .arena = .init(vcaligner.getAllocator()),
             .commit_seq = lctx.current_task.commit_seq,
             .parsed_units = .empty,
         };

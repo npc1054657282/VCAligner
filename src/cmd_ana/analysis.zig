@@ -1,16 +1,16 @@
 const std = @import("std");
-const gvca = @import("gvca");
-const c = gvca.c_helper.c;
+const vcaligner = @import("vcaligner");
+const c = vcaligner.c_helper.c;
 const AnaRunner = @import("AnaRunner.zig");
-const diag = gvca.diag;
-const Pool = gvca.Pool;
-const PathSeq = gvca.rocksdb_custom.PathSeq;
-const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
-const BlobPathKey = gvca.rocksdb_custom.BlobPathKey;
-const CommitSeqNative = gvca.rocksdb_custom.CommitSeqNative;
-const CommitSeq = gvca.rocksdb_custom.CommitSeq;
-const Key = gvca.rocksdb_custom.Key;
-const CommitRange = gvca.commit_range.CommitRange;
+const diag = vcaligner.diag;
+const Pool = vcaligner.Pool;
+const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
+const CommitSeqNative = vcaligner.rocksdb_custom.CommitSeqNative;
+const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
+const Key = vcaligner.rocksdb_custom.Key;
+const CommitRange = vcaligner.commit_range.CommitRange;
 
 pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     _ = last_diag;
@@ -155,7 +155,7 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                     const new_candidate_index = ctx.candidate_parser.candidates.items.len;
                     try ctx.candidate_parser.candidates.append(allocator, .{
                         .commit_collection = new_candidate_collection: {
-                            var new_candidate_collection: gvca.commit_range.CommitCollection = try commit_collection.view().dupe(allocator);
+                            var new_candidate_collection: vcaligner.commit_range.CommitCollection = try commit_collection.view().dupe(allocator);
                             // 对于新创建的候选集，重新补课，与前面的所有agenda取交集。
                             for (ctx.candidate_parser.agenda_parsers.items) |*review_agenda| {
                                 if (agenda == review_agenda) {
@@ -209,12 +209,12 @@ pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.
                     );
                     if (err_cstr) |ecstr| {
                         std.log.err("rocksdb commit get failed! {s}", .{std.mem.span(ecstr)});
-                        gvca.crash_dump.dumpAndCrash(@src());
+                        vcaligner.crash_dump.dumpAndCrash(@src());
                     }
                     if (commit_ptr == null) {
                         // 对应的commit不存在
                         std.log.err("rocksdb commit seq {d} not found!", .{ci_native});
-                        gvca.crash_dump.dumpAndCrash(@src());
+                        vcaligner.crash_dump.dumpAndCrash(@src());
                     }
                     defer c.rocksdb_free(commit_ptr);
                     break :blk .{
@@ -380,11 +380,11 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         );
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb path get failed! {s}", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         if (path_ptr == null) {
             std.log.err("rocksdb path seq {d} not found!", .{lctx.pi.toNative()});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         defer c.rocksdb_free(path_ptr);
         const path_from_repo = path_ptr[0..path_len];
@@ -402,12 +402,12 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             } else break :path_from_release path_from_repo;
         };
         var builder: std.ArrayList(u8) = .empty;
-        builder.appendSlice(ts_allocator, gctx.release_path) catch gvca.crash_dump.dumpAndCrash(@src());
-        builder.append(ts_allocator, '/') catch gvca.crash_dump.dumpAndCrash(@src());
-        builder.appendSlice(ts_allocator, path_from_release) catch gvca.crash_dump.dumpAndCrash(@src());
+        builder.appendSlice(ts_allocator, gctx.release_path) catch vcaligner.crash_dump.dumpAndCrash(@src());
+        builder.append(ts_allocator, '/') catch vcaligner.crash_dump.dumpAndCrash(@src());
+        builder.appendSlice(ts_allocator, path_from_release) catch vcaligner.crash_dump.dumpAndCrash(@src());
         break :blk .{
-            builder.toOwnedSliceSentinel(ts_allocator, 0) catch gvca.crash_dump.dumpAndCrash(@src()),
-            ts_allocator.dupeZ(u8, path_from_release) catch gvca.crash_dump.dumpAndCrash(@src()),
+            builder.toOwnedSliceSentinel(ts_allocator, 0) catch vcaligner.crash_dump.dumpAndCrash(@src()),
+            ts_allocator.dupeZ(u8, path_from_release) catch vcaligner.crash_dump.dumpAndCrash(@src()),
         };
     };
     defer {
@@ -419,7 +419,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         .blob_hash = blk: {
             const maybe_blob_hash = gitBlobSha1Hash(ts_allocator, path_from_cwd) catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
-                gvca.crash_dump.dumpAndCrash(@src());
+                vcaligner.crash_dump.dumpAndCrash(@src());
             };
             switch (maybe_blob_hash) {
                 .file_empty => {
@@ -453,7 +453,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
         );
         if (err_cstr) |ecstr| {
             std.log.err("rocksdb path blob seq get failed! {s}", .{std.mem.span(ecstr)});
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         }
         if (blob_path_seq_ptr == null) {
             // 对应的blob不存在，直接结束。
@@ -465,7 +465,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
     };
     // 将`blob_path_seq`作为前缀查找所有commit。
     lctx.commit_collection = commit_collection: {
-        var builder: gvca.commit_range.CommitCollection.Builder = .init;
+        var builder: vcaligner.commit_range.CommitCollection.Builder = .init;
         const bpici_iter = c.rocksdb_create_iterator_cf(gctx.db, gctx.candidate_parser.prefix_scan_roptions, gctx.cf_bpi_ci).?;
         defer c.rocksdb_iter_destroy(bpici_iter);
         c.rocksdb_iter_seek(bpici_iter, @ptrCast(&blob_path_seq), @sizeOf(BlobPathSeq));
@@ -477,7 +477,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 const ci: CommitSeq = std.mem.bytesAsValue(Key, key_ptr[0..klen]).commit_seq;
                 break :blk ci.toNative();
             };
-            builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch gvca.crash_dump.dumpAndCrash(@src());
+            builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch vcaligner.crash_dump.dumpAndCrash(@src());
         }
         // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
         break :commit_collection .{ .parsed = builder.toOwnedCommitRanges(ts_allocator) catch |err| {
@@ -491,7 +491,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
                 },
                 else => {},
             }
-            gvca.crash_dump.dumpAndCrash(@src());
+            vcaligner.crash_dump.dumpAndCrash(@src());
         } };
     };
 }

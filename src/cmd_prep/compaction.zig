@@ -1,10 +1,10 @@
 const std = @import("std");
-const gvca = @import("gvca");
-const diag = gvca.diag;
+const vcaligner = @import("vcaligner");
+const diag = vcaligner.diag;
 const PrepRunner = @import("PrepRunner.zig");
-const c = gvca.c_helper.c;
-const PathSeq = gvca.rocksdb_custom.PathSeq;
-const BlobPathSeq = gvca.rocksdb_custom.BlobPathSeq;
+const c = vcaligner.c_helper.c;
+const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
 
 // write线程执行完的后续。
 pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
@@ -169,7 +169,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
             c.rocksdb_sstfilewriter_finish(sstwriter, @ptrCast(&err_cstr));
             if (err_cstr) |ecstr| {
                 std.log.err("rocksdb sstfilewriter finish failed! {s}\n", .{std.mem.span(ecstr)});
-                gvca.crash_dump.dumpAndCrash(@src());
+                vcaligner.crash_dump.dumpAndCrash(@src());
             }
         }
 
