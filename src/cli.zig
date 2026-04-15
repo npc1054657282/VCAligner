@@ -7,7 +7,7 @@ pub const Runner = union(enum) {
     const cmd = blk: {
         var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
             .about("git version commit aligner")
-            .version("0.0.0")
+            .version("0.1.0-casestudy")
             .author("npc1054657282");
         for (@typeInfo(Runner).@"union".fields) |field| {
             building_cmd = building_cmd.sub(field.type.cmd);
