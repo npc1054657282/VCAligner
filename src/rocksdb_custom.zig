@@ -1,6 +1,3 @@
-// 本程序使用rocksdb过程中默认列族使用的merge operator。
-// merge operator一般而言伴随数据库终生，虽然实际上一次完整的手动compaction以后，实际上数据库不应当再出现merge operator内容。
-// 但处于保险起见，每次阅读时总是设置它们是更加安全的。
 const std = @import("std");
 const c = @import("c.zig").c;
 const vcaligner = @import("vcaligner");

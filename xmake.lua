@@ -2,7 +2,10 @@ add_rules("mode.valgrind", "mode.release")
 -- libgit2使用链接例外规则，因此虽然是GPL2.0，但是本项目仅仅链接，所以不受它的传染性影响。
 set_policy("check.target_package_licenses", false)
 
-set_toolchains("@zig")
+-- Note: xmake 3.0.8+ requires "zigcc" for proper C/C++ dependency wrapping.
+-- If you are using xmake 2.9.9, please change "zigcc" to "zig".
+set_toolchains("zigcc")
+-- set_toolchains("zig") -- Uncomment this and comment the line above for xmake 2.9.9
 
 add_repositories("vcaligner-repo repo", {rootdir = os.scriptdir()})
 
