@@ -153,7 +153,7 @@ pub fn AnyMpscQueue(comptime T: type, comptime SequenceTypeOverride: ?type) type
                     const ConcreteMpscQueue = @typeInfo(@FieldType(Dispatcher, tag_name)).pointer.child;
                     comptime std.debug.assert(ConcreteMpscQueue == MpscQueue(T, capacity_log2, SequenceTypeOverride));
                     const instance = try allocator.create(ConcreteMpscQueue);
-                    instance.* = .init;
+                    instance.init();
                     return .{
                         .u = @unionInit(Dispatcher, tag_name, instance),
                     };
@@ -307,17 +307,22 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             // 而Sequence的大小大多也是`usize`，因此这么做能确实生效的情景存疑。而移位的开销稳定存在。
             available: std.atomic.Value(Sequence),
         };
-        pub const init: @This() = .{
-            .buf = @splat(.{ .item = undefined, .available = .init(~@as(Sequence, 0)) }),
-            .produce_cursor_to_claim = .init(0),
-            .consume_cursor_to_release = .init(0),
-            .safety = if (runtime_safety) .{} else {},
-        };
         const capacity = 1 << capacity_log2;
         const mask = capacity - 1;
         const SafetyChecks = if (runtime_safety) struct {
             consumer_local_cache_inited: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
         } else void;
+        pub fn init(self: *@This()) void {
+            self.* = .{
+                .buf = undefined,
+                .produce_cursor_to_claim = .init(0),
+                .consume_cursor_to_release = .init(0),
+                .safety = if (runtime_safety) .{} else {},
+            };
+            for (&self.buf) |*slot| {
+                slot.available = .init(~@as(Sequence, 0));
+            }
+        }
         pub fn getCapacity(_: *@This()) usize {
             return capacity;
         }
