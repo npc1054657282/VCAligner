@@ -57,7 +57,6 @@ proc_stamp: struct {
 // max_allowed_space_usage: u64,
 repo: *c.git_repository = undefined,
 odb: *c.git_odb = undefined,
-repo_id: [:0]u8 = undefined,
 parsers: struct {
     pool: Pool,
     wait_group: std.Thread.WaitGroup,

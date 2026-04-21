@@ -67,20 +67,21 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
     // oidtype标识仓库的hash是SHA1还是SHA256。
     const oidtype = c.git_repository_oid_type(ctx.repo);
     _ = oidtype;
-    ctx.repo_id = try getRepoId(ctx.repo, allocator, last_diag);
-    defer {
-        allocator.free(ctx.repo_id);
-        ctx.repo_id = undefined;
-    }
-    std.log.debug("repo-id: {s}\n", .{ctx.repo_id});
-    // 如果rocksdb_output未指定，基于repo_id设置rocksdb_output。
+    // 如果rocksdb_output未指定，基于仓库构造repo_id来设置rocksdb_output。
     switch (ctx.rocksdb_output) {
         .manual => {},
         .auto => {
+            // repo_id原放在`ctx`中，曾考虑参与更多，如在rocksdb中被保存
+            // 由于repo_id目前实现不完善（仅仅只有repo中包含远程origin才能提取）且目前仅在自动创建rocksdb_outpu时才有用
+            // 因此它的创建目前仅仅在自动创建rocksdb_output时才会进行。
+            const repo_id = try getRepoId(ctx.repo, allocator, last_diag);
+            defer allocator.free(repo_id);
+            std.log.debug("repo-id: {s}\n", .{repo_id});
             ctx.rocksdb_output.auto = blk: {
                 var rocksdb_output_auto_writer: std.Io.Writer.Allocating = .init(allocator);
+                errdefer rocksdb_output_auto_writer.deinit();
                 try rocksdb_output_auto_writer.writer.print("tmp/{s}/{d}-{d}-rocksdb", .{
-                    ctx.repo_id,
+                    repo_id,
                     ctx.proc_stamp.pid,
                     ctx.proc_stamp.ts,
                 });
