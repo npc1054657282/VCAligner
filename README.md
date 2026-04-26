@@ -14,3 +14,7 @@
 xmake f -m release
 xmake
 ```
+
+## A case study on Xz-Utils
+
+We provide a reproducible [XZ Case Study](https://github.com/npc1054657282/VCAligner-XZ-CaseStudy.git) to demonstrate VCAligner's practical workflow. It showcases how to extract phantom artifacts and integrate them with downstream detection rules.
