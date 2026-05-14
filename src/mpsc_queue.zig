@@ -352,7 +352,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
             return capacity -| (cache_produce_cursor_to_claim -% cache_consume_cursor_to_release);
         }
         pub fn probeProduceVacancyForConsumer(self: *@This(), cache_consume_cursor_to_release: Sequence) usize {
-            const cache_produce_cursor_to_claim = self.produce_cursor_to_claim.load(.acquire);
+            const cache_produce_cursor_to_claim = self.produce_cursor_to_claim.load(.monotonic);
             return probeProduceVacancy(cache_produce_cursor_to_claim, cache_consume_cursor_to_release);
         }
         // 三个API，分别代表1.申请一次生产；2.申请多次生产，但如果空间不足则依然成功并申请剩余空间；
@@ -373,9 +373,9 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                     if (probeProduceVacancy(cache_produce_cursor, cache.consume_cursor_to_release) == 0) return error.MpscQueueVacancyUnavailableForProducer;
                 }
                 new_produce_cursor = cache_produce_cursor +% 1;
-                // 此处内存序`acquire`即可，claim阶段没有需要发布给consumer的数据。
+                // claim阶段没有需要发布给consumer的数据（`probeProduceVacancyForConsumer`不需要尽可能新的数据），生产者cas竞争仅需要原子语义不需要内存可见性语义。
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
-                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
+                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .monotonic, .monotonic);
                 break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
@@ -405,7 +405,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 } else actual_count = count;
                 new_produce_cursor = cache_produce_cursor +% actual_count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
-                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
+                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .monotonic, .monotonic);
                 break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
@@ -434,7 +434,7 @@ pub fn MpscQueue(comptime T: type, comptime capacity_log2: u8, comptime Sequence
                 }
                 new_produce_cursor = cache_produce_cursor +% count;
                 // ABA安全依赖于`Sequence`长度，参见`probeProduceVacancy`。
-                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .acquire, .monotonic);
+                cas_result = self.produce_cursor_to_claim.cmpxchgWeak(cache_produce_cursor, new_produce_cursor, .monotonic, .monotonic);
                 break :do cas_result != null;
             }) {
                 cache_produce_cursor = cas_result.?;
