@@ -91,11 +91,10 @@ pub fn task(ctx: *PrepRunner) void {
         // 只设置默认列族就够了，其他列族用不着。
         c.rocksdb_options_set_write_buffer_size(db_options, 256 * 1024 * 1024);
         c.rocksdb_options_set_max_write_buffer_number(db_options, @intCast(ctx.n_rocksdbjobs));
-        // 一定要小心，此处神坑！这两个东西进入options时都会变成`shared ptr`并且移交所有权！
+        // 一定要小心，此处神坑！slicetransform和mergeoperator进入options时都会变成shared ptr并且移交所有权！
         // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
         // 默认列族以path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(BlobPathSeq)));
-        // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 注：当options已经被用于打开rocksdb以后，rocksdb内部有此配置的拷贝，对options的直接修改不会影响rocksdb。
         // 虽然后续可以用`rocksdb_set_options`和`rocksdb_set_options_cf`中途修改各默认列族的行为。
         // 但是，C API不支持`SetDBOptions`，也就是修改数据库本体的操作。后续必须关闭数据库再重新打开。

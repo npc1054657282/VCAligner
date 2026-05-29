@@ -34,7 +34,6 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
         c.rocksdb_options_set_max_compaction_bytes(db_options, 1 << 60);
         // 下面为默认列族配置
         c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(BlobPathSeq)));
-        // c.rocksdb_options_set_merge_operator(db_options, ctx.writer.merge_operator_state.createCommitRangesMergeOperater());
         // 在compaction阶段，增加block cache量。默认32Mb，我们增加到256Mb。
         // 实际命中率不高，不用特别注意。
         c.rocksdb_options_set_block_based_table_factory(db_options, table_options);
