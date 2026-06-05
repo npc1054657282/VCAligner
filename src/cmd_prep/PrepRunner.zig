@@ -161,7 +161,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
     };
     return .{
         .prep = .{
-            .global = CliRunner.Global.initGlobal(args),
+            .global = .init(args),
             .bare_repo_path = bare_repo_path,
             .rocksdb_output = if (args.rocksdb_output) |rocksdb_output| .{
                 .manual = try allocator.dupeZ(u8, rocksdb_output),

@@ -51,7 +51,7 @@ pub const Diagnostic = union {
         const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
         return diagnostics.arena.allocator();
     }
-    pub fn unableToConstructDiagnostic(last_diagnostic: *@This(), err: anyerror) !void {
+    pub fn unableToConstructDiagnostic(last_diagnostic: *@This(), err: anyerror) error{UnableToConstructDiagnostic}!void {
         const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
         diagnostics.double_error = err;
         return error.UnableToConstructDiagnostic;

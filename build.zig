@@ -55,10 +55,13 @@ fn createVcalignerModule(
 
     vcaligner_module.addImport("mpsc_queue", mpsc_queue_module);
 
-    vcaligner_module.addImport("zargs", b.dependency("zargs", .{
+    const dep_zargs = b.dependency("zargs", .{
         .target = target,
         .optimize = optimize,
-    }).module("zargs"));
+    });
+    vcaligner_module.addImport("zargs", dep_zargs.module("zargs"));
+    vcaligner_module.addImport("ztype", dep_zargs.module("ztype"));
+
     return vcaligner_module;
 }
 

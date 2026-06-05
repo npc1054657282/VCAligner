@@ -112,7 +112,7 @@ pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) 
     const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
     return .{
         .ana = .{
-            .global = CliRunner.Global.initGlobal(args),
+            .global = .init(args),
             .rocksdb_path = try allocator.dupeZ(u8, args.rocksdb_path),
             .release_path = try allocator.dupeZ(u8, args.release_path),
             .report_output = if (args.report_output) |report_output| .{
