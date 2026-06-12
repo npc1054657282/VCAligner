@@ -68,7 +68,9 @@ parsers: struct {
         try self.pool.init(.{ .allocator = allocator, .n_jobs = n_parserjobs, .track_ids = true });
         self.wait_group = .{};
         self.lctxs = .empty;
+        self.task_in_queue_count = .init(0);
         // 注：实际上的id数量为线程池数量加1，这一点从`pool.init`的实现里就能看出。这是因为创建线程池的线程自己是id 0。
+        // TODO: 异常不安全。但此代码即将废弃。
         for (try self.lctxs.addManyAsSlice(allocator, 1 + n_parserjobs), 0..) |*lctx, id| {
             lctx.init(channel);
             try vcaligner.crash_dump.reg("parser", id, &lctx.dumpable);

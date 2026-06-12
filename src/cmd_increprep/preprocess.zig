@@ -6,6 +6,7 @@ const c = c_helper.c;
 const diag = vcaligner.diag;
 const StArena = vcaligner.StArena;
 const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
 const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
 
@@ -20,6 +21,7 @@ pub const PathRegistry = struct {
     arena: StArena,
     pub fn deinit(self: *PathRegistry) void {
         self.map.deinit(self.arena.allocator());
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -28,6 +30,20 @@ pub const BlobPathRegistry = struct {
     arena: StArena,
     pub fn deinit(self: *BlobPathRegistry) void {
         self.map.deinit(self.arena.allocator());
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const CommitRegistry = struct {
+    // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
+    // 目前需求：查找频繁，最后迭代一次。迭代是无序的。
+    // 目前基于最高查询效率的目的采用HashMap。未来或考虑array hash map。
+    map: std.AutoHashMapUnmanaged(c.git_oid, CommitSeq),
+    arena: StArena,
+    pub fn deinit(self: *CommitRegistry) void {
+        self.map.deinit(self.arena.allocator());
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -45,7 +61,7 @@ pub const RocksdbPath = union(enum) {
             .full => |full_conf| switch (full_conf.rocksdb_output) {
                 .manual => |path| .{ .borrowed_from_config = path },
                 .auto => blk: {
-                    // repo_id原放在`ctx`中，曾考虑参与更多，如在rocksdb中被保存
+                    // repo_id曾考虑参与更多，如在rocksdb中被保存
                     // 由于repo_id目前实现不完善（仅仅只有repo中包含远程origin才能提取）且目前仅在自动创建rocksdb_outpu时才有用
                     // 因此它的创建目前仅仅在自动创建rocksdb_output时才会进行。
                     const repo_id = try getRepoId(repo, allocator, last_diag);
@@ -82,16 +98,25 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
     defer path_registry.deinit();
     var blob_path_registry: BlobPathRegistry = .{ .map = .empty, .arena = .init(allocator) };
     defer blob_path_registry.deinit();
-    libgit2_lifetime: {
+    var commit_registry: CommitRegistry = .{ .map = .empty, .arena = .init(allocator) };
+    // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
+    // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
+    defer commit_registry.deinit();
+    // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
+    // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
+    var main_parser_allocator_impl: vcaligner.Gpa = .init();
+    defer main_parser_allocator_impl.deinit();
+    const main_parser: std.Thread, const rocksdb_output: RocksdbPath = libgit2_handoff: {
         var git_error_code = c.git_libgit2_init();
         if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
         std.debug.assert(git_error_code == 1);
-        // libgit2初始化逻辑无法使用`defer`来进行shutdown，因为其shutdown可能报错，因此改为在块末尾shutdown。
-        // 类似地，`errdefer`对于异常退出路径的关闭也难以保证得到最优控制流。
-        // 我理想的控制流有能力记录所有错误，不论是否panic。
-        // 因此，我原本无意在这里增加一层函数的抽象，但为了方便还是在这里增加了一层函数。
-        parseAndWrite(
+        // 下面的写法模拟对libgit2资源本身的`errdefer`。由于libgit2的销毁本身可能报错，且`errdefer`本身将移除捕获`err`的能力。
+        // 因此，当前的`errdefer`对于这种本身可能报错的逻辑无法收集所有信息得到最优控制流。
+        // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
+        break :libgit2_handoff provisionMainParser(
             runconf,
+            main_parser_allocator_impl.getAllocator(),
+            &commit_registry,
             allocator,
             last_diag,
         ) catch |err| {
@@ -103,36 +128,14 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
             }
             std.debug.assert(git_error_code == 0);
         };
-        // 下面的逻辑无法使用`defer`，因为可能报错。
-        git_error_code = c.git_libgit2_shutdown();
-        try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-        std.debug.assert(git_error_code == 0);
-        break :libgit2_lifetime;
-    }
-}
-
-fn parseAndWrite(
-    noalias runconf: *const PrepRunner,
-    allocator: std.mem.Allocator,
-    last_diag: *diag.Diagnostic,
-) !void {
-    var main_parser: std.Thread, const rocksdb_output: RocksdbPath = repo_lifetime: {
-        const repo: *c.git_repository = blk: {
-            var repo: ?*c.git_repository = undefined;
-            const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
-            try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-            break :blk repo.?;
-        };
-        errdefer c.git_repository_free(repo);
-        const rocksdb_output: RocksdbPath = try .init(runconf, repo, allocator, last_diag);
-        const main_parser = try std.Thread.spawn(.{ .allocator = allocator }, @import("parse.zig").main_parse_task, .{repo});
-        errdefer comptime unreachable;
-        break :repo_lifetime .{ main_parser, rocksdb_output };
     };
     defer rocksdb_output.deinit(allocator);
-    // TODO: 此处的join是否真的必要？
+    // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
+    // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
+    // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
+    // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
     defer main_parser.join();
-    //  创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
+    // 全量模式创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
     if (runconf.mode_conf == .full) make_parent_dir: {
         // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
         // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
@@ -158,6 +161,42 @@ fn parseAndWrite(
         }
         break :make_parent_dir;
     }
+}
+
+fn provisionMainParser(
+    noalias runconf: *const PrepRunner,
+    main_parser_allocator: std.mem.Allocator,
+    commit_registry: *CommitRegistry,
+    allocator: std.mem.Allocator,
+    last_diag: *diag.Diagnostic,
+) !struct { std.Thread, RocksdbPath } {
+    const write_strategy: PrepRunner.WriteStrategy = runconf.mode_conf.writeStrategy();
+    const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
+    _ = write_strategy;
+    _ = compaction_strategy;
+    const repo: *c.git_repository = blk: {
+        var repo: ?*c.git_repository = undefined;
+        const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
+        try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+        break :blk repo.?;
+    };
+    errdefer c.git_repository_free(repo);
+    // oidtype标识仓库的hash是SHA1还是SHA256。
+    // TODO: 将它输出，与repo id一起写进数据库里。
+    const oidtype = c.git_repository_oid_type(repo);
+    _ = oidtype;
+    const rocksdb_output: RocksdbPath = try .init(runconf, repo, allocator, last_diag);
+    errdefer rocksdb_output.deinit(allocator);
+    const main_parser = try std.Thread.spawn(.{ .allocator = allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
+        repo,
+        runconf.task_queue_capacity_log2,
+        // n_jobs是排除rocksdb自动创建线程外的线程数。而解析子线程的数量还需要再排除主解析和写线程各一个。
+        runconf.n_jobs - 2,
+        commit_registry,
+        main_parser_allocator,
+    });
+    errdefer comptime unreachable;
+    return .{ main_parser, rocksdb_output };
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。

@@ -17,9 +17,8 @@ pub const write_batch_threshold = 4096 - batch_threshold;
 pub fn task(ctx: *PrepRunner) void {
     // 写线程本地分配器。都是c分配器。
     const allocator = vcaligner.getAllocator();
-    const diagnostics_arena = std.heap.ArenaAllocator.init(allocator);
-    defer diagnostics_arena.deinit();
-    var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
+    var diagnostics: diag.Diagnostics = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    defer diagnostics.arena.deinit();
     const last_diag = &diagnostics.last_diagnostic;
     _ = last_diag;
 

@@ -45,12 +45,25 @@ mode_conf: union(Mode) {
     },
     pub fn deinit(noalias self: *const @This(), allocator: std.mem.Allocator) void {
         switch (self.*) {
+            // 存在捕获`full_conf`和`*full_conf`两种选择。选择了前者，因为实际上它们的大小差距不是很悬殊，后者也可能让人误解这是一个有状态的量。
             .full => |full_conf| switch (full_conf.rocksdb_output) {
                 .manual => |path| allocator.free(path),
                 .auto => {},
             },
             .incremental => |inc_conf| allocator.free(inc_conf.rocksdb_output),
         }
+    }
+    pub fn writeStrategy(noalias self: *const @This()) WriteStrategy {
+        return switch (self.*) {
+            .full => |full_conf| full_conf.write_strategy,
+            .incremental => .immediate_multi_cf,
+        };
+    }
+    pub fn compactionStrategy(noalias self: *const @This()) CompactionStrategy {
+        return switch (self.*) {
+            .full => |full_conf| full_conf.compaction_strategy,
+            .incremental => |inc_conf| inc_conf.compaction_strategy.asParent(),
+        };
     }
 },
 // 指代计算密集型任务。rocksdb的flush多为I/O密集型任务，不在`n_jobs`考虑范围内

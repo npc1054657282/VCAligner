@@ -9,7 +9,10 @@ const diag = @import("vcaligner").diag;
 
 pub const Parsing = struct {
     // 线程局部分配器。虽然本程序实践中使用c_allocator，因此实际上没有什么局部性。
+    // 经过重新分析：将`std.mem.Allocator`放在这里是错误的抽象。上下文应该放可变内容，而`std.mem.Allocator`是不可变的。
+    // 因此，一定要放的话，这里就放已知确定具体的分配器类型并在这里放可变的实际分配器上下文，例如arena，而`std.mem.Allocator`在这此处没有意义。
     allocator: std.mem.Allocator,
+    // 大失败！明明diagnostics内包含一个完整的diagnostics_arena，而非指针，怎么会设计成这样呢？设计得太差劲了！
     diagnostics_arena: std.heap.ArenaAllocator,
     diagnostics: diag.Diagnostics,
     producer_local: PrepRunner.Queue.ProducerLocal,

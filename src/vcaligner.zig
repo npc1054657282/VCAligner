@@ -22,6 +22,19 @@ pub const runtime_safety = switch (@import("builtin").mode) {
 // 全局变量，用于注册崩溃日志。
 pub var crash_dump: CrashDump = undefined;
 
+pub const Gpa = struct {
+    pub fn init() Gpa {
+        return .{};
+    }
+    pub fn deinit(self: *Gpa) void {
+        _ = self;
+    }
+    pub fn getAllocator(self: *Gpa) std.mem.Allocator {
+        _ = self;
+        return std.heap.c_allocator;
+    }
+};
+
 // var gpa: if (runtime_safety) std.heap.DebugAllocator(.{}) else void = if (runtime_safety) .init else {};
 
 pub fn getAllocator() std.mem.Allocator {
@@ -46,9 +59,8 @@ pub fn main() !void {
     // }
     crash_dump = .init(root_allocator);
     defer crash_dump.deinit();
-    const diagnostics_arena = std.heap.ArenaAllocator.init(root_allocator);
-    defer diagnostics_arena.deinit();
-    var diagnostics: diag.Diagnostics = .{ .arena = diagnostics_arena };
+    var diagnostics: diag.Diagnostics = .{ .arena = std.heap.ArenaAllocator.init(root_allocator) };
+    defer diagnostics.arena.deinit();
     var cli_runner = try cli.parseArgs(root_allocator);
     defer cli_runner.deinit(root_allocator);
     cli_runner.run(root_allocator, &diagnostics.last_diagnostic) catch |err| {

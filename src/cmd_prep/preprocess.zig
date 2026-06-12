@@ -39,9 +39,8 @@ pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: 
     if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
     defer {
         git_error_code = c.git_libgit2_shutdown();
-        const tmp_diagnostics_arena = std.heap.ArenaAllocator.init(allocator);
-        defer tmp_diagnostics_arena.deinit();
-        var tmp_diagnostics: diag.Diagnostics = .{ .arena = tmp_diagnostics_arena };
+        var tmp_diagnostics: diag.Diagnostics = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+        defer tmp_diagnostics.arena.deinit();
         c_helper.gitErrorCodeToZigError(git_error_code, &tmp_diagnostics.last_diagnostic) catch |err| tmp_diagnostics.log_all(err);
     }
     ctx.repo = blk: {
