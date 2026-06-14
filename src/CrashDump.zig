@@ -21,7 +21,7 @@ pub fn deinit(self: *CrashDump) void {
     self.registry.deinit(self.allocator);
 }
 
-pub fn reg(self: *CrashDump, comptime name: []const u8, id: usize, dumpable: *Dumpable) !void {
+pub fn reg(self: *CrashDump, comptime name: []const u8, id: usize, dumpable: *Dumpable) std.mem.Allocator.Error!void {
     const did: DumpableId = .{
         .name = blk: {
             var dest: [16:0]u8 = @splat(0);

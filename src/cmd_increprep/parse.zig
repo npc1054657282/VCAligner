@@ -44,19 +44,15 @@ const ParserStationsStorage = struct {
         lctx: ParserStation,
     };
     pub fn init(self: *ParserStationsStorage, n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-        self.* = .{
-            .task_in_queue_count = .{ ._ = {}, .v = .init(0) },
-            .main_parser_job = .{ ._ = {}, .lctx = .init(channel, allocator, last_diag) },
-            .sub_parser_jobs = allocator.alloc(SubParser, n_subparserjobs),
-        };
-        errdefer {
-            self.main_parser_job.lctx.deinit();
-            allocator.free(self.sub_parser_jobs);
-        }
+        self.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
+        self.main_parser_job = .{ ._ = {}, .lctx = .init(channel, allocator, last_diag) };
+        errdefer self.main_parser_job.lctx.deinit();
+        self.sub_parser_jobs = try allocator.alloc(SubParser, n_subparserjobs);
+        errdefer allocator.free(self.sub_parser_jobs);
         try vcaligner.crash_dump.reg("parser", 0, &self.main_parser_job.lctx.dumpable);
         errdefer vcaligner.crash_dump.unreg("parser", 0);
         const sub_parser_jobs_init_result: union(enum) { success: void, failed: struct {
-            err: @typeInfo(@typeInfo(@TypeOf(vcaligner.crash_dump.reg)).@"fn".return_type.?).error_union.error_set,
+            err: @typeInfo(@typeInfo(@TypeOf(vcaligner.CrashDump.reg)).@"fn".return_type.?).error_union.error_set,
             slice_id: usize,
         } } = blk: for (self.sub_parser_jobs, 0..) |*sub_parser_job, slice_id| {
             sub_parser_job.allocator_impl = .init();
@@ -67,8 +63,10 @@ const ParserStationsStorage = struct {
             sub_parser_job.lctx = .init(channel, sub_parser_allocator, &sub_parser_job.diagnostics.last_diagnostic);
             errdefer sub_parser_job.lctx.deinit();
             vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_job.lctx.dumpable) catch |err| break :blk .{
-                .err = err,
-                .slice_id = slice_id,
+                .failed = .{
+                    .err = err,
+                    .slice_id = slice_id,
+                },
             };
         } else .success;
         switch (sub_parser_jobs_init_result) {
@@ -106,7 +104,6 @@ const ParserStation = struct {
     allocator: std.mem.Allocator,
     last_diag: *diag.Diagnostic,
     producer_local: Queue.ProducerLocal,
-    comptime flush_threshold: usize = @import("write.zig").batch_threshold,
     // 以下内容为当前任务的缓存，下一个任务起重置。
     // TODO: 亟待重构
     current_task: struct {
@@ -216,26 +213,23 @@ pub fn mainParse(
     const queue: Queue = try .init(allocator, task_queue_capacity_log2);
     defer queue.deinit(allocator);
     var channel: Channel = .{ .mpsc_queue_ref = queue };
-    var parsers_lctxs_storage: ParserStationsStorage = undefined;
-    parsers_lctxs_storage.init(n_subparserjobs, &channel, allocator, last_diag);
-    defer parsers_lctxs_storage.deinit(allocator);
-    var parsers_pool: vcaligner.Pool = undefined;
-    try parsers_pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
-    defer parsers_pool.deinit();
-    var wait_group: std.Thread.WaitGroup = .{};
-    defer {
-        // TODO: 在报错的情况下，真的还需要把堆积的任务做完吗？预测如果升级到0.16，`defer`内的逻辑需要修改为取消，而此处的逻辑不再放在`defer`内。
-        parsers_pool.waitAndWork(&wait_group);
-        channel.notifyConsumerDone();
-    }
-    const ctx: IndexBuilderCbPayload = .{
+    var ctx: IndexBuilderCbPayload = .{
         .odb = odb,
         .commit_registry = commit_registry,
-        .parsers_lctxs_storage = &parsers_lctxs_storage,
         .task_queue_capacity_log2 = task_queue_capacity_log2,
-        .pool = &parsers_pool,
-        .wait_group = &wait_group,
+        .parsers_lctxs_storage = undefined,
+        .pool = undefined,
+        .wait_group = .{},
     };
+    try ctx.parsers_lctxs_storage.init(n_subparserjobs, &channel, allocator, last_diag);
+    defer ctx.parsers_lctxs_storage.deinit(allocator);
+    try ctx.pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
+    defer ctx.pool.deinit();
+    defer {
+        // TODO: 在报错的情况下，真的还需要把堆积的任务做完吗？预测如果升级到0.16，`defer`内的逻辑需要修改为取消，而此处的逻辑不再放在`defer`内。
+        ctx.pool.waitAndWork(&ctx.wait_group);
+        channel.notifyConsumerDone();
+    }
     const git_error_code = c.git_odb_foreach(odb, index_builder_cb, &ctx);
     try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
 }
@@ -243,10 +237,10 @@ pub fn mainParse(
 const IndexBuilderCbPayload = struct {
     odb: *c.git_odb,
     commit_registry: *CommitRegistry,
-    parsers_lctxs_storage: *ParserStationsStorage,
     task_queue_capacity_log2: u5,
-    pool: *vcaligner.Pool,
-    wait_group: *std.Thread.WaitGroup,
+    parsers_lctxs_storage: ParserStationsStorage,
+    pool: vcaligner.Pool,
+    wait_group: std.Thread.WaitGroup,
 };
 fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) c_int {
     var ctx: *IndexBuilderCbPayload = @ptrCast(@alignCast(payload.?));
@@ -285,7 +279,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     }
     // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
     // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
-    ctx.pool.spawnWgId(ctx.wait_group, subParseTask, .{ id.*, commit_seq });
+    ctx.pool.spawnWgId(&ctx.wait_group, subParseTask, .{ id.*, commit_seq });
     return 0;
 }
 

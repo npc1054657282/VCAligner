@@ -127,6 +127,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
                 unreachable;
             }
             std.debug.assert(git_error_code == 0);
+            return err;
         };
     };
     defer rocksdb_output.deinit(allocator);
