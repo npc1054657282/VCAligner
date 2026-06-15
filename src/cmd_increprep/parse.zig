@@ -25,84 +25,116 @@ pub const Parsed = struct {
     };
 };
 
-// 所有解析线程的上下文状态汇总
-const ParserStationsStorage = struct {
-    // XXX: 考虑使用一些本地缓冲方案来避免原子计数竞争。但是由于这些实现较为复杂且收益不确定，因此如果没有特别强的执念就算了。
-    task_in_queue_count: struct {
-        _: void align(std.atomic.cache_line),
-        v: std.atomic.Value(usize),
-    },
-    main_parser_job: struct {
-        _: void align(std.atomic.cache_line),
-        lctx: ParserStation,
-    },
-    sub_parser_jobs: []SubParser,
+const ParserBlocks = struct {
+    heap_ptr: *align(heap_align.toByteUnits()) Header,
+    main_parser_allocator: std.mem.Allocator,
+    main_parser_last_diag: *diag.Diagnostic,
+    n_subparserjobs: usize,
+    pub const Header = struct {
+        task_in_queue_count: struct {
+            _: void align(std.atomic.cache_line),
+            v: std.atomic.Value(usize),
+        },
+        main_parser_block: struct {
+            _: void align(std.atomic.cache_line),
+            station: ParserStation,
+        },
+        pub inline fn subParserBlocksPtr(heap_ptr: *Header) [*]SubParser {
+            return @ptrCast(@alignCast(@as([*]u8, @ptrCast(heap_ptr)) + sub_parser_blocks_offset));
+        }
+    };
+    pub const sub_parser_blocks_offset = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(SubParser));
+    pub fn heapSize(n_subparserjobs: usize) usize {
+        return sub_parser_blocks_offset + (@sizeOf(SubParser) * n_subparserjobs);
+    }
+    pub const heap_align: std.mem.Alignment = .max(.of(Header), .of(SubParser));
     pub const SubParser = struct {
         _: void align(std.atomic.cache_line),
         allocator_impl: vcaligner.Gpa,
         diagnostics: diag.Diagnostics,
-        lctx: ParserStation,
+        station: ParserStation,
     };
-    pub fn init(self: *ParserStationsStorage, n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-        self.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
-        self.main_parser_job = .{ ._ = {}, .lctx = .init(channel, allocator, last_diag) };
-        errdefer self.main_parser_job.lctx.deinit();
-        self.sub_parser_jobs = try allocator.alloc(SubParser, n_subparserjobs);
-        errdefer allocator.free(self.sub_parser_jobs);
-        try vcaligner.crash_dump.reg("parser", 0, &self.main_parser_job.lctx.dumpable);
+    pub fn init(n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParserBlocks {
+        const raw = try allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
+        errdefer allocator.free(raw);
+        const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
+        heap_ptr.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
+        heap_ptr.main_parser_block = .{ ._ = {}, .station = .init(channel, allocator) };
+        errdefer heap_ptr.main_parser_block.station.deinit();
+        try vcaligner.crash_dump.reg("parser", 0, &heap_ptr.main_parser_block.station.dumpable);
         errdefer vcaligner.crash_dump.unreg("parser", 0);
-        const sub_parser_jobs_init_result: union(enum) { success: void, failed: struct {
-            err: @typeInfo(@typeInfo(@TypeOf(vcaligner.CrashDump.reg)).@"fn".return_type.?).error_union.error_set,
+        const sub_parser_blocks: []SubParser = heap_ptr.subParserBlocksPtr()[0..n_subparserjobs];
+        const sub_parser_blocks_init_result: union(enum) { success: void, failed: struct {
+            err: std.mem.Allocator.Error,
             slice_id: usize,
-        } } = blk: for (self.sub_parser_jobs, 0..) |*sub_parser_job, slice_id| {
-            sub_parser_job.allocator_impl = .init();
-            errdefer sub_parser_job.allocator_impl.deinit();
-            const sub_parser_allocator = sub_parser_job.allocator_impl.getAllocator();
-            sub_parser_job.diagnostics = .{ .arena = .init(sub_parser_allocator) };
-            errdefer sub_parser_job.diagnostics.arena.deinit();
-            sub_parser_job.lctx = .init(channel, sub_parser_allocator, &sub_parser_job.diagnostics.last_diagnostic);
-            errdefer sub_parser_job.lctx.deinit();
-            vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_job.lctx.dumpable) catch |err| break :blk .{
+        } } = blk: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
+            sub_parser_block.allocator_impl = .init();
+            errdefer sub_parser_block.allocator_impl.deinit();
+            const sub_parser_allocator = sub_parser_block.allocator_impl.getAllocator();
+            sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
+            errdefer sub_parser_block.diagnostics.arena.deinit();
+            sub_parser_block.station = .init(channel, sub_parser_allocator);
+            errdefer sub_parser_block.station.deinit();
+            vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_block.station.dumpable) catch |err| break :blk .{
                 .failed = .{
                     .err = err,
                     .slice_id = slice_id,
                 },
             };
         } else .success;
-        switch (sub_parser_jobs_init_result) {
-            .success => return,
-            .failed => |failed| {
+        return switch (sub_parser_blocks_init_result) {
+            .failed => |failed| ret: {
                 for (0..failed.slice_id) |slice_id| {
                     vcaligner.crash_dump.unreg("parser", slice_id + 1);
-                    const sub_parser_job = &self.sub_parser_jobs[slice_id];
-                    sub_parser_job.lctx.deinit();
-                    sub_parser_job.diagnostics.arena.deinit();
-                    sub_parser_job.allocator_impl.deinit();
+                    const sub_parser_block = &sub_parser_blocks[slice_id];
+                    sub_parser_block.station.deinit();
+                    sub_parser_block.diagnostics.arena.deinit();
+                    sub_parser_block.allocator_impl.deinit();
                 }
-                return failed.err;
+                break :ret failed.err;
             },
-        }
+            .success => .{
+                .heap_ptr = heap_ptr,
+                .main_parser_allocator = allocator,
+                .main_parser_last_diag = last_diag,
+                .n_subparserjobs = n_subparserjobs,
+            },
+        };
     }
-    pub fn deinit(self: *ParserStationsStorage, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: ParserBlocks, allocator: std.mem.Allocator) void {
         vcaligner.crash_dump.unreg("parser", 0);
-        self.main_parser_job.lctx.deinit();
-        for (self.sub_parser_jobs, 1..) |*sub_parser_job, thread_id| {
+        self.heap_ptr.main_parser_block.station.deinit();
+        const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
+        for (sub_parser_blocks, 1..) |*sub_parser_block, thread_id| {
             vcaligner.crash_dump.unreg("parser", thread_id);
-            sub_parser_job.lctx.deinit();
-            sub_parser_job.diagnostics.arena.deinit();
-            sub_parser_job.allocator_impl.deinit();
+            sub_parser_block.station.deinit();
+            sub_parser_block.diagnostics.arena.deinit();
+            sub_parser_block.allocator_impl.deinit();
         }
-        allocator.free(self.sub_parser_jobs);
+        const raw = @as([*]align(heap_align.toByteUnits()) u8, @ptrCast(self.heap_ptr))[0..heapSize(self.n_subparserjobs)];
+        allocator.free(raw);
     }
-    pub inline fn lctxFromThreadId(self: *ParserStationsStorage, thread_id: usize) *ParserStation {
-        if (thread_id == 0) return &self.main_parser_job.lctx;
-        return &self.sub_parser_jobs[thread_id - 1].lctx;
+    pub fn lctxFromThreadId(self: ParserBlocks, thread_id: usize) struct {
+        std.mem.Allocator,
+        *diag.Diagnostic,
+        *ParserStation,
+    } {
+        if (thread_id == 0) return .{
+            self.main_parser_allocator,
+            self.main_parser_last_diag,
+            &self.heap_ptr.main_parser_block.station,
+        };
+        const sub_parser_block: *SubParser = &self.heap_ptr.subParserBlocksPtr()[0..heapSize(self.n_subparserjobs)][thread_id - 1];
+        return .{
+            sub_parser_block.allocator_impl.getAllocator(),
+            &sub_parser_block.diagnostics.last_diagnostic,
+            &sub_parser_block.station,
+        };
     }
 };
+
 // 各个解析线程的本地上下文。
 const ParserStation = struct {
-    allocator: std.mem.Allocator,
-    last_diag: *diag.Diagnostic,
     producer_local: Queue.ProducerLocal,
     // 以下内容为当前任务的缓存，下一个任务起重置。
     // TODO: 亟待重构
@@ -115,10 +147,8 @@ const ParserStation = struct {
     // 当全局崩溃时，打印相关信息。目前打印arena分配的空间大小。
     dumpable: vcaligner.CrashDump.Dumpable,
 
-    pub fn init(channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) ParserStation {
+    pub fn init(channel: *Channel, allocator: std.mem.Allocator) ParserStation {
         return .{
-            .allocator = allocator,
-            .last_diag = last_diag,
             .producer_local = channel.mpsc_queue_ref.initProducerLocal(),
             .current_task = .{
                 .arena = .init(allocator),
@@ -221,7 +251,7 @@ pub fn mainParse(
         .pool = undefined,
         .wait_group = .{},
     };
-    try ctx.parsers_lctxs_storage.init(n_subparserjobs, &channel, allocator, last_diag);
+    ctx.parsers_lctxs_storage = try .init(n_subparserjobs, &channel, allocator, last_diag);
     defer ctx.parsers_lctxs_storage.deinit(allocator);
     try ctx.pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
     defer ctx.pool.deinit();
@@ -238,7 +268,7 @@ const IndexBuilderCbPayload = struct {
     odb: *c.git_odb,
     commit_registry: *CommitRegistry,
     task_queue_capacity_log2: u5,
-    parsers_lctxs_storage: ParserStationsStorage,
+    parsers_lctxs_storage: ParserBlocks,
     pool: vcaligner.Pool,
     wait_group: std.Thread.WaitGroup,
 };
@@ -267,7 +297,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
         vcaligner.crash_dump.dumpAndCrash(@src());
     };
     // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
-    const task_in_queue_count = ctx.parsers_lctxs_storage.task_in_queue_count.v.fetchAdd(1, .acquire);
+    const task_in_queue_count = ctx.parsers_lctxs_storage.heap_ptr.task_in_queue_count.v.fetchAdd(1, .acquire);
     if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
         const run_node = blk: {
             ctx.pool.mutex.lock();
@@ -279,12 +309,22 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     }
     // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
     // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
-    ctx.pool.spawnWgId(&ctx.wait_group, subParseTask, .{ id.*, commit_seq });
+    ctx.pool.spawnWgId(&ctx.wait_group, subParseTask, .{ ctx.parsers_lctxs_storage, id.*, commit_seq });
     return 0;
 }
 
-pub fn subParseTask(thrd_id: usize, commit_hash: c.git_oid, commit_seq: vcaligner.rocksdb_custom.CommitSeq) void {
-    _ = thrd_id;
+pub fn subParseTask(
+    thrd_id: usize,
+    parsers_lctxs_storage: ParserBlocks,
+    commit_hash: c.git_oid,
+    commit_seq: vcaligner.rocksdb_custom.CommitSeq,
+) void {
+    const allocator, const last_diag, const lctx = parsers_lctxs_storage.lctxFromThreadId(thrd_id);
+    // 进入解析，降低积压的`task_in_queue_count`
+    _ = parsers_lctxs_storage.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
+    _ = allocator;
+    _ = last_diag;
+    _ = lctx;
     _ = commit_hash;
     _ = commit_seq;
 }
