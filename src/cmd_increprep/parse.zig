@@ -11,21 +11,28 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 
 pub const Queue = @import("mpsc_queue").AnyMpscQueue(Parsed, null);
 pub const Channel = vcaligner.MpscChannel(Queue);
+// XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
+// 注意，这并不代表它包含一个commit及其对应的所有blob-path。
+// 因为一个commit如果对应的blob-path过多，它可能被切割为多个`Parsed`。
+// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。这可能要求此结构变得复杂一些。
+// 目前的考虑是实践中大体量的仓库一般各个commit包含的blob-path都很多。而小体量的仓库不需要为此特别考虑优化。
 pub const Parsed = struct {
+    // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
+    // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
+    // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
     arena: StArena,
     commit_seq: CommitSeq,
-    // XXX: 考虑`MultiArrayList`，但是实际使用有些困难，因为实际上我的需求是要为key与path本身设计列表，也要为key的指针设计列表。
-    // 如果`MultiArrayList`的各个成员之间有地址依赖，该怎么设计，我感到头疼。因此目前依然是设计为分开的`ArrayList`
-    // 可能并非必要，因为已经在arena中分配？
-    // path_strings: std.ArrayList(u8),
     parsed_units: std.ArrayList(ParsedUnit),
     pub const ParsedUnit = struct {
-        path: []u8,
         blob_hash: c.git_oid,
+        // `path`的所有权属于`Parsed`内的`arena`。
+        path: []u8,
     };
 };
 
-const ParserBlocks = struct {
+// XXX: 原计划将`repo`也作为上下文放入此处。但是考虑到未来未来的扩容性：
+// 将来可能将程序设计为服务器式的，所有解析线程并非只分析一个repo而可能分析数个repo。因此依然将repo以参数形式传入而非放入此上下文中。
+const ParsersHub = struct {
     heap_ptr: *align(heap_align.toByteUnits()) Header,
     main_parser_allocator: std.mem.Allocator,
     main_parser_last_diag: *diag.Diagnostic,
@@ -50,11 +57,11 @@ const ParserBlocks = struct {
     pub const heap_align: std.mem.Alignment = .max(.of(Header), .of(SubParser));
     pub const SubParser = struct {
         _: void align(std.atomic.cache_line),
-        allocator_impl: vcaligner.Gpa,
+        allocator_state: vcaligner.Gpa,
         diagnostics: diag.Diagnostics,
         station: ParserStation,
     };
-    pub fn init(n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParserBlocks {
+    pub fn init(n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParsersHub {
         const raw = try allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
         errdefer allocator.free(raw);
         const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
@@ -68,9 +75,9 @@ const ParserBlocks = struct {
             err: std.mem.Allocator.Error,
             slice_id: usize,
         } } = blk: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
-            sub_parser_block.allocator_impl = .init();
-            errdefer sub_parser_block.allocator_impl.deinit();
-            const sub_parser_allocator = sub_parser_block.allocator_impl.getAllocator();
+            sub_parser_block.allocator_state = .init();
+            errdefer sub_parser_block.allocator_state.deinit();
+            const sub_parser_allocator = sub_parser_block.allocator_state.getAllocator();
             sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
             errdefer sub_parser_block.diagnostics.arena.deinit();
             sub_parser_block.station = .init(channel, sub_parser_allocator);
@@ -89,7 +96,7 @@ const ParserBlocks = struct {
                     const sub_parser_block = &sub_parser_blocks[slice_id];
                     sub_parser_block.station.deinit();
                     sub_parser_block.diagnostics.arena.deinit();
-                    sub_parser_block.allocator_impl.deinit();
+                    sub_parser_block.allocator_state.deinit();
                 }
                 break :ret failed.err;
             },
@@ -101,7 +108,7 @@ const ParserBlocks = struct {
             },
         };
     }
-    pub fn deinit(self: ParserBlocks, allocator: std.mem.Allocator) void {
+    pub fn deinit(noalias self: *const ParsersHub, allocator: std.mem.Allocator) void {
         vcaligner.crash_dump.unreg("parser", 0);
         self.heap_ptr.main_parser_block.station.deinit();
         const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
@@ -109,12 +116,12 @@ const ParserBlocks = struct {
             vcaligner.crash_dump.unreg("parser", thread_id);
             sub_parser_block.station.deinit();
             sub_parser_block.diagnostics.arena.deinit();
-            sub_parser_block.allocator_impl.deinit();
+            sub_parser_block.allocator_state.deinit();
         }
         const raw = @as([*]align(heap_align.toByteUnits()) u8, @ptrCast(self.heap_ptr))[0..heapSize(self.n_subparserjobs)];
         allocator.free(raw);
     }
-    pub fn lctxFromThreadId(self: ParserBlocks, thread_id: usize) struct {
+    pub fn lctxFromThreadId(noalias self: *const ParsersHub, thread_id: usize) struct {
         std.mem.Allocator,
         *diag.Diagnostic,
         *ParserStation,
@@ -126,7 +133,7 @@ const ParserBlocks = struct {
         };
         const sub_parser_block: *SubParser = &self.heap_ptr.subParserBlocksPtr()[0..heapSize(self.n_subparserjobs)][thread_id - 1];
         return .{
-            sub_parser_block.allocator_impl.getAllocator(),
+            sub_parser_block.allocator_state.getAllocator(),
             &sub_parser_block.diagnostics.last_diagnostic,
             &sub_parser_block.station,
         };
@@ -136,38 +143,41 @@ const ParserBlocks = struct {
 // 各个解析线程的本地上下文。
 const ParserStation = struct {
     producer_local: Queue.ProducerLocal,
-    // 以下内容为当前任务的缓存，下一个任务起重置。
-    // TODO: 亟待重构
-    current_task: struct {
-        arena: StArena,
-        commit_seq: CommitSeq,
-    },
-    // 以下内容为当前批次内容，flush过了就重置。
+    // 此arena是本解析线程的所有任务共用的一个arena，每个新任务开始时重置，主要保存一些递归解析过程中不会传递给最终消费者的当前任务临时缓存。
+    // scratch的命名idea[来自](https://ziggit.dev/t/allocators-best-practices-anti-patterns/14043/5)
+    // XXX: 当前的实现并没有更广泛地为了消除重复解析而加入整个线程级的缓存，如果采用了，那么此arena可能会改名且不再会在每次任务开始时重置。
+    // （当然，若如此实现，也可能此scratch保留而额外增加线程级缓存与对应arena）
+    current_task_scratch_arena: StArena,
+    // `to_flush`为当前批次内容，flush过了就重置。
+    // NOTE: 在当前实现中，`to_flush`作为批次，不会跨任务存在。之所以把它放在此上下文中，是考虑到未来可能更改实现使得它可以跨任务存在。
     to_flush: Parsed,
+    // 这个东西完全是为了方便Dumpable去dump才定义的。实际上它完全和`to_flush`里的`commit_seq`重复。
+    // TODO: 当dump机制被彻底弃用后，删除此字段。
+    maybe_commit_seq_to_dump: ?CommitSeq,
     // 当全局崩溃时，打印相关信息。目前打印arena分配的空间大小。
+    // TODO: 此机制终将被彻底弃用。
     dumpable: vcaligner.CrashDump.Dumpable,
 
     pub fn init(channel: *Channel, allocator: std.mem.Allocator) ParserStation {
         return .{
             .producer_local = channel.mpsc_queue_ref.initProducerLocal(),
-            .current_task = .{
-                .arena = .init(allocator),
-                //TODO: 缺省未定义的`commit_seq`在`dumpFn`打印时不安全。当dump机制被彻底弃用后，消除此TODO。
-                .commit_seq = undefined,
-            },
+            .current_task_scratch_arena = .init(allocator),
             .to_flush = undefined,
+            .maybe_commit_seq_to_dump = null,
             .dumpable = .{ .dumpFn = dumpFn },
         };
     }
     pub fn deinit(self: *ParserStation) void {
-        self.current_task.arena.deinit();
+        self.current_task_scratch_arena.deinit();
         self.* = undefined;
     }
     fn dumpFn(dumpable: *vcaligner.CrashDump.Dumpable) void {
         const parsing: *ParserStation = @alignCast(@fieldParentPtr("dumpable", dumpable));
         // TODO：弃用CrashDump！崩溃时打印，会由崩溃线程打印其它线程的信息。此处的信息获取存在数据竞争。CrashDump应当被完全废弃。
-        std.log.info("task capacity: {d}\n", .{parsing.current_task.arena.queryCapacity()});
-        std.log.info("commit_seq: {d}\n", .{parsing.current_task.commit_seq.toNative()});
+        std.log.info("task capacity: {d}\n", .{parsing.current_task_scratch_arena.queryCapacity()});
+        if (parsing.maybe_commit_seq_to_dump) |commit_seq_to_dump| {
+            std.log.info("commit_seq: {d}\n", .{commit_seq_to_dump.toNative()});
+        }
     }
 };
 
@@ -244,15 +254,16 @@ pub fn mainParse(
     defer queue.deinit(allocator);
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     var ctx: IndexBuilderCbPayload = .{
+        .repo = repo,
         .odb = odb,
         .commit_registry = commit_registry,
         .task_queue_capacity_log2 = task_queue_capacity_log2,
-        .parsers_lctxs_storage = undefined,
+        .parsers_ctx = undefined,
         .pool = undefined,
         .wait_group = .{},
     };
-    ctx.parsers_lctxs_storage = try .init(n_subparserjobs, &channel, allocator, last_diag);
-    defer ctx.parsers_lctxs_storage.deinit(allocator);
+    ctx.parsers_ctx = try .init(n_subparserjobs, &channel, allocator, last_diag);
+    defer ctx.parsers_ctx.deinit(allocator);
     try ctx.pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
     defer ctx.pool.deinit();
     defer {
@@ -260,71 +271,136 @@ pub fn mainParse(
         ctx.pool.waitAndWork(&ctx.wait_group);
         channel.notifyConsumerDone();
     }
-    const git_error_code = c.git_odb_foreach(odb, index_builder_cb, &ctx);
-    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+    const git_error_code_or_customized_error_code = c.git_odb_foreach(odb, index_builder_cb, &ctx);
+    if (git_error_code_or_customized_error_code > 0) {
+        const customized_error_enum: IndexBuilderCbCustomizedErrorEnum = .fromBackingInt(git_error_code_or_customized_error_code);
+        return customized_error_enum.toError();
+    }
+    try c_helper.gitErrorCodeToZigError(git_error_code_or_customized_error_code, last_diag);
 }
 
+// NOTE: 依个人风格，一般不把可变内容与不可变内容集中在一个结构体中放置。
+// 但这是特殊情况，因为这是一个用于C系函数的回调payload结构体，因此采用混合结构体的模式。
 const IndexBuilderCbPayload = struct {
+    repo: *c.git_repository,
     odb: *c.git_odb,
     commit_registry: *CommitRegistry,
     task_queue_capacity_log2: u5,
-    parsers_lctxs_storage: ParserBlocks,
+    parsers_ctx: ParsersHub,
     pool: vcaligner.Pool,
     wait_group: std.Thread.WaitGroup,
 };
+const IndexBuilderCbCustomizedError = std.mem.Allocator.Error;
+const IndexBuilderCbCustomizedErrorEnum = vcaligner.ErrorEnumFromErrorSet(IndexBuilderCbCustomizedError, c_int, 1, 1);
+// NOTE: 关于错误返回值：由于所有的git_error_code都小于0，我们约定小于0的是git_error_code，大于0的是自定义错误。
 fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) c_int {
     var ctx: *IndexBuilderCbPayload = @ptrCast(@alignCast(payload.?));
-    const obj_type: c.git_object_t = blk: {
-        var obj: ?*c.git_odb_object = undefined;
-        const git_error_code = c.git_odb_read(@as([*c]?*c.git_odb_object, &obj), ctx.odb, id);
-        if (git_error_code != 0) return git_error_code;
-        defer c.git_odb_object_free(obj);
-        break :blk c.git_odb_object_type(obj);
-    };
-    // 只处理commit对象
-    if (obj_type != c.GIT_OBJECT_COMMIT) return 0;
-    // NOTE: 遍历过程中，可能出现重复的对象。
-    // 参见<https://stackoverflow.com/questions/41050175/why-do-i-see-duplicate-object-ids-when-using-git-odb-foreach>。
-    // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
-    // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
-    // 引入增量模式后，已经分析过的commit在开头就被分析过一次了，因此此处的基于hash表的逻辑再次用于在增量模式中跳过已有commit。
-    // XXX: 考虑允许配置为另一种并非直接遍历所有commit，而是基于对每个后端按树型遍历的模式。可能在增量中更有优势，但不确定。
-    if (ctx.commit_registry.map.contains(id.*)) return 0;
-    // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
-    const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
-    ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
-        std.log.err("Commit regisistry put no clobber failed.\n", .{});
-        vcaligner.crash_dump.dumpAndCrash(@src());
-    };
-    // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
-    const task_in_queue_count = ctx.parsers_lctxs_storage.heap_ptr.task_in_queue_count.v.fetchAdd(1, .acquire);
-    if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
-        const run_node = blk: {
-            ctx.pool.mutex.lock();
-            defer ctx.pool.mutex.unlock();
-            break :blk ctx.pool.run_queue.popFirst() orelse break :help_do_work;
+    const customized_error = main_logic_customized_error: {
+        const obj_type: c.git_object_t = blk: {
+            var obj: ?*c.git_odb_object = undefined;
+            const git_error_code = c.git_odb_read(@as([*c]?*c.git_odb_object, &obj), ctx.odb, id);
+            if (git_error_code != 0) return git_error_code;
+            defer c.git_odb_object_free(obj);
+            break :blk c.git_odb_object_type(obj);
         };
-        const runnable: *vcaligner.Pool.Runnable = @fieldParentPtr("node", run_node);
-        runnable.runFn(runnable, 0);
-    }
-    // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
-    // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
-    ctx.pool.spawnWgId(&ctx.wait_group, subParseTask, .{ ctx.parsers_lctxs_storage, id.*, commit_seq });
-    return 0;
+        // 只处理commit对象
+        if (obj_type != c.GIT_OBJECT_COMMIT) return 0;
+        // NOTE: 遍历过程中，可能出现重复的对象。
+        // 参见<https://stackoverflow.com/questions/41050175/why-do-i-see-duplicate-object-ids-when-using-git-odb-foreach>。
+        // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
+        // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
+        // 引入增量模式后，已经分析过的commit在开头就被分析过一次了，因此此处的基于hash表的逻辑再次用于在增量模式中跳过已有commit。
+        // XXX: 考虑允许配置为另一种并非直接遍历所有commit，而是基于对每个后端按树型遍历的模式。可能在增量中更有优势，但不确定。
+        if (ctx.commit_registry.map.contains(id.*)) return 0;
+        // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
+        const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
+        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch |err| {
+            std.log.err("Commit regisistry put no clobber failed.\n", .{});
+            break :main_logic_customized_error err;
+        };
+        // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
+        const task_in_queue_count = ctx.parsers_ctx.heap_ptr.task_in_queue_count.v.fetchAdd(1, .acquire);
+        if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
+            const run_node = blk: {
+                ctx.pool.mutex.lock();
+                defer ctx.pool.mutex.unlock();
+                break :blk ctx.pool.run_queue.popFirst() orelse break :help_do_work;
+            };
+            const runnable: *vcaligner.Pool.Runnable = @fieldParentPtr("node", run_node);
+            runnable.runFn(runnable, 0);
+        }
+        // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
+        // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
+        // NOTE: 为什么此处使用`@call`？为了确保`.always_inline`起作用。为什么这里必须内联？因为此处的`ctx.parsers_ctx`必须拷贝。
+        // 考虑到zig将要移除PRO，此处的拷贝会在内部进行一次重复，这令我感到不满。因此选择必定内联来消除此次重复，因为subParseTask在源码中只在此处被调用。
+        @call(.always_inline, vcaligner.Pool.spawnWgId, .{
+            &ctx.pool,
+            &ctx.wait_group,
+            subParseTask,
+            .{ ctx.parsers_ctx, id.*, commit_seq, ctx.repo },
+        });
+        return 0;
+    };
+    std.debug.assert(IndexBuilderCbCustomizedError == @TypeOf(customized_error));
+    const customized_error_enum: IndexBuilderCbCustomizedErrorEnum = .fromError(customized_error);
+    return customized_error_enum.toBackingInt();
 }
 
 pub fn subParseTask(
     thrd_id: usize,
-    parsers_lctxs_storage: ParserBlocks,
+    ctx: ParsersHub,
     commit_hash: c.git_oid,
     commit_seq: vcaligner.rocksdb_custom.CommitSeq,
+    repo: *c.git_repository,
 ) void {
-    const allocator, const last_diag, const lctx = parsers_lctxs_storage.lctxFromThreadId(thrd_id);
     // 进入解析，降低积压的`task_in_queue_count`
-    _ = parsers_lctxs_storage.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
-    _ = allocator;
-    _ = last_diag;
+    _ = ctx.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
+    const allocator, const last_diag, const lctx = ctx.lctxFromThreadId(thrd_id);
+    defer {
+        if (!lctx.current_task_scratch_arena.reset(.retain_capacity)) {
+            std.log.warn("Retain capacity failed, free all", .{});
+        }
+    }
+    lctx.to_flush = .{
+        .arena = .init(allocator),
+        .commit_seq = commit_seq,
+        .parsed_units = .empty,
+    };
+    // 交由写线程释放。
+    lctx.maybe_commit_seq_to_dump = commit_seq;
+
+    (main_logic: {
+        const commit: *c.git_commit = blk: {
+            var commit: ?*c.git_commit = undefined;
+            const git_error_code = c.git_commit_lookup(&commit, repo, &commit_hash);
+            c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| break :main_logic err;
+            break :blk commit.?;
+        };
+        defer c.git_commit_free(commit);
+        const tree: *c.git_tree = blk: {
+            var tree: ?*c.git_tree = undefined;
+            const git_error_code = c.git_commit_tree(&tree, commit);
+            c_helper.gitErrorCodeToZigError(git_error_code, last_diag) catch |err| break :main_logic err;
+            break :blk tree.?;
+        };
+        defer c.git_tree_free(tree);
+        parse_tree(lctx, tree, &@as([0]u8, .{})) catch |err| break :main_logic err;
+        flush_relation_batch(lctx) catch |err| break :main_logic err;
+        break :main_logic {};
+    }) catch |err| {
+        const diagnostics: *diag.Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diag));
+        diagnostics.log_all(err);
+        diagnostics.clear();
+        vcaligner.crash_dump.dumpAndCrash(@src());
+    };
+}
+
+fn parse_tree(lctx: *ParserStation, tree: *const c.git_tree, base_path: []const u8) !void {
     _ = lctx;
-    _ = commit_hash;
-    _ = commit_seq;
+    _ = tree;
+    _ = base_path;
+}
+
+fn flush_relation_batch(lctx: *ParserStation) !void {
+    _ = lctx;
 }

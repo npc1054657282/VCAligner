@@ -121,7 +121,7 @@ fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_p
                     break :blk subtree.?;
                 };
                 defer c.git_tree_free(subtree);
-                const full_path = blk: {
+                const child_path = blk: {
                     const entry_name = c.git_tree_entry_name(entry);
                     const entry_name_slice: []const u8 = std.mem.span(entry_name);
                     if (base_path.len == 0) {
@@ -133,8 +133,8 @@ fn parse_tree(gctx: *PrepRunner, lctx: *Parsing, tree: *const c.git_tree, base_p
                     try builder.appendSlice(lctx.current_task.arena.allocator(), entry_name_slice);
                     break :blk try builder.toOwnedSlice(lctx.current_task.arena.allocator());
                 };
-                defer lctx.current_task.arena.allocator().free(full_path);
-                try parse_tree(gctx, lctx, subtree, full_path);
+                defer lctx.current_task.arena.allocator().free(child_path);
+                try parse_tree(gctx, lctx, subtree, child_path);
             },
             c.GIT_OBJECT_BLOB => {
                 // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。

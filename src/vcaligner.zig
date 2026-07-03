@@ -10,6 +10,7 @@ pub const CrashDump = @import("CrashDump.zig");
 pub const rocksdb_custom = @import("rocksdb_custom.zig");
 pub const commit_range = @import("commit_range.zig");
 pub const pid = @import("pid.zig");
+pub const ErrorEnumFromErrorSet = @import("error_enum.zig").ErrorEnumFromErrorSet;
 // 0.16起，zig的Arena采用线程安全模式。我的项目里不会存在任何线程安全需求的Arena，因此我会使用原线程不安全版本。
 // 虽然当前代码仍然基于0.15.2版本，但出于向前兼容考虑，定义`StArena`为线程不安全的Arena，将尽可能替代源代码里标准库的Arena。
 pub const StArena = @import("thread_unsafe_arena.zig").ArenaAllocator;

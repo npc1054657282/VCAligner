@@ -37,7 +37,7 @@ pub const Diagnostic = union {
     GIT_ERROR: c_helper.DiagnosticGIT_ERROR,
     UnknownCError: c_helper.DiagnosticUnknownCError,
     pub fn enterStack(last_diagnostic: *@This(), last_error: anyerror) !void {
-        var diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+        var diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         if (diagnostics.double_error != null) {
             return last_error;
         }
@@ -48,11 +48,11 @@ pub const Diagnostic = union {
         last_diagnostic.* = undefined;
     }
     pub fn getAllocator(last_diagnostic: *@This()) std.mem.Allocator {
-        const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+        const diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         return diagnostics.arena.allocator();
     }
     pub fn unableToConstructDiagnostic(last_diagnostic: *@This(), err: anyerror) error{UnableToConstructDiagnostic}!void {
-        const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+        const diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         diagnostics.double_error = err;
         return error.UnableToConstructDiagnostic;
     }
