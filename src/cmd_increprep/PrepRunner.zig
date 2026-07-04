@@ -70,7 +70,7 @@ mode_conf: union(Mode) {
 n_jobs: usize,
 n_rocksdbjobs: c_int,
 default_cf_max_write_buffer_number: c_int,
-task_queue_capacity_log2: u5,
+parsed_queue_capacity_log2: u5,
 compression: bool,
 // 采集本进程的pid与一个时间戳，用于生成本进程唯一信息，可用于临时文件命名。
 // XXX: 未来可能移动至cli.Runner.Global，但目前的ana确实无此需求。
@@ -149,7 +149,7 @@ pub const cmd = blk: {
             \\
         ))
         // vcaligner的解析工作通过环形缓冲区实现，这同样意味着vcaligner的解析内容的缓存。此选项为解析缓存数据的容量的底数。
-        .arg(zargs.Arg.optArg("task_queue_capacity_log2", u5).long("task-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)).help(
+        .arg(zargs.Arg.optArg("parsed_queue_capacity_log2", u5).long("parsed-queue-capacity-log2").default(8).ranges(zargs.Ranges(u5).new().u(5, 20)).help(
             \\Base-2 logarithm of the parser's ring buffer capacity. 
         ++ cli.helpNewLine(cmd_config) ++
             \\This determines the maximum amount of parsed data cached in memory.
@@ -275,7 +275,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         .n_jobs = n_jobs,
         .n_rocksdbjobs = n_rocksdbjobs,
         .default_cf_max_write_buffer_number = default_cf_max_write_buffer_number,
-        .task_queue_capacity_log2 = args.task_queue_capacity_log2,
+        .parsed_queue_capacity_log2 = args.parsed_queue_capacity_log2,
         .compression = !args.no_compression,
         .proc_stamp = .{
             .pid = vcaligner.pid.get(),

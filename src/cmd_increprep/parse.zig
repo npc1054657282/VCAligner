@@ -6,29 +6,11 @@ const StArena = vcaligner.StArena;
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CommitRegistry = @import("preprocess.zig").CommitRegistry;
+const Parsed = @import("preprocess.zig").Parsed;
+const Queue = @import("preprocess.zig").Queue;
+const Channel = @import("preprocess.zig").Channel;
 
 const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
-
-pub const Queue = @import("mpsc_queue").AnyMpscQueue(Parsed, null);
-pub const Channel = vcaligner.MpscChannel(Queue);
-// XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
-// 注意，这并不代表它包含一个commit及其对应的所有blob-path。
-// 因为一个commit如果对应的blob-path过多，它可能被切割为多个`Parsed`。
-// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。这可能要求此结构变得复杂一些。
-// 目前的考虑是实践中大体量的仓库一般各个commit包含的blob-path都很多。而小体量的仓库不需要为此特别考虑优化。
-pub const Parsed = struct {
-    // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
-    // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
-    // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
-    arena: StArena,
-    commit_seq: CommitSeq,
-    parsed_units: std.ArrayList(ParsedUnit),
-    pub const ParsedUnit = struct {
-        blob_hash: c.git_oid,
-        // `path`的所有权属于`Parsed`内的`arena`。
-        path: []u8,
-    };
-};
 
 // XXX: 原计划将`repo`也作为上下文放入此处。但是考虑到未来未来的扩容性：
 // 将来可能将程序设计为服务器式的，所有解析线程并非只分析一个repo而可能分析数个repo。因此依然将repo以参数形式传入而非放入此上下文中。
@@ -185,7 +167,7 @@ const ParserStation = struct {
 // 因此，相比主线程无法得知解析线程出错，还不如出错就崩溃。
 pub fn mainParseTaskTakeRepo(
     repo: *c.git_repository,
-    task_queue_capacity_log2: u5,
+    channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
     allocator: std.mem.Allocator,
@@ -201,9 +183,11 @@ pub fn mainParseTaskTakeRepo(
         // 注意repo的生命周期必须短于libgit2全局资源，但是目前假定libgit2全局资源的报错将无法使用`defer`，因此封装进单独块。
         (main_parse_except_shutdown_libgit2: {
             defer c.git_repository_free(repo);
+            // 主解析线程的任务错误都需要确保通知写线程停止以避免写线程死锁。
+            defer channel.notifyConsumerDone();
             break :main_parse_except_shutdown_libgit2 mainParse(
                 repo,
-                task_queue_capacity_log2,
+                channel,
                 n_subparserjobs,
                 commit_registry,
                 allocator,
@@ -237,7 +221,7 @@ pub fn mainParseTaskTakeRepo(
 
 pub fn mainParse(
     repo: *c.git_repository,
-    task_queue_capacity_log2: u5,
+    channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
     allocator: std.mem.Allocator,
@@ -250,27 +234,24 @@ pub fn mainParse(
         break :blk odb.?;
     };
     defer c.git_odb_free(odb);
-    const queue: Queue = try .init(allocator, task_queue_capacity_log2);
-    defer queue.deinit(allocator);
-    var channel: Channel = .{ .mpsc_queue_ref = queue };
     var ctx: IndexBuilderCbPayload = .{
         .repo = repo,
         .odb = odb,
         .commit_registry = commit_registry,
-        .task_queue_capacity_log2 = task_queue_capacity_log2,
+        .channel = channel,
+        .pending_tasks_backpressure = n_subparserjobs * backpressure_multiplier: {
+            break :backpressure_multiplier 8;
+        },
         .parsers_ctx = undefined,
         .pool = undefined,
         .wait_group = .{},
     };
-    ctx.parsers_ctx = try .init(n_subparserjobs, &channel, allocator, last_diag);
+    ctx.parsers_ctx = try .init(n_subparserjobs, channel, allocator, last_diag);
     defer ctx.parsers_ctx.deinit(allocator);
     try ctx.pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
     defer ctx.pool.deinit();
-    defer {
-        // TODO: 在报错的情况下，真的还需要把堆积的任务做完吗？预测如果升级到0.16，`defer`内的逻辑需要修改为取消，而此处的逻辑不再放在`defer`内。
-        ctx.pool.waitAndWork(&ctx.wait_group);
-        channel.notifyConsumerDone();
-    }
+    // TODO: 在报错的情况下，真的还需要把堆积的任务做完吗？预测如果升级到0.16，`defer`内的逻辑需要修改为取消，而此处的逻辑不再放在`defer`内。
+    defer ctx.pool.waitAndWork(&ctx.wait_group);
     const git_error_code_or_customized_error_code = c.git_odb_foreach(odb, index_builder_cb, &ctx);
     if (git_error_code_or_customized_error_code > 0) {
         const customized_error_enum: IndexBuilderCbCustomizedErrorEnum = .fromBackingInt(git_error_code_or_customized_error_code);
@@ -285,7 +266,8 @@ const IndexBuilderCbPayload = struct {
     repo: *c.git_repository,
     odb: *c.git_odb,
     commit_registry: *CommitRegistry,
-    task_queue_capacity_log2: u5,
+    channel: *Channel,
+    pending_tasks_backpressure: usize,
     parsers_ctx: ParsersHub,
     pool: vcaligner.Pool,
     wait_group: std.Thread.WaitGroup,
@@ -318,9 +300,9 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
             std.log.err("Commit regisistry put no clobber failed.\n", .{});
             break :main_logic_customized_error err;
         };
-        // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
+        // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。
         const task_in_queue_count = ctx.parsers_ctx.heap_ptr.task_in_queue_count.v.fetchAdd(1, .acquire);
-        if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
+        if (task_in_queue_count > ctx.pending_tasks_backpressure) help_do_work: {
             const run_node = blk: {
                 ctx.pool.mutex.lock();
                 defer ctx.pool.mutex.unlock();
@@ -337,7 +319,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
             &ctx.pool,
             &ctx.wait_group,
             subParseTask,
-            .{ ctx.parsers_ctx, id.*, commit_seq, ctx.repo },
+            .{ ctx.parsers_ctx, id.*, commit_seq, ctx.repo, ctx.channel },
         });
         return 0;
     };
@@ -352,6 +334,7 @@ pub fn subParseTask(
     commit_hash: c.git_oid,
     commit_seq: vcaligner.rocksdb_custom.CommitSeq,
     repo: *c.git_repository,
+    channel: *Channel,
 ) void {
     // 进入解析，降低积压的`task_in_queue_count`
     _ = ctx.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
@@ -384,8 +367,8 @@ pub fn subParseTask(
             break :blk tree.?;
         };
         defer c.git_tree_free(tree);
-        parse_tree(lctx, tree, &@as([0]u8, .{})) catch |err| break :main_logic err;
-        flush_relation_batch(lctx) catch |err| break :main_logic err;
+        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), channel) catch |err| break :main_logic err;
+        flush_relation_batch(lctx, channel) catch |err| break :main_logic err;
         break :main_logic {};
     }) catch |err| {
         const diagnostics: *diag.Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diag));
@@ -395,12 +378,72 @@ pub fn subParseTask(
     };
 }
 
-fn parse_tree(lctx: *ParserStation, tree: *const c.git_tree, base_path: []const u8) !void {
-    _ = lctx;
-    _ = tree;
-    _ = base_path;
+fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStation, base_path: []const u8, channel: *Channel) !void {
+    const entry_count = c.git_tree_entrycount(tree);
+    for (0..entry_count) |i| {
+        const entry = c.git_tree_entry_byindex(tree, i).?;
+        const entry_type = c.git_tree_entry_type(entry);
+        const entry_oid = c.git_tree_entry_id(entry);
+        switch (entry_type) {
+            c.GIT_OBJECT_TREE => deeper: {
+                const subtree: *c.git_tree = blk: {
+                    var subtree: ?*c.git_tree = undefined;
+                    // 对于查找过程，报错是一个正常现象：空目录就会报错，因此无需错误退出。
+                    if (c.git_tree_lookup(&subtree, repo, entry_oid) != 0) break :deeper;
+                    break :blk subtree.?;
+                };
+                defer c.git_tree_free(subtree);
+                const child_path = blk: {
+                    const entry_name = c.git_tree_entry_name(entry);
+                    const entry_name_slice: []const u8 = std.mem.span(entry_name);
+                    if (base_path.len == 0) {
+                        break :blk try lctx.current_task_scratch_arena.allocator().dupe(u8, entry_name_slice);
+                    }
+                    break :blk try std.fmt.allocPrintSentinel(lctx.current_task_scratch_arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
+                };
+                defer lctx.current_task_scratch_arena.allocator().free(child_path);
+                try parse_tree(subtree, repo, lctx, child_path, channel);
+            },
+            c.GIT_OBJECT_BLOB => {
+                // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。
+                const full_path = blk: {
+                    const entry_name = c.git_tree_entry_name(entry);
+                    const entry_name_slice: []const u8 = std.mem.span(entry_name);
+                    if (base_path.len == 0) {
+                        break :blk try lctx.to_flush.arena.allocator().dupe(u8, entry_name_slice);
+                    }
+                    break :blk try std.fmt.allocPrintSentinel(lctx.to_flush.arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
+                };
+                errdefer lctx.to_flush.arena.allocator().free(full_path);
+                try append_relation(lctx, full_path, entry_oid, channel);
+            },
+            else => {},
+        }
+    }
 }
 
-fn flush_relation_batch(lctx: *ParserStation) !void {
-    _ = lctx;
+fn append_relation(lctx: *ParserStation, path: []u8, blob_oid: *const c.git_oid, channel: *Channel) !void {
+    try lctx.to_flush.parsed_units.append(lctx.to_flush.arena.allocator(), .{
+        .path = path,
+        .blob_hash = blob_oid.*,
+    });
+    if (lctx.to_flush.parsed_units.items.len >= flush_threshold: {
+        break :flush_threshold @import("write.zig").parsed_chunk_max;
+    }) {
+        const commit_seq = lctx.to_flush.commit_seq;
+        try flush_relation_batch(lctx, channel);
+        lctx.to_flush = .{
+            .arena = .init(vcaligner.getAllocator()),
+            .commit_seq = commit_seq,
+            .parsed_units = .empty,
+        };
+    }
+}
+
+fn flush_relation_batch(lctx: *ParserStation, channel: *Channel) !void {
+    const ticket, const to_produce: *Parsed = channel.claimProduce(&lctx.producer_local, null);
+    defer channel.publishProducedUnsafe(ticket);
+    // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
+    to_produce.* = lctx.to_flush;
+    lctx.to_flush = undefined;
 }

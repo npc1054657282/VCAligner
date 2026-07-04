@@ -10,6 +10,27 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
 const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
 
+// XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
+// 注意，这并不代表它包含一个commit及其对应的所有blob-path。
+// 因为一个commit如果对应的blob-path过多，它可能被切割为多个`Parsed`。
+// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。这可能要求此结构变得复杂一些。
+// 目前的考虑是实践中大体量的仓库一般各个commit包含的blob-path都很多。而小体量的仓库不需要为此特别考虑优化。
+pub const Parsed = struct {
+    // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
+    // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
+    // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
+    arena: StArena,
+    commit_seq: CommitSeq,
+    parsed_units: std.ArrayList(ParsedUnit),
+    pub const ParsedUnit = struct {
+        blob_hash: c.git_oid,
+        // `path`的所有权属于`Parsed`内的`arena`。
+        path: []u8,
+    };
+};
+pub const Queue = @import("mpsc_queue").AnyMpscQueue(Parsed, null);
+pub const Channel = vcaligner.MpscChannel(Queue);
+
 pub const PathRegistry = struct {
     map: std.StringArrayHashMapUnmanaged(struct {
         // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
@@ -102,6 +123,11 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
     defer commit_registry.deinit();
+    const queue: Queue = try .init(allocator, runconf.parsed_queue_capacity_log2);
+    // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
+    defer queue.deinit(allocator);
+    // TODO: channel的生存期未来考虑精细设计。
+    var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
     // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
     var main_parser_allocator_impl: vcaligner.Gpa = .init();
@@ -117,6 +143,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
             runconf,
             main_parser_allocator_impl.getAllocator(),
             &commit_registry,
+            &channel,
             allocator,
             last_diag,
         ) catch |err| {
@@ -168,6 +195,7 @@ fn provisionMainParser(
     noalias runconf: *const PrepRunner,
     main_parser_allocator: std.mem.Allocator,
     commit_registry: *CommitRegistry,
+    channel: *Channel,
     allocator: std.mem.Allocator,
     last_diag: *diag.Diagnostic,
 ) !struct { std.Thread, RocksdbPath } {
@@ -190,7 +218,7 @@ fn provisionMainParser(
     errdefer rocksdb_output.deinit(allocator);
     const main_parser = try std.Thread.spawn(.{ .allocator = allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
         repo,
-        runconf.task_queue_capacity_log2,
+        channel,
         // n_jobs是排除rocksdb自动创建线程外的线程数。而解析子线程的数量还需要再排除主解析和写线程各一个。
         runconf.n_jobs - 2,
         commit_registry,
