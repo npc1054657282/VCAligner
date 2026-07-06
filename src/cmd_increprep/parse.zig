@@ -428,7 +428,8 @@ fn append_relation(lctx: *ParserStation, path: []u8, blob_oid: *const c.git_oid,
         .blob_hash = blob_oid.*,
     });
     if (lctx.to_flush.parsed_units.items.len >= flush_threshold: {
-        break :flush_threshold @import("write.zig").parsed_chunk_max;
+        // XXX: 当前设计为硬编码。或改为用户配置。
+        break :flush_threshold 512;
     }) {
         const commit_seq = lctx.to_flush.commit_seq;
         try flush_relation_batch(lctx, channel);
