@@ -130,8 +130,8 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
     // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-    var main_parser_allocator_impl: vcaligner.Gpa = .init();
-    defer main_parser_allocator_impl.deinit();
+    var main_parser_allocator_instance: vcaligner.GpaInstance = .init();
+    defer main_parser_allocator_instance.deinit();
     const main_parser: std.Thread, const rocksdb_output: RocksdbPath = libgit2_handoff: {
         var git_error_code = c.git_libgit2_init();
         if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -141,7 +141,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
         // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
         break :libgit2_handoff provisionMainParser(
             runconf,
-            main_parser_allocator_impl.getAllocator(),
+            main_parser_allocator_instance.allocator(),
             &commit_registry,
             &channel,
             allocator,

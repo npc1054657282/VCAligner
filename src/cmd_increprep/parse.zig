@@ -26,6 +26,10 @@ const ParsersHub = struct {
         },
         main_parser_block: struct {
             _: void align(std.atomic.cache_line),
+            // NOTE: 之所以放在堆上而没有和allocator和last diage一样当成不变量放在外部，是因为
+            // 将来可能将程序设计为服务式的，所有解析线程届时分析的repo可能会随之进行刷新。因此repo将来或许不是不变量。
+            // 没有放在ParserStation内，虽然主类型与子类型类型相同。因为生存周期和子parser的不同，放在外面便于理解。
+            repo: *c.git_repository,
             station: ParserStation,
         },
         pub inline fn subParserBlocksPtr(heap_ptr: *Header) [*]SubParser {
@@ -39,32 +43,44 @@ const ParsersHub = struct {
     pub const heap_align: std.mem.Alignment = .max(.of(Header), .of(SubParser));
     pub const SubParser = struct {
         _: void align(std.atomic.cache_line),
-        allocator_state: vcaligner.Gpa,
+        allocator_instance: vcaligner.GpaInstance,
         diagnostics: diag.Diagnostics,
+        // NOTE: 没有放在ParserStation内，虽然与主类型的相同，但生存周期和主parser的不同，放在外面便于理解。
+        // 每个子解析线程都需要一个独立创建的repo，不应当复用。这是旧实现的一个重要问题，此重构实现修复。
+        // [参见](https://gitlab.com/gitlab-org/libgit2/-/blob/master/docs/threading.md)
+        repo: *c.git_repository,
         station: ParserStation,
     };
-    pub fn init(n_subparserjobs: usize, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParsersHub {
+    pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParsersHub {
         const raw = try allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
         errdefer allocator.free(raw);
         const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
         heap_ptr.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
-        heap_ptr.main_parser_block = .{ ._ = {}, .station = .init(channel, allocator) };
+        heap_ptr.main_parser_block = .{ ._ = {}, .repo = repo, .station = .init(channel, allocator) };
         errdefer heap_ptr.main_parser_block.station.deinit();
         try vcaligner.crash_dump.reg("parser", 0, &heap_ptr.main_parser_block.station.dumpable);
         errdefer vcaligner.crash_dump.unreg("parser", 0);
+        const repo_path = c.git_repository_path(repo);
         const sub_parser_blocks: []SubParser = heap_ptr.subParserBlocksPtr()[0..n_subparserjobs];
         const sub_parser_blocks_init_result: union(enum) { success: void, failed: struct {
             err: std.mem.Allocator.Error,
             slice_id: usize,
-        } } = blk: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
-            sub_parser_block.allocator_state = .init();
-            errdefer sub_parser_block.allocator_state.deinit();
-            const sub_parser_allocator = sub_parser_block.allocator_state.getAllocator();
+        } } = sub_parser_blocks_init: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
+            sub_parser_block.allocator_instance = .init();
+            errdefer sub_parser_block.allocator_instance.deinit();
+            const sub_parser_allocator = sub_parser_block.allocator_instance.allocator();
             sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
             errdefer sub_parser_block.diagnostics.arena.deinit();
+            sub_parser_block.repo = repo: {
+                var sub_parser_block_repo: ?*c.git_repository = undefined;
+                const git_error_code = c.git_repository_open_bare(&sub_parser_block_repo, repo_path);
+                try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+                break :repo sub_parser_block_repo.?;
+            };
+            errdefer c.git_repository_free(sub_parser_block.repo);
             sub_parser_block.station = .init(channel, sub_parser_allocator);
             errdefer sub_parser_block.station.deinit();
-            vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_block.station.dumpable) catch |err| break :blk .{
+            vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_block.station.dumpable) catch |err| break :sub_parser_blocks_init .{
                 .failed = .{
                     .err = err,
                     .slice_id = slice_id,
@@ -77,8 +93,9 @@ const ParsersHub = struct {
                     vcaligner.crash_dump.unreg("parser", slice_id + 1);
                     const sub_parser_block = &sub_parser_blocks[slice_id];
                     sub_parser_block.station.deinit();
+                    c.git_repository_free(sub_parser_block.repo);
                     sub_parser_block.diagnostics.arena.deinit();
-                    sub_parser_block.allocator_state.deinit();
+                    sub_parser_block.allocator_instance.deinit();
                 }
                 break :ret failed.err;
             },
@@ -97,8 +114,9 @@ const ParsersHub = struct {
         for (sub_parser_blocks, 1..) |*sub_parser_block, thread_id| {
             vcaligner.crash_dump.unreg("parser", thread_id);
             sub_parser_block.station.deinit();
+            c.git_repository_free(sub_parser_block.repo);
             sub_parser_block.diagnostics.arena.deinit();
-            sub_parser_block.allocator_state.deinit();
+            sub_parser_block.allocator_instance.deinit();
         }
         const raw = @as([*]align(heap_align.toByteUnits()) u8, @ptrCast(self.heap_ptr))[0..heapSize(self.n_subparserjobs)];
         allocator.free(raw);
@@ -106,17 +124,20 @@ const ParsersHub = struct {
     pub fn lctxFromThreadId(noalias self: *const ParsersHub, thread_id: usize) struct {
         std.mem.Allocator,
         *diag.Diagnostic,
+        *c.git_repository,
         *ParserStation,
     } {
         if (thread_id == 0) return .{
             self.main_parser_allocator,
             self.main_parser_last_diag,
+            self.heap_ptr.main_parser_block.repo,
             &self.heap_ptr.main_parser_block.station,
         };
         const sub_parser_block: *SubParser = &self.heap_ptr.subParserBlocksPtr()[0..heapSize(self.n_subparserjobs)][thread_id - 1];
         return .{
-            sub_parser_block.allocator_state.getAllocator(),
+            sub_parser_block.allocator_instance.allocator(),
             &sub_parser_block.diagnostics.last_diagnostic,
+            sub_parser_block.repo,
             &sub_parser_block.station,
         };
     }
@@ -180,20 +201,14 @@ pub fn mainParseTaskTakeRepo(
     defer main_parse_diagnostics.arena.deinit();
     const last_diag = &main_parse_diagnostics.last_diagnostic;
     (main_parse_ret: {
-        // 注意repo的生命周期必须短于libgit2全局资源，但是目前假定libgit2全局资源的报错将无法使用`defer`，因此封装进单独块。
-        (main_parse_except_shutdown_libgit2: {
-            defer c.git_repository_free(repo);
-            // 主解析线程的任务错误都需要确保通知写线程停止以避免写线程死锁。
-            defer channel.notifyConsumerDone();
-            break :main_parse_except_shutdown_libgit2 mainParse(
-                repo,
-                channel,
-                n_subparserjobs,
-                commit_registry,
-                allocator,
-                last_diag,
-            );
-        }) catch |err| {
+        mainParseTakeRepo(
+            repo,
+            channel,
+            n_subparserjobs,
+            commit_registry,
+            allocator,
+            last_diag,
+        ) catch |err| {
             // 出于不适用`defer`，故在错误点和结尾重复一次清理libgit2全局资源逻辑。
             // XXX: 考虑改写`gitErrorCodeToZigError`，允许传入一个`?anyerror`参数。但考虑到诊断模式本身将来大概会被弃用，因此不再做这些复杂考量。
             const git_error_code = c.git_libgit2_shutdown();
@@ -219,7 +234,7 @@ pub fn mainParseTaskTakeRepo(
     };
 }
 
-pub fn mainParse(
+pub fn mainParseTakeRepo(
     repo: *c.git_repository,
     channel: *Channel,
     n_subparserjobs: usize,
@@ -227,6 +242,9 @@ pub fn mainParse(
     allocator: std.mem.Allocator,
     last_diag: *diag.Diagnostic,
 ) !void {
+    defer c.git_repository_free(repo);
+    // 主解析线程的任务错误都需要确保通知写线程停止以避免写线程死锁。
+    defer channel.notifyConsumerDone();
     const odb: *c.git_odb = blk: {
         var odb: ?*c.git_odb = undefined;
         const git_error_code = c.git_repository_odb(&odb, repo);
@@ -235,7 +253,6 @@ pub fn mainParse(
     };
     defer c.git_odb_free(odb);
     var ctx: IndexBuilderCbPayload = .{
-        .repo = repo,
         .odb = odb,
         .commit_registry = commit_registry,
         .channel = channel,
@@ -246,7 +263,7 @@ pub fn mainParse(
         .pool = undefined,
         .wait_group = .{},
     };
-    ctx.parsers_ctx = try .init(n_subparserjobs, channel, allocator, last_diag);
+    ctx.parsers_ctx = try .init(n_subparserjobs, repo, channel, allocator, last_diag);
     defer ctx.parsers_ctx.deinit(allocator);
     try ctx.pool.init(.{ .allocator = allocator, .n_jobs = n_subparserjobs, .track_ids = true });
     defer ctx.pool.deinit();
@@ -263,7 +280,6 @@ pub fn mainParse(
 // NOTE: 依个人风格，一般不把可变内容与不可变内容集中在一个结构体中放置。
 // 但这是特殊情况，因为这是一个用于C系函数的回调payload结构体，因此采用混合结构体的模式。
 const IndexBuilderCbPayload = struct {
-    repo: *c.git_repository,
     odb: *c.git_odb,
     commit_registry: *CommitRegistry,
     channel: *Channel,
@@ -319,7 +335,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
             &ctx.pool,
             &ctx.wait_group,
             subParseTask,
-            .{ ctx.parsers_ctx, id.*, commit_seq, ctx.repo, ctx.channel },
+            .{ ctx.parsers_ctx, id.*, commit_seq, ctx.channel },
         });
         return 0;
     };
@@ -333,12 +349,11 @@ pub fn subParseTask(
     ctx: ParsersHub,
     commit_hash: c.git_oid,
     commit_seq: vcaligner.rocksdb_custom.CommitSeq,
-    repo: *c.git_repository,
     channel: *Channel,
 ) void {
     // 进入解析，降低积压的`task_in_queue_count`
     _ = ctx.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
-    const allocator, const last_diag, const lctx = ctx.lctxFromThreadId(thrd_id);
+    const allocator, const last_diag, const repo, const lctx = ctx.lctxFromThreadId(thrd_id);
     defer {
         if (!lctx.current_task_scratch_arena.reset(.retain_capacity)) {
             std.log.warn("Retain capacity failed, free all", .{});

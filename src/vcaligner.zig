@@ -23,14 +23,14 @@ pub const runtime_safety = switch (@import("builtin").mode) {
 // 全局变量，用于注册崩溃日志。
 pub var crash_dump: CrashDump = undefined;
 
-pub const Gpa = struct {
-    pub fn init() Gpa {
+pub const GpaInstance = struct {
+    pub fn init() GpaInstance {
         return .{};
     }
-    pub fn deinit(self: *Gpa) void {
+    pub fn deinit(self: *GpaInstance) void {
         _ = self;
     }
-    pub fn getAllocator(self: *Gpa) std.mem.Allocator {
+    pub fn allocator(self: *GpaInstance) std.mem.Allocator {
         _ = self;
         return std.heap.c_allocator;
     }
