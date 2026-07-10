@@ -199,9 +199,7 @@ fn provisionMainParser(
     allocator: std.mem.Allocator,
     last_diag: *diag.Diagnostic,
 ) !struct { std.Thread, RocksdbPath } {
-    const write_strategy: PrepRunner.WriteStrategy = runconf.mode_conf.writeStrategy();
     const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
-    _ = write_strategy;
     _ = compaction_strategy;
     const repo: *c.git_repository = blk: {
         var repo: ?*c.git_repository = undefined;

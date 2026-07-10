@@ -11,6 +11,7 @@ pub fn compaction(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *di
     _ = last_diag;
     // 由于C API没有对`SetDbOptions`的支持，因此只得关闭数据库后，根据修改后的配置重新打开。
     var err_cstr: ?[*:0]u8 = null;
+    // TODO: 这段块缓存设置只对随机读取时候有意义。而此处全量compaction后续没有读取，因此此处的lru cache没有意义，应当删掉。
     const lru_cache = c.rocksdb_cache_create_lru(256 * 1024 * 1024).?;
     defer c.rocksdb_cache_destroy(lru_cache);
     const table_options = blk: {

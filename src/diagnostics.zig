@@ -41,6 +41,8 @@ pub const Diagnostic = union {
         if (diagnostics.double_error != null) {
             return last_error;
         }
+        // TODO: ArrayList本身不适合用arena分配器而适合gpa。考虑改为使用arena的child allocator而非arena的allocator本身。
+        // 当然此诊断抽象本身拟移除。
         diagnostics.error_stack.append(diagnostics.arena.allocator(), .{ .code = last_error, .diagnostic = last_diagnostic.* }) catch |double_error| {
             diagnostics.double_error = double_error;
             return last_error;

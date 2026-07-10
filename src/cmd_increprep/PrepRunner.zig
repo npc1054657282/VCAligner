@@ -6,12 +6,6 @@ const cli = vcaligner.cli;
 const PrepRunner = @This();
 
 pub const Mode = enum { full, incremental };
-pub const WriteStrategy = enum {
-    // 尽量同时写入多个列族
-    immediate_multi_cf,
-    // 其他列族延迟一次性写入。仅限全量模式可使用。
-    deferred_multi_cf,
-};
 pub const CompactionStrategy = union(enum) {
     // 写入时不自动压缩，写入全结束后额外进行一次自动压缩
     manual_delayed: void,
@@ -27,7 +21,6 @@ bare_repo_path: [:0]u8,
 mode_conf: union(Mode) {
     full: struct {
         rocksdb_output: union(enum) { manual: [:0]u8, auto: void },
-        write_strategy: WriteStrategy,
         compaction_strategy: CompactionStrategy,
     },
     incremental: struct {
@@ -52,12 +45,6 @@ mode_conf: union(Mode) {
             },
             .incremental => |inc_conf| allocator.free(inc_conf.rocksdb_output),
         }
-    }
-    pub fn writeStrategy(noalias self: *const @This()) WriteStrategy {
-        return switch (self.*) {
-            .full => |full_conf| full_conf.write_strategy,
-            .incremental => .immediate_multi_cf,
-        };
     }
     pub fn compactionStrategy(noalias self: *const @This()) CompactionStrategy {
         return switch (self.*) {
@@ -156,15 +143,6 @@ pub const cmd = blk: {
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
-        // 仅仅对全量模式有意义。全量模式下，默认行为是除主列族外的其他列族将延迟写入而非即时写入。
-        // 此选项关闭此行为，改为与增量模式相同的各列族尽可能即时写入。
-        .arg(zargs.Arg.opt("no_defer_cfs", bool).long("no-defer-cfs").help(
-            \\(Advanced) Force immediate multi-column-family writes in full mode. 
-        ++ cli.helpNewLine(cmd_config) ++
-            \\Mandatory behavior in incremental mode.
-        ++ cli.helpLastLine(cmd_config) ++
-            \\
-        ))
         // `null`在全量模式下指代延迟compaction，在增量模式下指代自动默认compaction
         // 显式输入`default`或者0，指代显式设置自动默认compaction。其他数字指代设置compaction trigger值。
         .arg(zargs.Arg.optArg("auto_compaction", ?enum(c_int) {
@@ -235,7 +213,6 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         errdefer comptime unreachable;
         break :blk .{ .full = .{
             .rocksdb_output = rocksdb_output,
-            .write_strategy = if (args.no_defer_cfs) .immediate_multi_cf else .deferred_multi_cf,
             .compaction_strategy = if (args.auto_compaction) |auto_compaction| switch (auto_compaction) {
                 .default => .auto_default,
                 _ => |trigger_tag| .{ .auto_with_trigger = @intFromEnum(trigger_tag) },
