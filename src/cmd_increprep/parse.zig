@@ -382,8 +382,13 @@ pub fn subParseTask(
             break :blk tree.?;
         };
         defer c.git_tree_free(tree);
-        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), channel) catch |err| break :main_logic err;
-        flush_relation_batch(lctx, channel) catch |err| break :main_logic err;
+        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), channel) catch |err| {
+            // NOTE: `parse_tree`内会基于to_flush的arena进行内存分配。
+            // 如果是正确情况那就将其内容flush到写线程。如果是错误情况就释放它。
+            lctx.to_flush.arena.deinit();
+            break :main_logic err;
+        };
+        if (lctx.to_flush.parsed_units.capacity != 0) flush_relation_batch(lctx, channel);
         break :main_logic {};
     }) catch |err| {
         const diagnostics: *diag.Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diag));
@@ -398,7 +403,7 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
     for (0..entry_count) |i| {
         const entry = c.git_tree_entry_byindex(tree, i).?;
         const entry_type = c.git_tree_entry_type(entry);
-        const entry_oid = c.git_tree_entry_id(entry);
+        const entry_oid: *const c.git_oid = c.git_tree_entry_id(entry);
         switch (entry_type) {
             c.GIT_OBJECT_TREE => deeper: {
                 const subtree: *c.git_tree = blk: {
@@ -420,43 +425,45 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
                 try parse_tree(subtree, repo, lctx, child_path, channel);
             },
             c.GIT_OBJECT_BLOB => {
-                // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。
-                const full_path = blk: {
-                    const entry_name = c.git_tree_entry_name(entry);
-                    const entry_name_slice: []const u8 = std.mem.span(entry_name);
-                    if (base_path.len == 0) {
-                        break :blk try lctx.to_flush.arena.allocator().dupe(u8, entry_name_slice);
-                    }
-                    break :blk try std.fmt.allocPrintSentinel(lctx.to_flush.arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
-                };
-                errdefer lctx.to_flush.arena.allocator().free(full_path);
-                try append_relation(lctx, full_path, entry_oid, channel);
+                if (lctx.to_flush.parsed_units.capacity == 0) try lctx.to_flush.parsed_units.ensureTotalCapacityPrecise(lctx.to_flush.arena.allocator(), flush_threshold: {
+                    // XXX: 当前设计为硬编码。或改为用户配置。
+                    break :flush_threshold 512;
+                });
+                append_relation: {
+                    // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。
+                    const full_path = blk: {
+                        const entry_name = c.git_tree_entry_name(entry);
+                        const entry_name_slice: []const u8 = std.mem.span(entry_name);
+                        if (base_path.len == 0) {
+                            break :blk try lctx.to_flush.arena.allocator().dupe(u8, entry_name_slice);
+                        }
+                        break :blk try std.fmt.allocPrintSentinel(lctx.to_flush.arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
+                    };
+                    // XXX: 此处的errdefer无用且非常有可能出错，要小心！一种建议是移除它。
+                    errdefer lctx.to_flush.arena.allocator().free(full_path);
+                    lctx.to_flush.parsed_units.appendAssumeCapacity(.{
+                        .path = full_path,
+                        .blob_hash = entry_oid.*,
+                    });
+                    break :append_relation;
+                }
+                if (lctx.to_flush.parsed_units.items.len == lctx.to_flush.parsed_units.capacity) {
+                    const allocator = lctx.to_flush.arena.child_allocator;
+                    const commit_seq = lctx.to_flush.commit_seq;
+                    flush_relation_batch(lctx, channel);
+                    lctx.to_flush = .{
+                        .arena = .init(allocator),
+                        .commit_seq = commit_seq,
+                        .parsed_units = .empty,
+                    };
+                }
             },
             else => {},
         }
     }
 }
 
-fn append_relation(lctx: *ParserStation, path: []u8, blob_oid: *const c.git_oid, channel: *Channel) !void {
-    try lctx.to_flush.parsed_units.append(lctx.to_flush.arena.allocator(), .{
-        .path = path,
-        .blob_hash = blob_oid.*,
-    });
-    if (lctx.to_flush.parsed_units.items.len >= flush_threshold: {
-        // XXX: 当前设计为硬编码。或改为用户配置。
-        break :flush_threshold 512;
-    }) {
-        const commit_seq = lctx.to_flush.commit_seq;
-        try flush_relation_batch(lctx, channel);
-        lctx.to_flush = .{
-            .arena = .init(vcaligner.getAllocator()),
-            .commit_seq = commit_seq,
-            .parsed_units = .empty,
-        };
-    }
-}
-
-fn flush_relation_batch(lctx: *ParserStation, channel: *Channel) !void {
+fn flush_relation_batch(lctx: *ParserStation, channel: *Channel) void {
     const ticket, const to_produce: *Parsed = channel.claimProduce(&lctx.producer_local, null);
     defer channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。

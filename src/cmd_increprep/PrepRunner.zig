@@ -59,6 +59,7 @@ n_rocksdbjobs: c_int,
 default_cf_max_write_buffer_number: c_int,
 parsed_queue_capacity_log2: u5,
 compression: bool,
+writebatch_watermark: c_int,
 // 采集本进程的pid与一个时间戳，用于生成本进程唯一信息，可用于临时文件命名。
 // XXX: 未来可能移动至cli.Runner.Global，但目前的ana确实无此需求。
 proc_stamp: struct {
@@ -178,6 +179,15 @@ pub const cmd = blk: {
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
+        .arg(zargs.Arg.optArg("writebatch_watermark", c_int).long("writebatch-watermark").default(65536).help(
+            \\Sets the threshold for flushing pending records to RocksDB.
+        ++ cli.helpNewLine(cmd_config) ++
+            \\Higher values reduce lock contention and commit frequency,
+        ++ cli.helpLastLine(cmd_config) ++
+            \\at the cost of slightly higher memory usage.
+        ++ cli.helpLastLine(cmd_config) ++
+            \\
+        ))
         .config(cmd_config);
 };
 
@@ -254,6 +264,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         .default_cf_max_write_buffer_number = default_cf_max_write_buffer_number,
         .parsed_queue_capacity_log2 = args.parsed_queue_capacity_log2,
         .compression = !args.no_compression,
+        .writebatch_watermark = args.writebatch_watermark,
         .proc_stamp = .{
             .pid = vcaligner.pid.get(),
             .ts = std.time.nanoTimestamp(),

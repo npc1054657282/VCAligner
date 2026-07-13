@@ -38,7 +38,7 @@ pub const PathRegistry = struct {
         blob_cnt: usize,
     }),
     // arena很重要，注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存
-    //因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
+    // 因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
     arena: StArena,
     pub fn deinit(self: *PathRegistry) void {
         self.map.deinit(self.arena.allocator());
