@@ -23,16 +23,46 @@ pub const runtime_safety = switch (@import("builtin").mode) {
 // 全局变量，用于注册崩溃日志。
 pub var crash_dump: CrashDump = undefined;
 
-pub const GpaInstance = struct {
+pub const GpaInstance = CAllocatorAsGpaInstance;
+
+const CAllocatorAsGpaInstance = struct {
+    pub fn init() CAllocatorAsGpaInstance {
+        return .{};
+    }
+    pub fn deinit(self: *CAllocatorAsGpaInstance) void {
+        _ = self;
+    }
+    pub fn allocator(self: *CAllocatorAsGpaInstance) std.mem.Allocator {
+        _ = self;
+        return std.heap.c_allocator;
+    }
+};
+
+const GlobalDebugAllocatorAsGpaInstance = struct {
+    pub var debug_allocator_instance: std.heap.DebugAllocator(.{}) = .init;
     pub fn init() GpaInstance {
         return .{};
     }
-    pub fn deinit(self: *GpaInstance) void {
+    pub fn deinit(self: *GlobalDebugAllocatorAsGpaInstance) void {
+        _ = self;
+        debug_allocator_instance.deinit();
+    }
+    pub fn allocator(self: *GlobalDebugAllocatorAsGpaInstance) std.mem.Allocator {
+        _ = self;
+        return debug_allocator_instance.allocator();
+    }
+};
+
+const SmpAllocatorAsGpaInstance = struct {
+    pub fn init() SmpAllocatorAsGpaInstance {
+        return .{};
+    }
+    pub fn deinit(self: *SmpAllocatorAsGpaInstance) void {
         _ = self;
     }
-    pub fn allocator(self: *GpaInstance) std.mem.Allocator {
+    pub fn allocator(self: *SmpAllocatorAsGpaInstance) std.mem.Allocator {
         _ = self;
-        return std.heap.c_allocator;
+        return std.heap.smp_allocator;
     }
 };
 

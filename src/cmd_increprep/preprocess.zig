@@ -13,22 +13,33 @@ const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
 // XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
 // 注意，这并不代表它包含一个commit及其对应的所有blob-path。
 // 因为一个commit如果对应的blob-path过多，它可能被切割为多个`Parsed`。
-// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。这可能要求此结构变得复杂一些。
-// 目前的考虑是实践中大体量的仓库一般各个commit包含的blob-path都很多。而小体量的仓库不需要为此特别考虑优化。
+// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。
+// 这可能要求此结构变得复杂一些，一个`Parsed`需要跨任务完成。
+// 目前的考虑是，`Parsed`任务批量发送主要出于减少任务碰撞，大多数情况下一个commit承载的blob-path对数量解析数量足够防止碰撞。
+// 相较于写入的io成本，这里的`Parsed`均衡的效果可能微不足道，暂不为此增加复杂度。
 pub const Parsed = struct {
     // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
     // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
     // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
     arena: StArena,
     commit_seq: CommitSeq,
-    parsed_units: std.ArrayList(ParsedUnit),
-    pub const ParsedUnit = struct {
+    // NOTE: `parsed_unints`的大小是预先分配好的，由flush阈值决定，并非动态增长
+    // 因此它同样基于本结构内的`arena`分配。
+    pairs: std.ArrayList(BlobPathPair),
+    pub const BlobPathPair = struct {
         blob_hash: c.git_oid,
         // `path`的所有权属于`Parsed`内的`arena`。
         path: []u8,
     };
 };
-pub const Queue = @import("mpsc_queue").AnyMpscQueue(Parsed, null);
+pub const MsgToWriter = union(enum) {
+    commit_meta: struct {
+        commit_hash: c.git_oid,
+        commit_seq: CommitSeq,
+    },
+    parsed: Parsed,
+};
+pub const Queue = @import("mpsc_queue").AnyMpscQueue(MsgToWriter, null);
 pub const Channel = vcaligner.MpscChannel(Queue);
 
 pub const PathRegistry = struct {
@@ -37,34 +48,25 @@ pub const PathRegistry = struct {
         index: PathSeq,
         blob_cnt: usize,
     }),
-    // arena很重要，注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存
-    // 因此arena不仅负责`StringArrayHashMapUnmanaged`，还负责键的保存。
-    arena: StArena,
-    pub fn deinit(self: *PathRegistry) void {
-        self.map.deinit(self.arena.allocator());
-        self.arena.deinit();
+    // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
+    // 注意`key_arena`不负责`StringArrayHashMapUnmanaged`，因为这是一个动态增长结构体，不适合arena。
+    key_arena: StArena,
+    pub fn deinit(self: *PathRegistry, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+        self.key_arena.deinit();
         self.* = undefined;
     }
 };
-pub const BlobPathRegistry = struct {
-    map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq),
-    arena: StArena,
-    pub fn deinit(self: *BlobPathRegistry) void {
-        self.map.deinit(self.arena.allocator());
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const BlobPathRegistry = std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq);
 
 pub const CommitRegistry = struct {
-    // XXX: HashMap不记录插入顺序，而ArrayHashMap只要不删除内部元素就能确保记录插入顺序。ArrayHashMap有高得多的迭代效率。
-    // 目前需求：查找频繁，最后迭代一次。迭代是无序的。
-    // 目前基于最高查询效率的目的采用HashMap。未来或考虑array hash map。
-    map: std.AutoHashMapUnmanaged(c.git_oid, CommitSeq),
-    arena: StArena,
+    map: std.AutoHashMapUnmanaged(c.git_oid, void),
+    // `CommitRegistry`存在跨线程需求。
+    // 增量模式下，需要在主解析线程启动前使用它，并在主线程中继续使用。
+    // 因此这要求跨线程地保存其分配器，且此分配器应为线程安全的。
+    gpa: std.mem.Allocator,
     pub fn deinit(self: *CommitRegistry) void {
-        self.map.deinit(self.arena.allocator());
-        self.arena.deinit();
+        self.map.deinit(self.gpa);
         self.* = undefined;
     }
 };
@@ -113,19 +115,19 @@ pub const RocksdbPath = union(enum) {
     }
 };
 
-pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+pub fn preprocess(noalias runconf: *const PrepRunner, gpa: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
     // 此重构版本，主线程为写入线程，解析主线程另开线程。
-    var path_registry: PathRegistry = .{ .map = .empty, .arena = .init(allocator) };
-    defer path_registry.deinit();
-    var blob_path_registry: BlobPathRegistry = .{ .map = .empty, .arena = .init(allocator) };
-    defer blob_path_registry.deinit();
-    var commit_registry: CommitRegistry = .{ .map = .empty, .arena = .init(allocator) };
+    var path_registry: PathRegistry = .{ .map = .empty, .key_arena = .init(gpa) };
+    defer path_registry.deinit(gpa);
+    var blob_path_registry: BlobPathRegistry = .empty;
+    defer blob_path_registry.deinit(gpa);
+    var commit_registry: CommitRegistry = .{ .map = .empty, .gpa = gpa };
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
     defer commit_registry.deinit();
-    const queue: Queue = try .init(allocator, runconf.parsed_queue_capacity_log2);
+    const queue: Queue = try .init(gpa, runconf.parsed_queue_capacity_log2);
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
-    defer queue.deinit(allocator);
+    defer queue.deinit(gpa);
     // TODO: channel的生存期未来考虑精细设计。
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
@@ -144,7 +146,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
             main_parser_allocator_instance.allocator(),
             &commit_registry,
             &channel,
-            allocator,
+            gpa,
             last_diag,
         ) catch |err| {
             git_error_code = c.git_libgit2_shutdown();
@@ -157,7 +159,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, allocator: std.mem.Allocat
             return err;
         };
     };
-    defer rocksdb_output.deinit(allocator);
+    defer rocksdb_output.deinit(gpa);
     // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
     // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
     // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
