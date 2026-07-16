@@ -7,6 +7,7 @@ const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CommitRegistry = @import("preprocess.zig").CommitRegistry;
 const Parsed = @import("preprocess.zig").Parsed;
+const CommitMeta = @import("preprocess.zig").CommitMeta;
 const MsgToWriter = @import("preprocess.zig").MsgToWriter;
 const Queue = @import("preprocess.zig").Queue;
 const Channel = @import("preprocess.zig").Channel;
@@ -57,7 +58,11 @@ const ParsersHub = struct {
         errdefer gpa.allocator.free(raw);
         const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
         heap_ptr.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
-        heap_ptr.main_parser_block = .{ ._ = {}, .repo = repo, .station = .init(channel, gpa.allocator) };
+        heap_ptr.main_parser_block = .{
+            ._ = {},
+            .repo = repo,
+            .station = .init(channel, gpa.allocator),
+        };
         errdefer heap_ptr.main_parser_block.station.deinit();
         try vcaligner.crash_dump.reg("parser", 0, &heap_ptr.main_parser_block.station.dumpable);
         errdefer vcaligner.crash_dump.unreg("parser", 0);
@@ -261,9 +266,12 @@ pub fn mainParseTakeRepo(
             break :backpressure_multiplier 8;
         },
         .parsers_ctx = undefined,
+        .commit_meta_batch_to_flush = .empty,
         .pool = undefined,
         .wait_group = .{},
     };
+    // 正常路径`commit_meta_batch_to_flush`总是会被flush为空。为错误路径析构。
+    defer ctx.commit_meta_batch_to_flush.deinit(gpa.allocator);
     ctx.parsers_ctx = try .init(n_subparserjobs, repo, channel, gpa, last_diag);
     defer ctx.parsers_ctx.deinit(gpa);
     try ctx.pool.init(.{ .allocator = gpa.allocator, .n_jobs = n_subparserjobs, .track_ids = true });
@@ -276,6 +284,7 @@ pub fn mainParseTakeRepo(
         return customized_error_enum.toError();
     }
     try c_helper.gitErrorCodeToZigError(git_error_code_or_customized_error_code, last_diag);
+    flush_commit_meta_batch(&ctx.commit_meta_batch_to_flush, channel, &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local, gpa);
 }
 
 // NOTE: 依个人风格，一般不把可变内容与不可变内容集中在一个结构体中放置。
@@ -286,6 +295,7 @@ const IndexBuilderCbPayload = struct {
     channel: *Channel,
     pending_tasks_backpressure: usize,
     parsers_ctx: ParsersHub,
+    commit_meta_batch_to_flush: std.ArrayList(CommitMeta),
     pool: vcaligner.Pool,
     wait_group: std.Thread.WaitGroup,
 };
@@ -317,17 +327,24 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
             std.log.err("Commit regisistry put no clobber failed.\n", .{});
             break :main_logic_customized_error err;
         };
-        // TODO: 当前实现是每一个commit立即发送单个任务。
-        // 经考虑完全可以像`parsed`任务的逻辑一样，预先分配足量空间的ArrayList，占满以后再一次性刷给写线程。
-        flush_commit_meta: {
-            const producer_local = &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local;
-            const ticket, const to_produce: *MsgToWriter = ctx.channel.claimProduce(producer_local, null);
-            defer ctx.channel.publishProducedUnsafe(ticket);
-            to_produce.* = .{ .commit_meta = .{
+        append_commit_meta: {
+            const gpa = ctx.parsers_ctx.main_parser_gpa;
+            const to_flush = &ctx.commit_meta_batch_to_flush;
+            if (to_flush.capacity == 0) to_flush.ensureTotalCapacityPrecise(gpa.allocator, flush_threshold: {
+                // XXX: 当前设计为硬编码。或改为用户配置。
+                break :flush_threshold 512;
+            }) catch |err| break :main_logic_customized_error err;
+            to_flush.appendAssumeCapacity(.{
                 .commit_hash = id.*,
                 .commit_seq = commit_seq,
-            } };
-            break :flush_commit_meta;
+            });
+            if (to_flush.items.len == to_flush.capacity) flush_commit_meta_batch(
+                to_flush,
+                ctx.channel,
+                &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local,
+                gpa,
+            );
+            break :append_commit_meta;
         }
         // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。
         const task_in_queue_count = ctx.parsers_ctx.heap_ptr.task_in_queue_count.v.fetchAdd(1, .acquire);
@@ -355,6 +372,17 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     std.debug.assert(IndexBuilderCbCustomizedError == @TypeOf(customized_error));
     const customized_error_enum: IndexBuilderCbCustomizedErrorEnum = .fromError(customized_error);
     return customized_error_enum.toBackingInt();
+}
+
+fn flush_commit_meta_batch(to_flush: *std.ArrayList(CommitMeta), channel: *Channel, producer_local: *Queue.ProducerLocal, gpa: vcaligner.Gpa) void {
+    const ticket, const to_produce: *MsgToWriter = channel.claimProduce(producer_local, null);
+    defer channel.publishProducedUnsafe(ticket);
+    // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
+    to_produce.* = .{ .commit_meta = .{
+        .batch = to_flush.*,
+        .gpa = gpa,
+    } };
+    to_flush.* = .empty;
 }
 
 pub fn subParseTask(

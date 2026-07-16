@@ -32,10 +32,14 @@ pub const Parsed = struct {
         path: []u8,
     };
 };
+pub const CommitMeta = struct {
+    commit_hash: c.git_oid,
+    commit_seq: CommitSeq,
+};
 pub const MsgToWriter = union(enum) {
     commit_meta: struct {
-        commit_hash: c.git_oid,
-        commit_seq: CommitSeq,
+        batch: std.ArrayList(CommitMeta),
+        gpa: vcaligner.Gpa,
     },
     parsed: Parsed,
 };
