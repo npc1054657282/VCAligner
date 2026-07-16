@@ -64,9 +64,9 @@ pub const CommitRegistry = struct {
     // `CommitRegistry`存在跨线程需求。
     // 增量模式下，需要在主解析线程启动前使用它，并在主线程中继续使用。
     // 因此这要求跨线程地保存其分配器，且此分配器应为线程安全的。
-    gpa: std.mem.Allocator,
+    gpa: vcaligner.Gpa,
     pub fn deinit(self: *CommitRegistry) void {
-        self.map.deinit(self.gpa);
+        self.map.deinit(self.gpa.allocator);
         self.* = undefined;
     }
 };
@@ -115,25 +115,25 @@ pub const RocksdbPath = union(enum) {
     }
 };
 
-pub fn preprocess(noalias runconf: *const PrepRunner, gpa: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
     // 此重构版本，主线程为写入线程，解析主线程另开线程。
-    var path_registry: PathRegistry = .{ .map = .empty, .key_arena = .init(gpa) };
-    defer path_registry.deinit(gpa);
+    var path_registry: PathRegistry = .{ .map = .empty, .key_arena = .init(gpa.allocator) };
+    defer path_registry.deinit(gpa.allocator);
     var blob_path_registry: BlobPathRegistry = .empty;
-    defer blob_path_registry.deinit(gpa);
+    defer blob_path_registry.deinit(gpa.allocator);
     var commit_registry: CommitRegistry = .{ .map = .empty, .gpa = gpa };
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
     defer commit_registry.deinit();
-    const queue: Queue = try .init(gpa, runconf.parsed_queue_capacity_log2);
+    const queue: Queue = try .init(gpa.allocator, runconf.parsed_queue_capacity_log2);
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
-    defer queue.deinit(gpa);
+    defer queue.deinit(gpa.allocator);
     // TODO: channel的生存期未来考虑精细设计。
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
     // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-    var main_parser_allocator_instance: vcaligner.GpaInstance = .init();
-    defer main_parser_allocator_instance.deinit();
+    var main_parser_gpa_instance: vcaligner.Gpa.Instance = .init();
+    defer main_parser_gpa_instance.deinit();
     const main_parser: std.Thread, const rocksdb_output: RocksdbPath = libgit2_handoff: {
         var git_error_code = c.git_libgit2_init();
         if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -143,7 +143,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: std.mem.Allocator, la
         // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
         break :libgit2_handoff provisionMainParser(
             runconf,
-            main_parser_allocator_instance.allocator(),
+            main_parser_gpa_instance.gpa(),
             &commit_registry,
             &channel,
             gpa,
@@ -159,7 +159,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: std.mem.Allocator, la
             return err;
         };
     };
-    defer rocksdb_output.deinit(gpa);
+    defer rocksdb_output.deinit(gpa.allocator);
     // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
     // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
     // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
@@ -195,10 +195,10 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: std.mem.Allocator, la
 
 fn provisionMainParser(
     noalias runconf: *const PrepRunner,
-    main_parser_allocator: std.mem.Allocator,
+    main_parser_gpa: vcaligner.Gpa,
     commit_registry: *CommitRegistry,
     channel: *Channel,
-    allocator: std.mem.Allocator,
+    gpa: vcaligner.Gpa,
     last_diag: *diag.Diagnostic,
 ) !struct { std.Thread, RocksdbPath } {
     const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
@@ -214,15 +214,15 @@ fn provisionMainParser(
     // TODO: 将它输出，与repo id一起写进数据库里。
     const oidtype = c.git_repository_oid_type(repo);
     _ = oidtype;
-    const rocksdb_output: RocksdbPath = try .init(runconf, repo, allocator, last_diag);
-    errdefer rocksdb_output.deinit(allocator);
-    const main_parser = try std.Thread.spawn(.{ .allocator = allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
+    const rocksdb_output: RocksdbPath = try .init(runconf, repo, gpa.allocator, last_diag);
+    errdefer rocksdb_output.deinit(gpa.allocator);
+    const main_parser = try std.Thread.spawn(.{ .allocator = gpa.allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
         repo,
         channel,
         // n_jobs是排除rocksdb自动创建线程外的线程数。而解析子线程的数量还需要再排除主解析和写线程各一个。
         runconf.n_jobs - 2,
         commit_registry,
-        main_parser_allocator,
+        main_parser_gpa,
     });
     errdefer comptime unreachable;
     return .{ main_parser, rocksdb_output };

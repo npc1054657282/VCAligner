@@ -12,7 +12,8 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const Key = vcaligner.rocksdb_custom.Key;
 const CommitRange = vcaligner.commit_range.CommitRange;
 
-pub fn analysis(ctx: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
+    const allocator = gpa.allocator;
     _ = last_diag;
     var err_cstr: ?[*:0]u8 = null;
     const db_options = blk: {

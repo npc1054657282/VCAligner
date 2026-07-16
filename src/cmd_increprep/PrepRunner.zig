@@ -191,8 +191,8 @@ pub const cmd = blk: {
         .config(cmd_config);
 };
 
-pub fn run(noalias self: *const PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    try @import("preprocess.zig").preprocess(self, allocator, last_diag);
+pub fn run(noalias self: *const PrepRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
+    try @import("preprocess.zig").preprocess(self, gpa, last_diag);
     return;
 }
 pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {

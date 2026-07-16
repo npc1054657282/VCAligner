@@ -17,7 +17,7 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 // 将来可能将程序设计为服务器式的，所有解析线程并非只分析一个repo而可能分析数个repo。因此依然将repo以参数形式传入而非放入此上下文中。
 const ParsersHub = struct {
     heap_ptr: *align(heap_align.toByteUnits()) Header,
-    main_parser_gpa: std.mem.Allocator,
+    main_parser_gpa: vcaligner.Gpa,
     main_parser_last_diag: *diag.Diagnostic,
     n_subparserjobs: usize,
     pub const Header = struct {
@@ -44,7 +44,7 @@ const ParsersHub = struct {
     pub const heap_align: std.mem.Alignment = .max(.of(Header), .of(SubParser));
     pub const SubParser = struct {
         _: void align(std.atomic.cache_line),
-        gpa_instance: vcaligner.GpaInstance,
+        gpa_instance: vcaligner.Gpa.Instance,
         diagnostics: diag.Diagnostics,
         // NOTE: 没有放在ParserStation内，虽然与主类型的相同，但生存周期和主parser的不同，放在外面便于理解。
         // 每个子解析线程都需要一个独立创建的repo，不应当复用。这是旧实现的一个重要问题，此重构实现修复。
@@ -52,12 +52,12 @@ const ParsersHub = struct {
         repo: *c.git_repository,
         station: ParserStation,
     };
-    pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, gpa: std.mem.Allocator, last_diag: *diag.Diagnostic) !ParsersHub {
-        const raw = try gpa.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
-        errdefer gpa.free(raw);
+    pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !ParsersHub {
+        const raw = try gpa.allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
+        errdefer gpa.allocator.free(raw);
         const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
         heap_ptr.task_in_queue_count = .{ ._ = {}, .v = .init(0) };
-        heap_ptr.main_parser_block = .{ ._ = {}, .repo = repo, .station = .init(channel, gpa) };
+        heap_ptr.main_parser_block = .{ ._ = {}, .repo = repo, .station = .init(channel, gpa.allocator) };
         errdefer heap_ptr.main_parser_block.station.deinit();
         try vcaligner.crash_dump.reg("parser", 0, &heap_ptr.main_parser_block.station.dumpable);
         errdefer vcaligner.crash_dump.unreg("parser", 0);
@@ -69,7 +69,7 @@ const ParsersHub = struct {
         } } = sub_parser_blocks_init: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
             sub_parser_block.gpa_instance = .init();
             errdefer sub_parser_block.gpa_instance.deinit();
-            const sub_parser_allocator = sub_parser_block.gpa_instance.allocator();
+            const sub_parser_allocator = sub_parser_block.gpa_instance.gpa().allocator;
             sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
             errdefer sub_parser_block.diagnostics.arena.deinit();
             sub_parser_block.repo = repo: {
@@ -108,7 +108,7 @@ const ParsersHub = struct {
             },
         };
     }
-    pub fn deinit(noalias self: *const ParsersHub, gpa: std.mem.Allocator) void {
+    pub fn deinit(noalias self: *const ParsersHub, gpa: vcaligner.Gpa) void {
         vcaligner.crash_dump.unreg("parser", 0);
         self.heap_ptr.main_parser_block.station.deinit();
         const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
@@ -120,10 +120,10 @@ const ParsersHub = struct {
             sub_parser_block.gpa_instance.deinit();
         }
         const raw = @as([*]align(heap_align.toByteUnits()) u8, @ptrCast(self.heap_ptr))[0..heapSize(self.n_subparserjobs)];
-        gpa.free(raw);
+        gpa.allocator.free(raw);
     }
     pub fn lctxFromThreadId(noalias self: *const ParsersHub, thread_id: usize) struct {
-        std.mem.Allocator,
+        vcaligner.Gpa,
         *diag.Diagnostic,
         *c.git_repository,
         *ParserStation,
@@ -136,7 +136,7 @@ const ParsersHub = struct {
         };
         const sub_parser_block: *SubParser = &self.heap_ptr.subParserBlocksPtr()[0..heapSize(self.n_subparserjobs)][thread_id - 1];
         return .{
-            sub_parser_block.gpa_instance.allocator(),
+            sub_parser_block.gpa_instance.gpa(),
             &sub_parser_block.diagnostics.last_diagnostic,
             sub_parser_block.repo,
             &sub_parser_block.station,
@@ -192,13 +192,13 @@ pub fn mainParseTaskTakeRepo(
     channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
-    gpa: std.mem.Allocator,
+    gpa: vcaligner.Gpa,
 ) void {
     // XXX: 此处的`main_parse_diagnostics`会进行某种复用，详见`Parsers`。另一种更简单的设计是分别使用两个diagnostics对象，但我停不下来了。
     // TODO: 经过仔细思考：当前的诊断模式是反模式，正确的模式是依赖注入的错误处理上下文。
     // 通过定制的错误处理上下文逻辑，辅以合理的错误处理传参规范，可以实现当前诊断模式的一切行为，且具体行为由错误处理上下文而非子模块自己去做。
     // 将来应当直接替换，且错误处理上下文极有可能由调用者传入。
-    var main_parse_diagnostics: diag.Diagnostics = .{ .arena = .init(gpa) };
+    var main_parse_diagnostics: diag.Diagnostics = .{ .arena = .init(gpa.allocator) };
     defer main_parse_diagnostics.arena.deinit();
     const last_diag = &main_parse_diagnostics.last_diagnostic;
     (main_parse_ret: {
@@ -240,7 +240,7 @@ pub fn mainParseTakeRepo(
     channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
-    gpa: std.mem.Allocator,
+    gpa: vcaligner.Gpa,
     last_diag: *diag.Diagnostic,
 ) !void {
     defer c.git_repository_free(repo);
@@ -266,7 +266,7 @@ pub fn mainParseTakeRepo(
     };
     ctx.parsers_ctx = try .init(n_subparserjobs, repo, channel, gpa, last_diag);
     defer ctx.parsers_ctx.deinit(gpa);
-    try ctx.pool.init(.{ .allocator = gpa, .n_jobs = n_subparserjobs, .track_ids = true });
+    try ctx.pool.init(.{ .allocator = gpa.allocator, .n_jobs = n_subparserjobs, .track_ids = true });
     defer ctx.pool.deinit();
     // TODO: 在报错的情况下，真的还需要把堆积的任务做完吗？预测如果升级到0.16，`defer`内的逻辑需要修改为取消，而此处的逻辑不再放在`defer`内。
     defer ctx.pool.waitAndWork(&ctx.wait_group);
@@ -313,7 +313,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
         if (ctx.commit_registry.map.contains(id.*)) return 0;
         // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
         const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
-        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.gpa, id.*, {}) catch |err| {
+        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.gpa.allocator, id.*, {}) catch |err| {
             std.log.err("Commit regisistry put no clobber failed.\n", .{});
             break :main_logic_customized_error err;
         };
@@ -373,7 +373,7 @@ pub fn subParseTask(
         }
     }
     lctx.to_flush = .{
-        .arena = .init(gpa),
+        .arena = .init(gpa.allocator),
         .commit_seq = commit_seq,
         .pairs = .empty,
     };

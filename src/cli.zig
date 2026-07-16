@@ -1,8 +1,8 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const diag = @import("diagnostics.zig");
+const vcaligner = @import("vcaligner");
+const diag = vcaligner.diag;
 pub const Runner = union(enum) {
-    prep: @import("cmd_prep/PrepRunner.zig"),
     increprep: @import("cmd_increprep/PrepRunner.zig"),
     ana: @import("cmd_ana/AnaRunner.zig"),
     pub const cmd_config: CommandConfig = .{};
@@ -44,9 +44,9 @@ pub const Runner = union(enum) {
         }
     }
     /// NOTE: allocator必须线程安全
-    pub fn run(self: *Runner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+    pub fn run(self: *Runner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
         switch (self.*) {
-            inline else => |*case| return case.run(allocator, last_diag),
+            inline else => |*case| return case.run(gpa, last_diag),
         }
     }
     pub const Error = error{

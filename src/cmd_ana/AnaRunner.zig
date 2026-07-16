@@ -104,8 +104,8 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("ana"))
     .arg(zargs.Arg.optArg("point_lookup_cache_mb", u64).long("point-lookup-cache-mb").default(512))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"));
 
-pub fn run(self: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    try @import("analysis.zig").analysis(self, allocator, last_diag);
+pub fn run(self: *AnaRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
+    try @import("analysis.zig").analysis(self, gpa, last_diag);
     return;
 }
 pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
