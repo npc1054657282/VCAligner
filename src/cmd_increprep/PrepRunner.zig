@@ -73,7 +73,7 @@ proc_stamp: struct {
 const cmd_config: cli.CommandConfig = cli.Runner.cmd_config;
 pub const cmd = blk: {
     @setEvalBranchQuota(2048);
-    break :blk cli.Runner.Global.sharedArgs(zargs.Command.new("increprep"))
+    break :blk cli.Runner.Global.sharedArgs(zargs.Command.new("prep"))
         // 待预处理的git仓库路径。要求此路径下包含一个`.git`目录。此选项与`bare-repo-path`至少需要提供一个。如果有`bare-repo-path`参数，此选项被无视。
         .arg(zargs.Arg.optArg("repo_path", ?[]const u8).long("repo-path").help(
             \\Path to the target Git repository (must contain a .git directory). 
@@ -191,7 +191,7 @@ pub const cmd = blk: {
         .config(cmd_config);
 };
 
-pub fn run(noalias self: *const PrepRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
+pub fn run(noalias self: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     try @import("preprocess.zig").preprocess(self, gpa, last_diag);
     return;
 }
@@ -255,7 +255,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         // 对于自动compaction这个最小值虽然偏大，但是默认列族比其他列族的缓冲数量要多一些是合理的。这个设置大了仅仅是多消耗一点内存，问题不大。
         break :blk if (default_cf_max_write_buffer_number < 6) 6 else @intFromFloat(@trunc(default_cf_max_write_buffer_number));
     };
-    return .{ .increprep = .{
+    return .{ .prep = .{
         .global = .init(args),
         .bare_repo_path = bare_repo_path,
         .mode_conf = mode_conf,

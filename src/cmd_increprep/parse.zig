@@ -18,7 +18,7 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 // 将来可能将程序设计为服务器式的，所有解析线程并非只分析一个repo而可能分析数个repo。因此依然将repo以参数形式传入而非放入此上下文中。
 const ParsersHub = struct {
     heap_ptr: *align(heap_align.toByteUnits()) Header,
-    main_parser_gpa: vcaligner.Gpa,
+    main_parser_gpa: vcaligner.gpa.Concurrent,
     main_parser_last_diag: *diag.Diagnostic,
     n_subparserjobs: usize,
     pub const Header = struct {
@@ -45,7 +45,7 @@ const ParsersHub = struct {
     pub const heap_align: std.mem.Alignment = .max(.of(Header), .of(SubParser));
     pub const SubParser = struct {
         _: void align(std.atomic.cache_line),
-        gpa_instance: vcaligner.Gpa.Instance,
+        gpa_instance: vcaligner.gpa.Concurrent.Instance,
         diagnostics: diag.Diagnostics,
         // NOTE: 没有放在ParserStation内，虽然与主类型的相同，但生存周期和主parser的不同，放在外面便于理解。
         // 每个子解析线程都需要一个独立创建的repo，不应当复用。这是旧实现的一个重要问题，此重构实现修复。
@@ -53,7 +53,7 @@ const ParsersHub = struct {
         repo: *c.git_repository,
         station: ParserStation,
     };
-    pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !ParsersHub {
+    pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !ParsersHub {
         const raw = try gpa.allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
         errdefer gpa.allocator.free(raw);
         const heap_ptr: *align(heap_align.toByteUnits()) Header = @ptrCast(raw);
@@ -74,7 +74,7 @@ const ParsersHub = struct {
         } } = sub_parser_blocks_init: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
             sub_parser_block.gpa_instance = .init();
             errdefer sub_parser_block.gpa_instance.deinit();
-            const sub_parser_allocator = sub_parser_block.gpa_instance.gpa().allocator;
+            const sub_parser_allocator = sub_parser_block.gpa_instance.gpac().allocator;
             sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
             errdefer sub_parser_block.diagnostics.arena.deinit();
             sub_parser_block.repo = repo: {
@@ -113,7 +113,7 @@ const ParsersHub = struct {
             },
         };
     }
-    pub fn deinit(noalias self: *const ParsersHub, gpa: vcaligner.Gpa) void {
+    pub fn deinit(noalias self: *const ParsersHub, gpa: vcaligner.gpa.Concurrent) void {
         vcaligner.crash_dump.unreg("parser", 0);
         self.heap_ptr.main_parser_block.station.deinit();
         const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
@@ -128,7 +128,7 @@ const ParsersHub = struct {
         gpa.allocator.free(raw);
     }
     pub fn lctxFromThreadId(noalias self: *const ParsersHub, thread_id: usize) struct {
-        vcaligner.Gpa,
+        vcaligner.gpa.Concurrent,
         *diag.Diagnostic,
         *c.git_repository,
         *ParserStation,
@@ -141,7 +141,7 @@ const ParsersHub = struct {
         };
         const sub_parser_block: *SubParser = &self.heap_ptr.subParserBlocksPtr()[0..heapSize(self.n_subparserjobs)][thread_id - 1];
         return .{
-            sub_parser_block.gpa_instance.gpa(),
+            sub_parser_block.gpa_instance.gpac(),
             &sub_parser_block.diagnostics.last_diagnostic,
             sub_parser_block.repo,
             &sub_parser_block.station,
@@ -159,24 +159,30 @@ const ParserStation = struct {
     current_task_scratch_arena: StArena,
     // `to_flush`为当前批次内容，flush过了就重置。
     // NOTE: 在当前实现中，`to_flush`作为批次，不会跨任务存在。之所以把它放在此上下文中，是考虑到未来可能更改实现使得它可以跨任务存在。
-    to_flush: Parsed,
+    to_flush: union(enum) {
+        uninited: void,
+        inited: Parsed,
+    },
     // 这个东西完全是为了方便Dumpable去dump才定义的。实际上它完全和`to_flush`里的`commit_seq`重复。
     // TODO: 当dump机制被彻底弃用后，删除此字段。
     maybe_commit_seq_to_dump: ?CommitSeq,
     // 当全局崩溃时，打印相关信息。目前打印arena分配的空间大小。
     // TODO: 此机制终将被彻底弃用。
     dumpable: vcaligner.CrashDump.Dumpable,
-
     pub fn init(channel: *Channel, allocator: std.mem.Allocator) ParserStation {
         return .{
             .producer_local = channel.mpsc_queue_ref.initProducerLocal(),
             .current_task_scratch_arena = .init(allocator),
-            .to_flush = undefined,
+            .to_flush = .uninited,
             .maybe_commit_seq_to_dump = null,
             .dumpable = .{ .dumpFn = dumpFn },
         };
     }
     pub fn deinit(self: *ParserStation) void {
+        switch (self.to_flush) {
+            .uninited => {},
+            .inited => |*parsed| parsed.deinit(),
+        }
         self.current_task_scratch_arena.deinit();
         self.* = undefined;
     }
@@ -197,12 +203,14 @@ pub fn mainParseTaskTakeRepo(
     channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
-    gpa: vcaligner.Gpa,
 ) void {
     // XXX: 此处的`main_parse_diagnostics`会进行某种复用，详见`Parsers`。另一种更简单的设计是分别使用两个diagnostics对象，但我停不下来了。
     // TODO: 经过仔细思考：当前的诊断模式是反模式，正确的模式是依赖注入的错误处理上下文。
     // 通过定制的错误处理上下文逻辑，辅以合理的错误处理传参规范，可以实现当前诊断模式的一切行为，且具体行为由错误处理上下文而非子模块自己去做。
     // 将来应当直接替换，且错误处理上下文极有可能由调用者传入。
+    var main_parser_gpa_instance: vcaligner.gpa.Concurrent.Instance = .init();
+    defer main_parser_gpa_instance.deinit();
+    const gpa = main_parser_gpa_instance.gpac();
     var main_parse_diagnostics: diag.Diagnostics = .{ .arena = .init(gpa.allocator) };
     defer main_parse_diagnostics.arena.deinit();
     const last_diag = &main_parse_diagnostics.last_diagnostic;
@@ -245,7 +253,7 @@ pub fn mainParseTakeRepo(
     channel: *Channel,
     n_subparserjobs: usize,
     commit_registry: *CommitRegistry,
-    gpa: vcaligner.Gpa,
+    gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
 ) !void {
     defer c.git_repository_free(repo);
@@ -266,12 +274,15 @@ pub fn mainParseTakeRepo(
             break :backpressure_multiplier 8;
         },
         .parsers_ctx = undefined,
-        .commit_meta_batch_to_flush = .empty,
+        .commit_meta_batch_to_flush = .uninited,
         .pool = undefined,
         .wait_group = .{},
     };
-    // 正常路径`commit_meta_batch_to_flush`总是会被flush为空。为错误路径析构。
-    defer ctx.commit_meta_batch_to_flush.deinit(gpa.allocator);
+    // 正常路径`commit_meta_batch_to_flush`总是会被flush为uninited。为错误路径析构。
+    defer switch (ctx.commit_meta_batch_to_flush) {
+        .uninited => {},
+        .inited => |*to_flush| to_flush.deinit(),
+    };
     ctx.parsers_ctx = try .init(n_subparserjobs, repo, channel, gpa, last_diag);
     defer ctx.parsers_ctx.deinit(gpa);
     try ctx.pool.init(.{ .allocator = gpa.allocator, .n_jobs = n_subparserjobs, .track_ids = true });
@@ -284,7 +295,13 @@ pub fn mainParseTakeRepo(
         return customized_error_enum.toError();
     }
     try c_helper.gitErrorCodeToZigError(git_error_code_or_customized_error_code, last_diag);
-    flush_commit_meta_batch(&ctx.commit_meta_batch_to_flush, channel, &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local, gpa);
+    switch (ctx.commit_meta_batch_to_flush) {
+        .inited => |*to_flush| {
+            flush_commit_meta_batch(to_flush, channel, &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local);
+            ctx.commit_meta_batch_to_flush = .uninited;
+        },
+        .uninited => {},
+    }
 }
 
 // NOTE: 依个人风格，一般不把可变内容与不可变内容集中在一个结构体中放置。
@@ -295,7 +312,10 @@ const IndexBuilderCbPayload = struct {
     channel: *Channel,
     pending_tasks_backpressure: usize,
     parsers_ctx: ParsersHub,
-    commit_meta_batch_to_flush: std.ArrayList(CommitMeta),
+    commit_meta_batch_to_flush: union(enum) {
+        uninited: void,
+        inited: CommitMeta.Batch,
+    },
     pool: vcaligner.Pool,
     wait_group: std.Thread.WaitGroup,
 };
@@ -323,27 +343,38 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
         if (ctx.commit_registry.map.contains(id.*)) return 0;
         // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
         const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
-        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.gpa.allocator, id.*, {}) catch |err| {
+        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.gpa_instance.gpao().allocator, id.*, {}) catch |err| {
             std.log.err("Commit regisistry put no clobber failed.\n", .{});
             break :main_logic_customized_error err;
         };
         append_commit_meta: {
-            const gpa = ctx.parsers_ctx.main_parser_gpa;
             const to_flush = &ctx.commit_meta_batch_to_flush;
-            if (to_flush.capacity == 0) to_flush.ensureTotalCapacityPrecise(gpa.allocator, flush_threshold: {
-                // XXX: 当前设计为硬编码。或改为用户配置。
-                break :flush_threshold 512;
-            }) catch |err| break :main_logic_customized_error err;
-            to_flush.appendAssumeCapacity(.{
+            switch (to_flush.*) {
+                .inited => {},
+                .uninited => {
+                    to_flush.* = .{ .inited = .{ .gpa_instance = .init(), .batch = undefined } };
+                    errdefer {
+                        to_flush.inited.gpa_instance.deinit();
+                        to_flush.* = .uninited;
+                    }
+                    to_flush.inited.batch = std.ArrayList(CommitMeta).initCapacity(to_flush.inited.gpa_instance.gpao().allocator, flush_threshold: {
+                        // XXX: 当前设计为硬编码。或改为用户配置。
+                        break :flush_threshold 512;
+                    }) catch |err| break :main_logic_customized_error err;
+                },
+            }
+            to_flush.inited.batch.appendAssumeCapacity(.{
                 .commit_hash = id.*,
                 .commit_seq = commit_seq,
             });
-            if (to_flush.items.len == to_flush.capacity) flush_commit_meta_batch(
-                to_flush,
-                ctx.channel,
-                &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local,
-                gpa,
-            );
+            if (to_flush.inited.batch.items.len == to_flush.inited.batch.capacity) {
+                flush_commit_meta_batch(
+                    &to_flush.inited,
+                    ctx.channel,
+                    &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local,
+                );
+                to_flush.* = .uninited;
+            }
             break :append_commit_meta;
         }
         // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。
@@ -374,15 +405,12 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     return customized_error_enum.toBackingInt();
 }
 
-fn flush_commit_meta_batch(to_flush: *std.ArrayList(CommitMeta), channel: *Channel, producer_local: *Queue.ProducerLocal, gpa: vcaligner.Gpa) void {
+fn flush_commit_meta_batch(to_flush: *CommitMeta.Batch, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
     const ticket, const to_produce: *MsgToWriter = channel.claimProduce(producer_local, null);
     defer channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
-    to_produce.* = .{ .commit_meta = .{
-        .batch = to_flush.*,
-        .gpa = gpa,
-    } };
-    to_flush.* = .empty;
+    to_produce.* = .{ .commit_meta = to_flush.* };
+    to_flush.* = undefined;
 }
 
 pub fn subParseTask(
@@ -395,16 +423,12 @@ pub fn subParseTask(
     // 进入解析，降低积压的`task_in_queue_count`
     _ = ctx.heap_ptr.task_in_queue_count.v.fetchSub(1, .release);
     const gpa, const last_diag, const repo, const lctx = ctx.lctxFromThreadId(thrd_id);
+    _ = gpa;
     defer {
         if (!lctx.current_task_scratch_arena.reset(.retain_capacity)) {
             std.log.warn("Retain capacity failed, free all", .{});
         }
     }
-    lctx.to_flush = .{
-        .arena = .init(gpa.allocator),
-        .commit_seq = commit_seq,
-        .pairs = .empty,
-    };
     // 交由写线程释放。
     lctx.maybe_commit_seq_to_dump = commit_seq;
 
@@ -423,13 +447,14 @@ pub fn subParseTask(
             break :blk tree.?;
         };
         defer c.git_tree_free(tree);
-        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), channel) catch |err| {
-            // NOTE: `parse_tree`内会基于to_flush的arena进行内存分配。
-            // 如果是正确情况那就将其内容flush到写线程。如果是错误情况就释放它。
-            lctx.to_flush.arena.deinit();
-            break :main_logic err;
-        };
-        if (lctx.to_flush.pairs.capacity != 0) flush_relation_batch(lctx, channel);
+        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), commit_seq, channel) catch |err| break :main_logic err;
+        switch (lctx.to_flush) {
+            .inited => |*parsed| {
+                flush_relation_batch(parsed, channel, &lctx.producer_local);
+                lctx.to_flush = .uninited;
+            },
+            .uninited => {},
+        }
         break :main_logic {};
     }) catch |err| {
         const diagnostics: *diag.Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diag));
@@ -439,7 +464,7 @@ pub fn subParseTask(
     };
 }
 
-fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStation, base_path: []const u8, channel: *Channel) !void {
+fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStation, base_path: []const u8, commit_seq: vcaligner.rocksdb_custom.CommitSeq, channel: *Channel) !void {
     const entry_count = c.git_tree_entrycount(tree);
     for (0..entry_count) |i| {
         const entry = c.git_tree_entry_byindex(tree, i).?;
@@ -463,41 +488,53 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
                     break :blk try std.fmt.allocPrintSentinel(lctx.current_task_scratch_arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
                 };
                 defer lctx.current_task_scratch_arena.allocator().free(child_path);
-                try parse_tree(subtree, repo, lctx, child_path, channel);
+                try parse_tree(subtree, repo, lctx, child_path, commit_seq, channel);
             },
             c.GIT_OBJECT_BLOB => {
                 append_relation: {
-                    // 这个分配器的存在时间是脆弱的，在`append_relation`块之后就可能被重置。
-                    const to_flush_arena_allocator = lctx.to_flush.arena.allocator();
-                    if (lctx.to_flush.pairs.capacity == 0) try lctx.to_flush.pairs.ensureTotalCapacityPrecise(to_flush_arena_allocator, flush_threshold: {
-                        // XXX: 当前设计为硬编码。或改为用户配置。
-                        break :flush_threshold 512;
-                    });
+                    var to_flush_arena: vcaligner.StArena = undefined;
+                    switch (lctx.to_flush) {
+                        .uninited => {
+                            lctx.to_flush = .{ .inited = .{
+                                .gpa_instance = .init(),
+                                .arena_state = undefined,
+                                .commit_seq = commit_seq,
+                                .pairs = undefined,
+                            } };
+                            errdefer {
+                                lctx.to_flush.inited.gpa_instance.deinit();
+                                lctx.to_flush = .uninited;
+                            }
+                            to_flush_arena = .init(lctx.to_flush.inited.gpa_instance.gpao().allocator);
+                            errdefer to_flush_arena.deinit();
+                            lctx.to_flush.inited.pairs = try .initCapacity(to_flush_arena.allocator(), flush_threshold: {
+                                // XXX: 当前设计为硬编码。或改为用户配置。
+                                break :flush_threshold 512;
+                            });
+                            errdefer comptime unreachable;
+                        },
+                        .inited => |*parsed| to_flush_arena = parsed.arena_state.promote(parsed.gpa_instance.gpao().allocator),
+                    }
+                    defer lctx.to_flush.inited.arena_state = to_flush_arena.state;
                     // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。
                     const full_path = blk: {
                         const entry_name = c.git_tree_entry_name(entry);
                         const entry_name_slice: []const u8 = std.mem.span(entry_name);
                         if (base_path.len == 0) {
-                            break :blk try to_flush_arena_allocator.dupe(u8, entry_name_slice);
+                            break :blk try to_flush_arena.allocator().dupe(u8, entry_name_slice);
                         }
-                        break :blk try std.fmt.allocPrintSentinel(to_flush_arena_allocator, "{s}/{s}", .{ base_path, entry_name_slice }, 0);
+                        break :blk try std.fmt.allocPrintSentinel(to_flush_arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
                     };
                     errdefer comptime unreachable;
-                    lctx.to_flush.pairs.appendAssumeCapacity(.{
+                    lctx.to_flush.inited.pairs.appendAssumeCapacity(.{
                         .path = full_path,
                         .blob_hash = entry_oid.*,
                     });
                     break :append_relation;
                 }
-                if (lctx.to_flush.pairs.items.len == lctx.to_flush.pairs.capacity) {
-                    const allocator = lctx.to_flush.arena.child_allocator;
-                    const commit_seq = lctx.to_flush.commit_seq;
-                    flush_relation_batch(lctx, channel);
-                    lctx.to_flush = .{
-                        .arena = .init(allocator),
-                        .commit_seq = commit_seq,
-                        .pairs = .empty,
-                    };
+                if (lctx.to_flush.inited.pairs.items.len == lctx.to_flush.inited.pairs.capacity) {
+                    flush_relation_batch(&lctx.to_flush.inited, channel, &lctx.producer_local);
+                    lctx.to_flush = .uninited;
                 }
             },
             else => {},
@@ -505,10 +542,10 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
     }
 }
 
-fn flush_relation_batch(lctx: *ParserStation, channel: *Channel) void {
-    const ticket, const to_produce: *MsgToWriter = channel.claimProduce(&lctx.producer_local, null);
+fn flush_relation_batch(to_flush: *Parsed, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
+    const ticket, const to_produce: *MsgToWriter = channel.claimProduce(producer_local, null);
     defer channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
-    to_produce.* = .{ .parsed = lctx.to_flush };
-    lctx.to_flush = undefined;
+    to_produce.* = .{ .parsed = to_flush.* };
+    to_flush.* = undefined;
 }

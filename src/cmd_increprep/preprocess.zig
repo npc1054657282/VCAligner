@@ -21,7 +21,8 @@ pub const Parsed = struct {
     // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
     // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
     // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
-    arena: StArena,
+    gpa_instance: vcaligner.gpa.Owned.Instance,
+    arena_state: StArena.State,
     commit_seq: CommitSeq,
     // NOTE: `parsed_unints`的大小是预先分配好的，由flush阈值决定，并非动态增长
     // 因此它同样基于本结构内的`arena`分配。
@@ -31,16 +32,25 @@ pub const Parsed = struct {
         // `path`的所有权属于`Parsed`内的`arena`。
         path: []u8,
     };
+    pub fn deinit(self: *Parsed) void {
+        self.arena_state.promote(self.gpa_instance.gpao().allocator).deinit();
+        self.gpa_instance.deinit();
+    }
 };
 pub const CommitMeta = struct {
     commit_hash: c.git_oid,
     commit_seq: CommitSeq,
+    pub const Batch = struct {
+        batch: std.ArrayList(CommitMeta),
+        gpa_instance: vcaligner.gpa.Owned.Instance,
+        pub fn deinit(self: *Batch) void {
+            self.batch.deinit(self.gpa_instance.gpao().allocator);
+            self.gpa_instance.deinit();
+        }
+    };
 };
 pub const MsgToWriter = union(enum) {
-    commit_meta: struct {
-        batch: std.ArrayList(CommitMeta),
-        gpa: vcaligner.Gpa,
-    },
+    commit_meta: CommitMeta.Batch,
     parsed: Parsed,
 };
 pub const Queue = @import("mpsc_queue").AnyMpscQueue(MsgToWriter, null);
@@ -63,14 +73,31 @@ pub const PathRegistry = struct {
 };
 pub const BlobPathRegistry = std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq);
 
+pub const WriterBoundRegistries = struct {
+    gpa_instance: vcaligner.gpa.Owned.Instance,
+    path_registry: PathRegistry,
+    blob_path_registry: BlobPathRegistry,
+    pub fn init(self: *WriterBoundRegistries) void {
+        self.gpa_instance = .init();
+        self.path_registry = .{ .map = .empty, .key_arena = .init(self.gpa_instance.gpao().allocator) };
+        self.blob_path_registry = .empty;
+    }
+    pub fn deinit(self: *WriterBoundRegistries) void {
+        self.blob_path_registry.deinit(self.gpa_instance.gpao().allocator);
+        self.path_registry.deinit(self.gpa_instance.gpao().allocator);
+        self.gpa_instance.deinit();
+    }
+};
+
 pub const CommitRegistry = struct {
     map: std.AutoHashMapUnmanaged(c.git_oid, void),
     // `CommitRegistry`存在跨线程需求。
     // 增量模式下，需要在主解析线程启动前使用它，并在主线程中继续使用。
     // 因此这要求跨线程地保存其分配器，且此分配器应为线程安全的。
-    gpa: vcaligner.Gpa,
+    gpa_instance: vcaligner.gpa.Owned.Instance,
     pub fn deinit(self: *CommitRegistry) void {
-        self.map.deinit(self.gpa.allocator);
+        self.map.deinit(self.gpa_instance.gpao().allocator);
+        self.gpa_instance.deinit();
         self.* = undefined;
     }
 };
@@ -119,13 +146,13 @@ pub const RocksdbPath = union(enum) {
     }
 };
 
-pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
-    // 此重构版本，主线程为写入线程，解析主线程另开线程。
-    var path_registry: PathRegistry = .{ .map = .empty, .key_arena = .init(gpa.allocator) };
-    defer path_registry.deinit(gpa.allocator);
-    var blob_path_registry: BlobPathRegistry = .empty;
-    defer blob_path_registry.deinit(gpa.allocator);
-    var commit_registry: CommitRegistry = .{ .map = .empty, .gpa = gpa };
+pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+    // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
+    // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
+    var writer_bound_registries: WriterBoundRegistries = undefined;
+    writer_bound_registries.init();
+    defer writer_bound_registries.deinit();
+    var commit_registry: CommitRegistry = .{ .map = .empty, .gpa_instance = .init() };
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
     defer commit_registry.deinit();
@@ -136,8 +163,6 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.Gpa, last_d
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
     // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-    var main_parser_gpa_instance: vcaligner.Gpa.Instance = .init();
-    defer main_parser_gpa_instance.deinit();
     const main_parser: std.Thread, const rocksdb_output: RocksdbPath = libgit2_handoff: {
         var git_error_code = c.git_libgit2_init();
         if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
@@ -147,7 +172,6 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.Gpa, last_d
         // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
         break :libgit2_handoff provisionMainParser(
             runconf,
-            main_parser_gpa_instance.gpa(),
             &commit_registry,
             &channel,
             gpa,
@@ -199,10 +223,9 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.Gpa, last_d
 
 fn provisionMainParser(
     noalias runconf: *const PrepRunner,
-    main_parser_gpa: vcaligner.Gpa,
     commit_registry: *CommitRegistry,
     channel: *Channel,
-    gpa: vcaligner.Gpa,
+    gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
 ) !struct { std.Thread, RocksdbPath } {
     const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
@@ -226,7 +249,6 @@ fn provisionMainParser(
         // n_jobs是排除rocksdb自动创建线程外的线程数。而解析子线程的数量还需要再排除主解析和写线程各一个。
         runconf.n_jobs - 2,
         commit_registry,
-        main_parser_gpa,
     });
     errdefer comptime unreachable;
     return .{ main_parser, rocksdb_output };

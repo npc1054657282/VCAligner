@@ -3,7 +3,7 @@ const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 pub const Runner = union(enum) {
-    increprep: @import("cmd_increprep/PrepRunner.zig"),
+    prep: @import("cmd_increprep/PrepRunner.zig"),
     ana: @import("cmd_ana/AnaRunner.zig"),
     pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
@@ -44,7 +44,7 @@ pub const Runner = union(enum) {
         }
     }
     /// NOTE: allocator必须线程安全
-    pub fn run(self: *Runner, gpa: vcaligner.Gpa, last_diag: *diag.Diagnostic) !void {
+    pub fn run(self: *Runner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
         switch (self.*) {
             inline else => |*case| return case.run(gpa, last_diag),
         }
