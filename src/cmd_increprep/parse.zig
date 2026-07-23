@@ -52,6 +52,30 @@ const ParsersHub = struct {
         // [参见](https://gitlab.com/gitlab-org/libgit2/-/blob/master/docs/threading.md)
         repo: *c.git_repository,
         station: ParserStation,
+        fn init(self: *SubParser, repo_path: [*c]const u8, last_diag: *diag.Diagnostic, channel: *Channel, slice_id: usize) !void {
+            self.gpa_instance = .init();
+            errdefer self.gpa_instance.deinit();
+            const sub_parser_allocator = self.gpa_instance.gpac().allocator;
+            self.diagnostics = .{ .arena = .init(sub_parser_allocator) };
+            errdefer self.diagnostics.arena.deinit();
+            self.repo = repo: {
+                var sub_parser_block_repo: ?*c.git_repository = undefined;
+                const git_error_code = c.git_repository_open_bare(&sub_parser_block_repo, repo_path);
+                try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+                break :repo sub_parser_block_repo.?;
+            };
+            errdefer c.git_repository_free(self.repo);
+            self.station = .init(channel, sub_parser_allocator);
+            errdefer self.station.deinit();
+            try vcaligner.crash_dump.reg("parser", slice_id + 1, &self.station.dumpable);
+        }
+        fn deinit(self: *SubParser, slice_id: usize) void {
+            vcaligner.crash_dump.unreg("parser", slice_id + 1);
+            self.station.deinit();
+            c.git_repository_free(self.repo);
+            self.diagnostics.arena.deinit();
+            self.gpa_instance.deinit();
+        }
     };
     pub fn init(n_subparserjobs: usize, repo: *c.git_repository, channel: *Channel, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !ParsersHub {
         const raw = try gpa.allocator.alignedAlloc(u8, heap_align, heapSize(n_subparserjobs));
@@ -69,24 +93,10 @@ const ParsersHub = struct {
         const repo_path = c.git_repository_path(repo);
         const sub_parser_blocks: []SubParser = heap_ptr.subParserBlocksPtr()[0..n_subparserjobs];
         const sub_parser_blocks_init_result: union(enum) { success: void, failed: struct {
-            err: std.mem.Allocator.Error,
+            err: (std.mem.Allocator.Error || c_helper.Libgit2Error || error{UnableToConstructDiagnostic}),
             slice_id: usize,
         } } = sub_parser_blocks_init: for (sub_parser_blocks, 0..) |*sub_parser_block, slice_id| {
-            sub_parser_block.gpa_instance = .init();
-            errdefer sub_parser_block.gpa_instance.deinit();
-            const sub_parser_allocator = sub_parser_block.gpa_instance.gpac().allocator;
-            sub_parser_block.diagnostics = .{ .arena = .init(sub_parser_allocator) };
-            errdefer sub_parser_block.diagnostics.arena.deinit();
-            sub_parser_block.repo = repo: {
-                var sub_parser_block_repo: ?*c.git_repository = undefined;
-                const git_error_code = c.git_repository_open_bare(&sub_parser_block_repo, repo_path);
-                try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-                break :repo sub_parser_block_repo.?;
-            };
-            errdefer c.git_repository_free(sub_parser_block.repo);
-            sub_parser_block.station = .init(channel, sub_parser_allocator);
-            errdefer sub_parser_block.station.deinit();
-            vcaligner.crash_dump.reg("parser", slice_id + 1, &sub_parser_block.station.dumpable) catch |err| break :sub_parser_blocks_init .{
+            sub_parser_block.init(repo_path, last_diag, channel, slice_id) catch |err| break :sub_parser_blocks_init .{
                 .failed = .{
                     .err = err,
                     .slice_id = slice_id,
@@ -95,13 +105,10 @@ const ParsersHub = struct {
         } else .success;
         return switch (sub_parser_blocks_init_result) {
             .failed => |failed| ret: {
-                for (0..failed.slice_id) |slice_id| {
-                    vcaligner.crash_dump.unreg("parser", slice_id + 1);
+                for (0..failed.slice_id) |reverse_slice_id| {
+                    const slice_id = failed.slice_id - 1 - reverse_slice_id;
                     const sub_parser_block = &sub_parser_blocks[slice_id];
-                    sub_parser_block.station.deinit();
-                    c.git_repository_free(sub_parser_block.repo);
-                    sub_parser_block.diagnostics.arena.deinit();
-                    sub_parser_block.gpa_instance.deinit();
+                    sub_parser_block.deinit(slice_id);
                 }
                 break :ret failed.err;
             },
@@ -114,16 +121,13 @@ const ParsersHub = struct {
         };
     }
     pub fn deinit(noalias self: *const ParsersHub, gpa: vcaligner.gpa.Concurrent) void {
+        const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
+        var reverse_sub_parser_blocks_iter = std.mem.reverseIterator(sub_parser_blocks);
+        while (reverse_sub_parser_blocks_iter.nextPtr()) |sub_parser_block| {
+            sub_parser_block.deinit(reverse_sub_parser_blocks_iter.index);
+        }
         vcaligner.crash_dump.unreg("parser", 0);
         self.heap_ptr.main_parser_block.station.deinit();
-        const sub_parser_blocks: []SubParser = self.heap_ptr.subParserBlocksPtr()[0..self.n_subparserjobs];
-        for (sub_parser_blocks, 1..) |*sub_parser_block, thread_id| {
-            vcaligner.crash_dump.unreg("parser", thread_id);
-            sub_parser_block.station.deinit();
-            c.git_repository_free(sub_parser_block.repo);
-            sub_parser_block.diagnostics.arena.deinit();
-            sub_parser_block.gpa_instance.deinit();
-        }
         const raw = @as([*]align(heap_align.toByteUnits()) u8, @ptrCast(self.heap_ptr))[0..heapSize(self.n_subparserjobs)];
         gpa.allocator.free(raw);
     }

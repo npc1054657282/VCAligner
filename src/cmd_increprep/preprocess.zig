@@ -170,6 +170,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         // 下面的写法模拟对libgit2资源本身的`errdefer`。由于libgit2的销毁本身可能报错，且`errdefer`本身将移除捕获`err`的能力。
         // 因此，当前的`errdefer`对于这种本身可能报错的逻辑无法收集所有信息得到最优控制流。
         // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
+        // NOTE: 此处的主要逻辑只能放到函数里，不可以展开，[原因](https://ziggit.dev/t/idiom-for-an-old-school-try-catch-block/3821/6)。
         break :libgit2_handoff provisionMainParser(
             runconf,
             &commit_registry,
