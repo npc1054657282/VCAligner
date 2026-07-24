@@ -32,3 +32,25 @@ pub const Key = extern struct {
 // 一个范围。高位是范围起始值。低位是范围结束值。
 const commit_range = @import("commit_range.zig");
 const CommitRange = commit_range.CommitRange;
+
+pub const CollumFamily = enum {
+    // Cumulative 列族，构造时一边解析一边写入，可增量
+    // 键为blob-path-id和commit-id并列(Key)，值为空
+    bpi_ci,
+    // 键为path-id(PathSeq)，值为path
+    pi_p,
+    // 键为blob和path-id并列(BlobPathKey)，值为blob-path-id(BlobPathSeq)
+    b_pi_bpi,
+    // 键为commit-id(CommitSeq)，值为commit
+    ci_c,
+    // Full-Rebuild 列族，构造结束以后一次性通过sstWriter写入，不可增量，每次写入全部替换
+    // 键为path-rank，值为path
+    pr_pi,
+};
+pub const cf_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
+    .bpi_ci = "default",
+    .pi_p = "pi2p",
+    .b_pi_bpi = "b_pi2bpi",
+    .ci_c = "ci2c",
+    .pr_pi = "pr2pi",
+});

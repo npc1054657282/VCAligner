@@ -105,10 +105,10 @@ const ParsersHub = struct {
         } else .success;
         return switch (sub_parser_blocks_init_result) {
             .failed => |failed| ret: {
-                for (0..failed.slice_id) |reverse_slice_id| {
-                    const slice_id = failed.slice_id - 1 - reverse_slice_id;
-                    const sub_parser_block = &sub_parser_blocks[slice_id];
-                    sub_parser_block.deinit(slice_id);
+                const inited_sub_parser_blocks = sub_parser_blocks[0..failed.slice_id];
+                var reverse_inited_sub_parser_blocks_iter = std.mem.reverseIterator(inited_sub_parser_blocks);
+                while (reverse_inited_sub_parser_blocks_iter.nextPtr()) |sub_parser_block| {
+                    sub_parser_block.deinit(reverse_inited_sub_parser_blocks_iter.index);
                 }
                 break :ret failed.err;
             },
