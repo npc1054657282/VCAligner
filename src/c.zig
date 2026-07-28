@@ -129,3 +129,33 @@ pub const DiagnosticUnknownCError = struct {
         std.log.err("unknown c: {d}\n", .{self.code});
     }
 };
+
+pub const DiagnosticRocksdbError = struct {
+    message: [:0]u8,
+    src: std.builtin.SourceLocation,
+    pub fn init(ecstr: [*:0]u8, src: std.builtin.SourceLocation, allocator: std.mem.Allocator) !DiagnosticRocksdbError {
+        const message: [:0]u8 = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ecstr}, 0);
+        errdefer comptime unreachable;
+        return .{ .message = message, .src = src };
+    }
+    pub fn log(self: DiagnosticRocksdbError) void {
+        std.log.err("rocksdb: {s}\n{s}:{s}:{s}:{d}:{d}", .{
+            self.message,
+            self.src.module,
+            self.src.file,
+            self.src.fn_name,
+            self.src.line,
+            self.src.column,
+        });
+    }
+};
+
+pub fn checkRocksdbErr(err_cstr: ?[*:0]u8, src: std.builtin.SourceLocation, last_diag: *diag.Diagnostic) error{ RocksdbError, UnableToConstructDiagnostic }!void {
+    if (err_cstr) |ecstr| {
+        last_diag.* = .{ .GIT_ERROR = DiagnosticRocksdbError.init(ecstr, src, last_diag.getAllocator()) catch |e| {
+            return last_diag.unableToConstructDiagnostic(e);
+        } };
+        return error.RocksdbError;
+    }
+    return;
+}

@@ -87,6 +87,9 @@ pub const WriterBoundRegistries = struct {
         self.path_registry.deinit(self.gpa_instance.gpao().allocator);
         self.gpa_instance.deinit();
     }
+    pub fn allocator(self: *WriterBoundRegistries) std.mem.Allocator {
+        return self.gpa_instance.gpao().allocator;
+    }
 };
 
 pub const CommitRegistry = struct {
