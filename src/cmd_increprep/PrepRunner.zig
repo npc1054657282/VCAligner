@@ -14,11 +14,7 @@ pub const CompactionStrategy = union(enum) {
     // 默认自动压缩
     auto_default: void,
 };
-
-// 重构后的PrepRunner：仅包含不可变的配置信息，任何可变项修改为到了解析时随着需求构造而非放到PrepRunner里。
-global: cli.Runner.Global,
-bare_repo_path: [:0]u8,
-mode_conf: union(Mode) {
+pub const ModeConf = union(Mode) {
     full: struct {
         rocksdb_output: union(enum) { manual: [:0]u8, auto: void },
         compaction_strategy: CompactionStrategy,
@@ -52,11 +48,16 @@ mode_conf: union(Mode) {
             .incremental => |inc_conf| inc_conf.compaction_strategy.asParent(),
         };
     }
-},
+};
+
+// 重构后的PrepRunner：仅包含不可变的配置信息，任何可变项修改为到了解析时随着需求构造而非放到PrepRunner里。
+global: cli.Runner.Global,
+bare_repo_path: [:0]u8,
+mode_conf: ModeConf,
 // 指代计算密集型任务。rocksdb的flush多为I/O密集型任务，不在`n_jobs`考虑范围内
 n_jobs: usize,
 n_rocksdbjobs: c_int,
-default_cf_max_write_buffer_number: c_int,
+cf_max_write_buffer_number: c_int,
 parsed_queue_capacity_log2: u5,
 compression: bool,
 writebatch_watermark: c_int,
@@ -203,7 +204,6 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         return cli.Runner.Error.CliArgInvalidInput;
     };
     errdefer allocator.free(bare_repo_path);
-    const ModeConf = @FieldType(PrepRunner, "mode_conf");
     const mode_conf: ModeConf = if (args.increment) blk: {
         const rocksdb_output = if (args.rocksdb_output) |rocksdb_output| try allocator.dupeZ(u8, rocksdb_output) else {
             std.log.err("Option `bare-repo-path` or `repo-path` is necessary.\n", .{});
@@ -245,14 +245,14 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         // 上述论述并没有考虑自动compaction场景。在自动compaction场景，4这个值依然是一个合理的rocksdb工作线程最小值。
         break :blk if (n_rocksdbjobs < 4) 4 else @intFromFloat(@trunc(n_rocksdbjobs));
     };
-    const default_cf_max_write_buffer_number: c_int = blk: {
+    const cf_max_write_buffer_number: c_int = blk: {
         const default_cf_max_write_buffer_number: f32 = @as(f32, @floatFromInt(n_rocksdbjobs)) * args.max_write_buffers_factor;
         if (!std.math.isFinite(default_cf_max_write_buffer_number) or default_cf_max_write_buffer_number > @as(f32, @floatFromInt(std.math.maxInt(c_int)))) {
             std.log.err("Option `max-write-buffers-factor` is set unreasonably.\n", .{});
             return error.CliArgInvalidInput;
         }
-        // 默认列族的写缓冲数量最小保护值为6。这个值依旧出自`PrepareForBulkLoad`内部实现。
-        // 对于自动compaction这个最小值虽然偏大，但是默认列族比其他列族的缓冲数量要多一些是合理的。这个设置大了仅仅是多消耗一点内存，问题不大。
+        // 列族的写缓冲数量最小保护值为6。这个值依旧出自`PrepareForBulkLoad`内部实现。
+        // 对于只写不读的场景，即使是自动compaction，这个最小值依旧合理。
         break :blk if (default_cf_max_write_buffer_number < 6) 6 else @intFromFloat(@trunc(default_cf_max_write_buffer_number));
     };
     return .{ .prep = .{
@@ -261,7 +261,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         .mode_conf = mode_conf,
         .n_jobs = n_jobs,
         .n_rocksdbjobs = n_rocksdbjobs,
-        .default_cf_max_write_buffer_number = default_cf_max_write_buffer_number,
+        .cf_max_write_buffer_number = cf_max_write_buffer_number,
         .parsed_queue_capacity_log2 = args.parsed_queue_capacity_log2,
         .compression = !args.no_compression,
         .writebatch_watermark = args.writebatch_watermark,

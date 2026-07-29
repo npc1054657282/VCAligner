@@ -9,7 +9,7 @@ const Parsed = @import("preprocess.zig").Parsed;
 const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
 
 fn write(
-    noalias storage: *const CumulativeStorage,
+    storage: *const CumulativeStorage,
     mode: @import("PrepRunner.zig").Mode,
     channel: *Channel,
     registries: *WriterBoundRegistries,
