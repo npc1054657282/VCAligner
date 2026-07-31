@@ -4,28 +4,37 @@ const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CompactionStrategy = @import("PrepRunner.zig").CompactionStrategy;
+const RocksdbPath = @import("preprocess.zig").RocksdbPath;
 
 const CumulativeStorage = @This();
 
 db: *c.rocksdb_t,
-cf_handles: std.enums.EnumArray(CollumFamily, *c.rocksdb_column_family_handle_t),
+cf_handles: std.enums.EnumArray(CollumFamily, ?*c.rocksdb_column_family_handle_t),
 
 pub const CollumFamily = enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
-    bpi_ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi_bpi),
+    bpi_ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi_ci),
     pi_p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi_p),
     b_pi_bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi_bpi),
     ci_c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci_c),
 };
 
+pub const column_family_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
+    .bpi_ci = vcaligner.rocksdb_custom.cf_names.get(.bpi_ci),
+    .pi_p = vcaligner.rocksdb_custom.cf_names.get(.pi_p),
+    .b_pi_bpi = vcaligner.rocksdb_custom.cf_names.get(.b_pi_bpi),
+    .ci_c = vcaligner.rocksdb_custom.cf_names.get(.ci_c),
+});
+
 // 打开数据库及各列族，覆盖 1.增量模式下的读取现有列族阶段；2.写入阶段
 // 如果写入阶段有自动compaction，此配置将覆盖pr2pi列族的写入。否则，此配置将在全量compaction中被重置。
+// TODO: 重写！
 pub fn init(
     mode: @import("PrepRunner.zig").Mode,
     n_rocksdbjobs: c_int,
     compression: bool,
     compaction_strategy: CompactionStrategy,
     cf_max_write_buffer_number: c_int,
-    rocksdb_path: @import("preprocess.zig").RocksdbPath,
+    rocksdb_path: RocksdbPath,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !CumulativeStorage {
     const db = db: {
@@ -127,7 +136,7 @@ pub fn init(
     return .{ .db = db, .cf_handles = cf_handles };
 }
 fn applyHeavyWriteOptimizations(
-    db_options: *c.rocksdb_options_t,
+    options: *c.rocksdb_options_t,
     n_rocksdbjobs: c_int,
     compression: bool,
     compaction_strategy: CompactionStrategy,
@@ -137,7 +146,7 @@ fn applyHeavyWriteOptimizations(
         // 关于压缩：原则上compaction阶段的压缩才影响最终大小，而写入阶段的压缩只影响中间文件大小而不影响最终大小。
         // 但是，在对postgresql的测试中，如果compaction阶段都不压缩，而只检验写入阶段的压缩，发现写入阶段压缩比不压缩反而快30秒左右（13分50秒与14分36秒的区别）
         // 这说明中间文件的大小变小实际上由于降低了I/O量，导致中间过程的压缩也反而对性能有益而非有害。
-        c.rocksdb_options_set_compression(db_options, c.rocksdb_lz4_compression);
+        c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
     }
     sw: switch (compaction_strategy) {
         .manual_delayed => {
@@ -147,14 +156,14 @@ fn applyHeavyWriteOptimizations(
             // 但是，所幸的是，看了[源码](https://github.com/facebook/rocksdb/blob/a34683bf543cc3eb151d08eeac00791862acd4d6/options/options.cc#L478-L519)
             // 实际没有修改memtable使用类型的行为，仅仅是全部写入L0以及禁止自动压缩。这些行为都是我需要的，可以放心使用。
             // 这个行为会设置`flush`线程为4。不用担心`flush`线程数影响parser等其他线程，因为这是I/O密集线程，不怎么影响计算线程。
-            c.rocksdb_options_prepare_for_bulk_load(db_options);
-            c.rocksdb_options_set_max_background_flushes(db_options, n_rocksdbjobs);
+            c.rocksdb_options_prepare_for_bulk_load(options);
+            c.rocksdb_options_set_max_background_flushes(options, n_rocksdbjobs);
         },
         .auto_with_trigger => |compaction_trigger| {
             // 自动compaction，但配置了触发器
-            c.rocksdb_options_set_level0_file_num_compaction_trigger(db_options, compaction_trigger);
-            c.rocksdb_options_set_level0_slowdown_writes_trigger(db_options, compaction_trigger * 2);
-            c.rocksdb_options_set_level0_stop_writes_trigger(db_options, compaction_trigger * 4);
+            c.rocksdb_options_set_level0_file_num_compaction_trigger(options, compaction_trigger);
+            c.rocksdb_options_set_level0_slowdown_writes_trigger(options, compaction_trigger * 2);
+            c.rocksdb_options_set_level0_stop_writes_trigger(options, compaction_trigger * 4);
             // 其余配置和自动触发器相同。
             continue :sw .auto_default;
         },
@@ -162,27 +171,141 @@ fn applyHeavyWriteOptimizations(
             // 自动compaction。下面的配置部分抄自prepare for bulk load内部实现，适用于大量数据写入。
             // 但不要像prepare for bulk load那样减少compaction层级，以及修改最大compation大小。
             // 各列族的最大write buffer number将在后文通过参数配置。
-            c.rocksdb_options_set_min_write_buffer_number_to_merge(db_options, 1);
-            c.rocksdb_options_set_target_file_size_base(db_options, 256 * 1024 * 1024);
+            c.rocksdb_options_set_min_write_buffer_number_to_merge(options, 1);
+            c.rocksdb_options_set_target_file_size_base(options, 256 * 1024 * 1024);
             // flush和compaction的线程分配交给前面的`rocksdb_options_increase_parallelism`自动进行。
         },
     }
     // 以下为各个列族相关配置
     // 增加`write_buffer_size`。目前默认的64MB可能导致多个小sst文件，增大单个sst文件的大小，降低文件数量，以避免文件打开与关闭开销。
-    c.rocksdb_options_set_write_buffer_size(db_options, 256 * 1024 * 1024);
-    c.rocksdb_options_set_max_write_buffer_number(db_options, cf_max_write_buffer_number);
+    c.rocksdb_options_set_write_buffer_size(options, 256 * 1024 * 1024);
+    c.rocksdb_options_set_max_write_buffer_number(options, cf_max_write_buffer_number);
 }
 
-pub fn deinit(self: *CumulativeStorage) void {
+pub fn deinit(noalias self: *const CumulativeStorage) void {
     c.rocksdb_column_family_handle_destroy(self.cf_handles.get(.b_pi_bpi));
     c.rocksdb_column_family_handle_destroy(self.cf_handles.get(.pi_p));
     c.rocksdb_column_family_handle_destroy(self.cf_handles.get(.ci_c));
     c.rocksdb_column_family_handle_destroy(self.cf_handles.get(.bpi_ci));
     c.rocksdb_close(self.db);
-    self.* = undefined;
 }
 
-pub fn reopenForFullCompaction(self: *CumulativeStorage) !void {
-    // TODO:
-    _ = self;
-}
+pub const MaybeCumulativeStorage = union(enum) {
+    valid: CumulativeStorage,
+    invalid: void,
+    // 假定`self`是`valid`的情境下允许调用。仅用于全量写入后的延迟全量compaction。
+    pub fn reopenAndWaitFullCompaction(
+        self: *MaybeCumulativeStorage,
+        n_rocksdbjobs: c_int,
+        compression: bool,
+        rocksdb_path: RocksdbPath,
+        last_diag: *vcaligner.diag.Diagnostic,
+    ) !void {
+        try self.reopenForFullCompaction(
+            n_rocksdbjobs,
+            compression,
+            rocksdb_path,
+            last_diag,
+        );
+        const compact_options = c.rocksdb_compactoptions_create();
+        defer c.rocksdb_compactoptions_destroy(compact_options);
+        // 遍历所有的列族进行压缩
+        for (self.valid.cf_handles.values) |cf_handle| {
+            c.rocksdb_compact_range_cf_opt(
+                self.valid.db,
+                cf_handle,
+                compact_options,
+                // null 代表从头开始
+                null,
+                0,
+                // null 代表一直到结尾
+                null,
+                0,
+            );
+        }
+        // 等待所有compaction完成
+        const wait_for_compact_options = c.rocksdb_wait_for_compact_options_create().?;
+        defer c.rocksdb_wait_for_compact_options_destroy(wait_for_compact_options);
+        // NOTE：rocksdb_wait_for_compact 是针对整个 db 实例的，
+        // 它可以等待上面触发的所有后台 compaction 任务完成。
+        var err_cstr: ?[*:0]u8 = null;
+        c.rocksdb_wait_for_compact(self.valid.db, wait_for_compact_options, @ptrCast(&err_cstr));
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+    }
+    fn reopenForFullCompaction(
+        self: *MaybeCumulativeStorage,
+        n_rocksdbjobs: c_int,
+        compression: bool,
+        rocksdb_path: RocksdbPath,
+        last_diag: *vcaligner.diag.Diagnostic,
+    ) !void {
+        self.valid.deinit();
+        errdefer self.* = .invalid;
+        // 打开数据库以及默认列族所用配置。
+        const db_options = blk: {
+            const db_options = c.rocksdb_options_create().?;
+            c.rocksdb_options_set_create_if_missing(db_options, 0);
+            c.rocksdb_options_set_error_if_exists(db_options, 0);
+            // 数据库整体配置
+            c.rocksdb_options_set_create_if_missing(db_options, 0);
+            c.rocksdb_options_set_error_if_exists(db_options, 0);
+            c.rocksdb_options_increase_parallelism(db_options, n_rocksdbjobs);
+            c.rocksdb_options_set_max_background_compactions(db_options, n_rocksdbjobs);
+            c.rocksdb_options_set_max_background_flushes(db_options, 1);
+            c.rocksdb_options_set_max_open_files(db_options, 1024);
+            // 默认列族配置
+            applyFullCompactionOptimizations(db_options, compression);
+            c.rocksdb_options_set_prefix_extractor(db_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
+            break :blk db_options;
+        };
+        defer c.rocksdb_options_destroy(db_options);
+        // 非默认列族（除cf_b_pi_bpi外）的选项
+        const cf_options = blk: {
+            const cf_options = c.rocksdb_options_create().?;
+            applyFullCompactionOptimizations(cf_options, compression);
+            break :blk cf_options;
+        };
+        defer c.rocksdb_options_destroy(cf_options);
+        // cf_b_pi_bpi的选项
+        const cf_b_pi_bpi_options = blk: {
+            const cf_b_pi_bpi_options = c.rocksdb_options_create().?;
+            applyFullCompactionOptimizations(cf_b_pi_bpi_options, compression);
+            c.rocksdb_options_set_prefix_extractor(cf_b_pi_bpi_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
+            break :blk cf_b_pi_bpi_options;
+        };
+        defer c.rocksdb_options_destroy(cf_b_pi_bpi_options);
+        const column_family_options: std.enums.EnumArray(CollumFamily, ?*const c.rocksdb_options_t) = .init(.{
+            .bpi_ci = db_options,
+            .pi_p = cf_options,
+            .b_pi_bpi = cf_b_pi_bpi_options,
+            .ci_c = cf_options,
+        });
+        self.valid.db = blk: {
+            var err_cstr: ?[*:0]u8 = null;
+            const new_db = c.rocksdb_open_column_families(
+                db_options,
+                rocksdb_path.get(),
+                column_family_names.values.len,
+                @ptrCast(&column_family_names.values),
+                &column_family_options.values,
+                &self.valid.cf_handles,
+                @ptrCast(&err_cstr),
+            );
+            try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+            break :blk new_db.?;
+        };
+    }
+    fn applyFullCompactionOptimizations(
+        options: *c.rocksdb_options_t,
+        compression: bool,
+    ) void {
+        // 依旧禁用自动compaction。我们使用手动compaction，避免撞车。
+        c.rocksdb_options_set_disable_auto_compactions(options, 1);
+        // 手动 compaction 的最大字节数依然应为极大值。全量手动compaction不应当限制compaction的输入规模。
+        c.rocksdb_options_set_max_compaction_bytes(options, 1 << 60);
+        c.rocksdb_options_set_target_file_size_base(options, 256 * 1024 * 1024);
+        if (compression) {
+            c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
+        }
+    }
+};

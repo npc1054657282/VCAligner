@@ -152,6 +152,7 @@ pub const DiagnosticRocksdbError = struct {
 
 pub fn checkRocksdbErr(err_cstr: ?[*:0]u8, src: std.builtin.SourceLocation, last_diag: *diag.Diagnostic) error{ RocksdbError, UnableToConstructDiagnostic }!void {
     if (err_cstr) |ecstr| {
+        defer c.rocksdb_free(ecstr);
         last_diag.* = .{ .GIT_ERROR = DiagnosticRocksdbError.init(ecstr, src, last_diag.getAllocator()) catch |e| {
             return last_diag.unableToConstructDiagnostic(e);
         } };
