@@ -48,6 +48,8 @@ pub const CollumFamily = enum {
     pr_pi,
 };
 pub const cf_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
+    // XXX: 将来考虑默认列族改为存放元数据，专设bpi_ci列族。
+    // 当前考虑到复用已有分析数据的兼容性，仍然设计为bpi_ci使用default列族。
     .bpi_ci = "default",
     .pi_p = "pi2p",
     .b_pi_bpi = "b_pi2bpi",

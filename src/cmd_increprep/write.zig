@@ -2,29 +2,42 @@ const std = @import("std");
 const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
-const CumulativeStorage = @import("CumulativeStorage.zig");
 const Channel = @import("preprocess.zig").Channel;
 const MsgToWriter = @import("preprocess.zig").MsgToWriter;
 const Parsed = @import("preprocess.zig").Parsed;
 const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
 
+pub const CumulativeStorage = struct {
+    db: *c.rocksdb_t,
+    cf_handles: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
+        bpi_ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi_ci),
+        pi_p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi_p),
+        b_pi_bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi_bpi),
+        ci_c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci_c),
+    }, ?*c.rocksdb_column_family_handle_t),
+    pub fn fromStorage(storage: *@import("storage.zig").Storage) CumulativeStorage {
+        return .{ .db = storage.valid.db, .cf_handles = .init(.{
+            .bpi_ci = storage.valid.cf_handles.get(.bpi_ci),
+            .pi_p = storage.valid.cf_handles.get(.pi_p),
+            .b_pi_bpi = storage.valid.cf_handles.get(.b_pi_bpi),
+            .ci_c = storage.valid.cf_handles.get(.ci_c),
+        }) };
+    }
+};
+
 fn write(
-    noalias storage: *const CumulativeStorage,
-    mode: @import("PrepRunner.zig").Mode,
+    storage: CumulativeStorage,
     channel: *Channel,
     registries: *WriterBoundRegistries,
     write_batch_watermark: c_int,
-    gpa: vcaligner.gpa.Concurrent,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
-    _ = gpa;
     writing: {
         const woptions = blk: {
             const woptions = c.rocksdb_writeoptions_create();
-            c.rocksdb_writeoptions_disable_WAL(woptions, switch (mode) {
-                .full => 1,
-                .incremental => 0,
-            });
+            // 无论是全量还是增量，都关闭WAL。因为libgit2的`git_odb_foreach`固有的顺序不确定性，无论如何，WAL都无法做到逻辑可靠的断电续传。
+            // 或者说，基于WAL的断电续传需要更复杂的设计才能支持。我们目前仅仅基于checkpoint来确保可靠性，不考虑增量的断电续传能力。
+            c.rocksdb_writeoptions_disable_WAL(1);
             break :blk woptions.?;
         };
         defer c.rocksdb_writeoptions_destroy(woptions);
@@ -121,14 +134,9 @@ fn write(
         const foptions = c.rocksdb_flushoptions_create().?;
         defer c.rocksdb_flushoptions_destroy(foptions);
         c.rocksdb_flushoptions_set_wait(foptions, 1);
-        var column_family = [_]?*c.struct_rocksdb_column_family_handle_t{
-            storage.cf_handles.get(.bpi_ci),
-            storage.cf_handles.get(.pi_p),
-            storage.cf_handles.get(.b_pi_bpi),
-            storage.cf_handles.get(.ci_c),
-        };
         var err_cstr: ?[*:0]u8 = null;
-        c.rocksdb_flush_cfs(storage.db, foptions, &column_family, column_family.len, @ptrCast(&err_cstr));
+        // NOTE: 此处constCast是rocksdb的API问题所致，实际上此API绝无可能修改传入的列族family值。
+        c.rocksdb_flush_cfs(storage.db, foptions, @constCast(&storage.cf_handles.values), storage.cf_handles.values.len, @ptrCast(&err_cstr));
         try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
         break :flush_all;
     }
