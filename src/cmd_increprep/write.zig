@@ -7,23 +7,7 @@ const MsgToWriter = @import("preprocess.zig").MsgToWriter;
 const Parsed = @import("preprocess.zig").Parsed;
 const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
 
-pub const CumulativeStorage = struct {
-    db: *c.rocksdb_t,
-    cf_handles: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
-        bpi_ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi_ci),
-        pi_p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi_p),
-        b_pi_bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi_bpi),
-        ci_c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci_c),
-    }, ?*c.rocksdb_column_family_handle_t),
-    pub fn fromStorage(storage: *@import("storage.zig").Storage) CumulativeStorage {
-        return .{ .db = storage.valid.db, .cf_handles = .init(.{
-            .bpi_ci = storage.valid.cf_handles.get(.bpi_ci),
-            .pi_p = storage.valid.cf_handles.get(.pi_p),
-            .b_pi_bpi = storage.valid.cf_handles.get(.b_pi_bpi),
-            .ci_c = storage.valid.cf_handles.get(.ci_c),
-        }) };
-    }
-};
+pub const CumulativeStorage = @import("storage.zig").Cumulative;
 
 fn write(
     storage: CumulativeStorage,
@@ -105,6 +89,7 @@ fn write(
                     parsed.deinit();
                 },
                 .commit_meta => |*commit_metas| {
+                    // XXX: 写入可以确保顺序，将来可能考虑使用SstFileWriter写入。
                     for (commit_metas.batch.items) |*commit_meta| {
                         c.rocksdb_writebatch_put_cf(
                             wb,
@@ -136,6 +121,7 @@ fn write(
         c.rocksdb_flushoptions_set_wait(foptions, 1);
         var err_cstr: ?[*:0]u8 = null;
         // NOTE: 此处constCast是rocksdb的API问题所致，实际上此API绝无可能修改传入的列族family值。
+        // 一说rocksdb这么设计是为了兼容古老编译器。
         c.rocksdb_flush_cfs(storage.db, foptions, @constCast(&storage.cf_handles.values), storage.cf_handles.values.len, @ptrCast(&err_cstr));
         try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
         break :flush_all;
