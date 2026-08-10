@@ -47,7 +47,7 @@ pub const State = union(enum) {
         }
     }
     // 假定`self`是`valid`的情境下允许调用。仅用于全量写入后的延迟全量compaction。
-    pub fn reopenAndWaitFullCompaction(
+    pub fn reopenAndWaitForFullCompaction(
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
@@ -77,14 +77,7 @@ pub const State = union(enum) {
                 0,
             );
         }
-        // 等待所有compaction完成
-        const wait_for_compact_options = c.rocksdb_wait_for_compact_options_create().?;
-        defer c.rocksdb_wait_for_compact_options_destroy(wait_for_compact_options);
-        // NOTE：rocksdb_wait_for_compact 是针对整个 db 实例的，它可以等待上面触发的所有后台 compaction 任务完成。
-        // TODO: 需要进行进一步调研。似乎`rocksdb_compact_range_cf_opt`本来就是串行的而非异步的，没有等待的价值。
-        var err_cstr: ?[*:0]u8 = null;
-        c.rocksdb_wait_for_compact(cumulative_storage.db, wait_for_compact_options, @ptrCast(&err_cstr));
-        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        // NOTE: `rocksdb_compact_range_cf_opt`是同步的，无需使用`rocksdb_wait_for_compact`等待。
     }
     fn reopenForFullCompaction(
         self: *State,
@@ -223,7 +216,7 @@ pub const Handles = struct {
             break :blk db_options;
         };
         defer c.rocksdb_options_destroy(db_options);
-        // 非默认列族（除cf_b_pi_bpi外）的选项
+        // 非默认列族（除b_pi_bpi外）的选项
         const normal_cf_options = blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsOnCfOptions(cf_options, compression);
