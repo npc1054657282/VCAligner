@@ -4,18 +4,9 @@ const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CompactionStrategy = @import("PrepRunner.zig").CompactionStrategy;
 const RocksdbPath = @import("preprocess.zig").RocksdbPath;
-
-const checkpoint_path_suffix = ".checkpoint";
-
-pub const State = struct {
-    maybe_valid_handles: union(enum) {
-        valid: Handles,
-        invalid: void,
-    },
-    maybe_checkpoint_path: union(enum) {
-        need: [:0]u8,
-        neednt: void,
-    },
+pub const State = union(enum) {
+    valid: Handles,
+    invalid: void,
     pub fn init(
         self: *State,
         mode: @import("PrepRunner.zig").Mode,
@@ -23,25 +14,19 @@ pub const State = struct {
         compaction_strategy: CompactionStrategy,
         compression: bool,
         cf_max_write_buffer_number: c_int,
-        rocksdb_path: [:0]const u8,
-        allocator: *std.mem.Allocator,
+        rocksdb_path: RocksdbPath,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
-        self = .{ .maybe_handles = .{ .valid = undefined }, .maybe_checkpoint_path = undefined };
+        self = .{ .valid = undefined };
         try self.valid.initForWrite(mode, n_rocksdbjobs, compaction_strategy, compression, cf_max_write_buffer_number, rocksdb_path, last_diag);
         errdefer self.valid.deinit();
-        self.maybe_checkpoint_path = switch (mode) {
-            .full => .neednt,
-            .incremental => checkpoint: {
-                const checkpoint_path = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ rocksdb_path, checkpoint_path_suffix }, 0);
-                errdefer allocator.free(checkpoint_path);
-                // TODO: 增加创建checkpoint逻辑。
-                break :checkpoint .{ .need = checkpoint_path };
-            },
-        };
+        // TODO: 增加checkpoint逻辑。
+        checkpoint: {
+            break :checkpoint;
+        }
     }
-    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
-        switch (self.maybe_valid_handles) {
+    pub fn deinit(self: *State) void {
+        switch (self.*) {
             .valid => |*handles| {
                 // TODO: 增加移除checkpoint逻辑。
                 remove_checkpoint: {
@@ -51,35 +36,22 @@ pub const State = struct {
             },
             .invalid => {},
         }
-        switch (self.maybe_checkpoint_path) {
-            .need => |checkpoint_path| {
-                allocator.free(checkpoint_path);
-            },
-            .neednt => {},
-        }
     }
-    pub fn deinitOnErr(self: *State, allocator: std.mem.Allocator) void {
-        switch (self.maybe_valid_handles) {
+    pub fn deinitOnErr(self: *State) void {
+        switch (self.*) {
             .valid => |*handles| {
                 handles.deinit();
-                self.maybe_valid_handles = .invalid;
+                self.* = .invalid;
             },
             .invalid => {},
         }
-        switch (self.maybe_checkpoint_path) {
-            .need => |checkpoint_path| {
-                allocator.free(checkpoint_path);
-                self.maybe_checkpoint_path = .neednt;
-            },
-            .neednt => {},
-        }
     }
-    // 假定`self`的`maybe_handles`是`valid`的情境下允许调用。仅用于全量写入后的延迟全量compaction。
+    // 假定`self`是`valid`的情境下允许调用。仅用于全量写入后的延迟全量compaction。
     pub fn reopenAndWaitForFullCompaction(
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: [:0]const u8,
+        rocksdb_path: RocksdbPath,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         try self.reopenForFullCompaction(
@@ -111,12 +83,12 @@ pub const State = struct {
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: [:0]const u8,
+        rocksdb_path: RocksdbPath,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
-        self.maybe_valid_handles.valid.deinit();
-        errdefer self.maybe_valid_handles = .invalid;
-        try self.maybe_valid_handles.valid.initForManualCompaction(n_rocksdbjobs, compression, rocksdb_path, last_diag);
+        self.valid.deinit();
+        errdefer self.* = .invalid;
+        try self.valid.initForManualCompaction(n_rocksdbjobs, compression, rocksdb_path, last_diag);
     }
 };
 
@@ -130,7 +102,7 @@ pub const Handles = struct {
         compaction_strategy: CompactionStrategy,
         compression: bool,
         cf_max_write_buffer_number: c_int,
-        rocksdb_path: []const u8,
+        rocksdb_path: RocksdbPath,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         const db_options = blk: {
@@ -215,7 +187,7 @@ pub const Handles = struct {
             var err_cstr: ?[*:0]u8 = null;
             const db = c.rocksdb_open_column_families(
                 db_options,
-                rocksdb_path,
+                rocksdb_path.get(),
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(&vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
@@ -230,7 +202,7 @@ pub const Handles = struct {
         self: *Handles,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: [:0]const u8,
+        rocksdb_path: RocksdbPath,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         const db_options = blk: {
@@ -276,7 +248,7 @@ pub const Handles = struct {
             var err_cstr: ?[*:0]u8 = null;
             const new_db = c.rocksdb_open_column_families(
                 db_options,
-                rocksdb_path,
+                rocksdb_path.get(),
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
