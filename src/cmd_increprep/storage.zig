@@ -3,7 +3,6 @@ const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CompactionStrategy = @import("PrepRunner.zig").CompactionStrategy;
-const RocksdbPath = @import("preprocess.zig").RocksdbPath;
 pub const State = union(enum) {
     valid: Handles,
     invalid: void,
@@ -14,7 +13,7 @@ pub const State = union(enum) {
         compaction_strategy: CompactionStrategy,
         compression: bool,
         cf_max_write_buffer_number: c_int,
-        rocksdb_path: RocksdbPath,
+        rocksdb_path: [:0]const u8,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         self = .{ .valid = undefined };
@@ -51,7 +50,7 @@ pub const State = union(enum) {
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: RocksdbPath,
+        rocksdb_path: [:0]const u8,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         try self.reopenForFullCompaction(
@@ -83,7 +82,7 @@ pub const State = union(enum) {
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: RocksdbPath,
+        rocksdb_path: [:0]const u8,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         self.valid.deinit();
@@ -102,7 +101,7 @@ pub const Handles = struct {
         compaction_strategy: CompactionStrategy,
         compression: bool,
         cf_max_write_buffer_number: c_int,
-        rocksdb_path: RocksdbPath,
+        rocksdb_path: [:0]const u8,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         const db_options = blk: {
@@ -187,7 +186,7 @@ pub const Handles = struct {
             var err_cstr: ?[*:0]u8 = null;
             const db = c.rocksdb_open_column_families(
                 db_options,
-                rocksdb_path.get(),
+                rocksdb_path,
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(&vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
@@ -202,7 +201,7 @@ pub const Handles = struct {
         self: *Handles,
         n_rocksdbjobs: c_int,
         compression: bool,
-        rocksdb_path: RocksdbPath,
+        rocksdb_path: [:0]const u8,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         const db_options = blk: {
@@ -248,7 +247,7 @@ pub const Handles = struct {
             var err_cstr: ?[*:0]u8 = null;
             const new_db = c.rocksdb_open_column_families(
                 db_options,
-                rocksdb_path.get(),
+                rocksdb_path,
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
