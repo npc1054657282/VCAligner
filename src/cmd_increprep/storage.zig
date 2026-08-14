@@ -3,6 +3,7 @@ const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CompactionStrategy = @import("PrepRunner.zig").CompactionStrategy;
+const RecoveryPathConfView = @import("preprocess.zig").RecoveryPathConf.View;
 pub const State = union(enum) {
     valid: Handles,
     invalid: void,
@@ -14,22 +15,30 @@ pub const State = union(enum) {
         compression: bool,
         cf_max_write_buffer_number: c_int,
         rocksdb_path: [:0]const u8,
+        recovery_path_conf: RecoveryPathConfView,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
         self = .{ .valid = undefined };
         try self.valid.initForWrite(mode, n_rocksdbjobs, compaction_strategy, compression, cf_max_write_buffer_number, rocksdb_path, last_diag);
         errdefer self.valid.deinit();
-        // TODO: 增加checkpoint逻辑。
-        checkpoint: {
-            break :checkpoint;
+        switch (recovery_path_conf) {
+            .disabled => {},
+            .enabled => |path| {
+                var err_cstr: ?[*:0]u8 = null;
+                const checkpoint_object = c.rocksdb_checkpoint_object_create(self.valid.db, @ptrCast(&err_cstr));
+                try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                defer c.rocksdb_checkpoint_object_destroy(checkpoint_object);
+                c.rocksdb_checkpoint_create(checkpoint_object, path, 0, &err_cstr);
+                try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+            },
         }
     }
-    pub fn deinit(self: *State) void {
+    pub fn deinit(self: *State, recovery_path_conf: RecoveryPathConfView) void {
         switch (self.*) {
             .valid => |*handles| {
-                // TODO: 增加移除checkpoint逻辑。
-                remove_checkpoint: {
-                    break :remove_checkpoint;
+                switch (recovery_path_conf) {
+                    .disabled => {},
+                    .enabled => |path| try std.fs.cwd().deleteTree(path),
                 }
                 handles.deinit();
             },

@@ -31,6 +31,11 @@ pub const ModeConf = union(Mode) {
                 };
             }
         },
+        recovery: union(enum) {
+            disabled: void,
+            enabled_with_custom_path: [:0]u8,
+            enabled_with_auto_path: void,
+        },
     },
     pub fn deinit(noalias self: *const @This(), allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -39,7 +44,13 @@ pub const ModeConf = union(Mode) {
                 .manual => |path| allocator.free(path),
                 .auto => {},
             },
-            .incremental => |inc_conf| allocator.free(inc_conf.rocksdb_output),
+            .incremental => |inc_conf| {
+                allocator.free(inc_conf.rocksdb_output);
+                switch (inc_conf.recovery) {
+                    .enabled_with_custom_path => |path| allocator.free(path),
+                    .disabled, .enabled_with_auto_path => {},
+                }
+            },
         }
     }
     pub fn compactionStrategy(noalias self: *const @This()) CompactionStrategy {
@@ -73,7 +84,7 @@ proc_stamp: struct {
 // 如果有此需求，进程调用者应该事先备份rocksdb数据库，然后使用备份后的数据库作为`rocksdb-ouput`参数。
 const cmd_config: cli.CommandConfig = cli.Runner.cmd_config;
 pub const cmd = blk: {
-    @setEvalBranchQuota(2048);
+    @setEvalBranchQuota(4096);
     break :blk cli.Runner.Global.sharedArgs(zargs.Command.new("prep"))
         // 待预处理的git仓库路径。要求此路径下包含一个`.git`目录。此选项与`bare-repo-path`至少需要提供一个。如果有`bare-repo-path`参数，此选项被无视。
         .arg(zargs.Arg.optArg("repo_path", ?[]const u8).long("repo-path").help(
@@ -189,6 +200,24 @@ pub const cmd = blk: {
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
+        // 缺省在增量模式下启用容灾恢复。缺省在增量模式下启用容灾恢复。此选项禁用容灾恢复。
+        // 禁用后，增量模式下如果出错将可能永久破坏原有数据库。
+        .arg(zargs.Arg.opt("no_increment_recovery", bool).long("no-increment-recovery").help(
+            \\Disable recovery point creation when running in incremental mode. 
+        ++ cli.helpNewLine(cmd_config) ++
+            \\By default, a recovery point is created to protect the existing RocksDB database from corruption in case of errors.
+        ++ cli.helpLastLine(cmd_config) ++
+            \\Only effective when --increment is provided.
+        ++ cli.helpLastLine(cmd_config) ++
+            \\
+        ))
+        .arg(zargs.Arg.optArg("increment_recovery_path", ?[]const u8).long("increment-recovery-path").help(
+            \\Custom path for the recovery checkpoint in incremental mode.
+        ++ cli.helpNewLine(cmd_config) ++
+            \\If not specified, defaults to the RocksDB output path with '.recovery' appended.
+        ++ cli.helpLastLine(cmd_config) ++
+            \\Only used when --increment is active and recovery is not disabled.
+        ))
         .config(cmd_config);
 };
 
@@ -209,6 +238,11 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
             std.log.err("Option `bare-repo-path` or `repo-path` is necessary.\n", .{});
             return cli.Runner.Error.CliArgInvalidInput;
         };
+        errdefer allocator.free(rocksdb_output);
+        const recovery: @FieldType(@FieldType(ModeConf, "incremental"), "recovery") =
+            if (args.no_increment_recovery) .disabled else if (args.increment_recovery_path) |recovery_path| .{
+                .enabled_with_custom_path = try allocator.dupeZ(u8, recovery_path),
+            } else .enabled_with_auto_path;
         errdefer comptime unreachable;
         break :blk .{ .incremental = .{
             .rocksdb_output = rocksdb_output,
@@ -216,6 +250,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
                 .default => .auto_default,
                 _ => |trigger_tag| .{ .auto_with_trigger = @intFromEnum(trigger_tag) },
             } else .auto_default,
+            .recovery = recovery,
         } };
     } else blk: {
         const rocksdb_output: @FieldType(@FieldType(ModeConf, "full"), "rocksdb_output") =

@@ -165,6 +165,47 @@ pub const RocksdbPath = union(enum) {
     }
 };
 
+pub const RecoveryPathConf = union(enum) {
+    disabled: void,
+    borrowed_from_config: [:0]const u8,
+    owned: [:0]u8,
+    pub fn init(
+        noalias runconf: *const PrepRunner,
+        allocator: std.mem.Allocator,
+        rocksdb_path: [:0]const u8,
+    ) !RecoveryPathConf {
+        return switch (runconf.mode_conf) {
+            .full => .disabled,
+            .incremental => |inc_conf| switch (inc_conf.recovery) {
+                .disabled => .disabled,
+                .enabled_with_custom_path => |path| .{ .borrowed_from_config = path },
+                .enabled_with_auto_path => blk: {
+                    var recovery_path_writer: std.Io.Writer.Allocating = .init(allocator);
+                    errdefer recovery_path_writer.deinit();
+                    try recovery_path_writer.writer.print("{s}.recovery", .{rocksdb_path});
+                    break :blk .{ .owned = try recovery_path_writer.toOwnedSliceSentinel(0) };
+                },
+            },
+        };
+    }
+    pub fn deinit(self: RecoveryPathConf, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .disabled, .borrowed_from_config => {},
+            .owned => |path| allocator.free(path),
+        }
+    }
+    pub fn view(self: RecoveryPathConf) RecoveryPathConf.View {
+        return switch (self) {
+            .disabled => .{ .disabled = {} },
+            .borrowed_from_config, .owned => |path| .{ .enabled = path },
+        };
+    }
+    pub const View = union(enum) {
+        disabled: void,
+        enabled: [:0]const u8,
+    };
+};
+
 pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
     // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
