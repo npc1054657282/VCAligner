@@ -74,11 +74,12 @@ pub const Queue = @import("mpsc_queue").AnyMpscQueue(MsgToWriter, null);
 pub const Channel = vcaligner.MpscChannel(Queue);
 
 pub const PathRegistry = struct {
-    map: std.StringArrayHashMapUnmanaged(struct {
+    pub const Map = std.StringArrayHashMapUnmanaged(struct {
         // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
         index: PathSeq,
         blob_cnt: usize,
-    }),
+    });
+    map: Map,
     // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
     // 注意`key_arena`不负责`StringArrayHashMapUnmanaged`，因为这是一个动态增长结构体，不适合arena。
     key_arena: StArena,
@@ -138,7 +139,7 @@ pub const CommitRegistry = struct {
                 break :blk roptions;
             };
             defer c.rocksdb_readoptions_destroy(roptions);
-            break :it c.rocksdb_create_iterator_cf(rocksdb.db, roptions, rocksdb.cf_handles.get(.ci_c));
+            break :it c.rocksdb_create_iterator_cf(rocksdb.db, roptions, rocksdb.cfs.get(.ci2c));
         };
         defer c.rocksdb_iter_destroy(it);
         c.rocksdb_iter_seek_to_first(it);

@@ -29,32 +29,37 @@ pub const Key = extern struct {
     blob_path_seq: BlobPathSeq align(1),
     commit_seq: CommitSeq align(1),
 };
-// 一个范围。高位是范围起始值。低位是范围结束值。
-const commit_range = @import("commit_range.zig");
-const CommitRange = commit_range.CommitRange;
+pub const PathRankNative = u32;
+pub const PathRank = Seq(PathRankNative, .big);
+pub const BlobCountNative = u32;
+pub const BlobCount = Seq(BlobCountNative, .big);
+pub const PathRankBlobCountKey = extern struct {
+    path_rank: PathRank align(1),
+    blob_count: BlobCount align(1),
+};
 
 pub const CollumFamily = enum {
     // Cumulative 列族，构造时一边解析一边写入，可增量
     // 键为blob-path-id和commit-id并列(Key)，值为空
-    bpi_ci,
+    bpi2ci,
     // 键为path-id(PathSeq)，值为path
-    pi_p,
+    pi2p,
     // 键为blob和path-id并列(BlobPathKey)，值为blob-path-id(BlobPathSeq)
-    b_pi_bpi,
+    b_pi2bpi,
     // 键为commit-id(CommitSeq)，值为commit
-    ci_c,
+    ci2c,
     // Full-Rebuild 列族，构造结束以后一次性通过sstWriter写入，不可增量，每次写入全部替换
-    // 键为path-rank，值为path
-    pr_pi,
+    // 键为path-rank和blob-count并列，值为path
+    pr_bc2pi,
 };
 pub const cf_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
-    // XXX: 将来考虑默认列族改为存放元数据，专设bpi_ci列族。
-    // 当前考虑到复用已有分析数据的兼容性，仍然设计为bpi_ci使用default列族。
-    .bpi_ci = "default",
-    .pi_p = "pi2p",
-    .b_pi_bpi = "b_pi2bpi",
-    .ci_c = "ci2c",
-    .pr_pi = "pr2pi",
+    // XXX: 将来考虑默认列族改为存放元数据，专设bpi2ci列族。
+    // 当前考虑到复用已有分析数据的兼容性，仍然设计为bpi2ci使用default列族。
+    .bpi2ci = "default",
+    .pi2p = "pi2p",
+    .b_pi2bpi = "b_pi2bpi",
+    .ci2c = "ci2c",
+    .pr_bc2pi = "pr2pi",
 });
 
 // 在读取rocksdb时，应用全局遍历的配置。

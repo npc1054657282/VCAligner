@@ -7,10 +7,10 @@ const MsgToWriter = @import("preprocess.zig").MsgToWriter;
 const Parsed = @import("preprocess.zig").Parsed;
 const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
 
-pub const CumulativeStorage = @import("storage.zig").Cumulative;
+const storage = @import("storage.zig");
 
-fn write(
-    storage: CumulativeStorage,
+pub fn writeCumulative(
+    storage_handles: storage.Cumulative,
     channel: *Channel,
     registries: *WriterBoundRegistries,
     write_batch_watermark: c_int,
@@ -46,7 +46,7 @@ fn write(
                             };
                             c.rocksdb_writebatch_put_cf(
                                 wb,
-                                storage.cf_handles.get(.pi_p),
+                                storage_handles.cfs.get(.pi2p),
                                 @ptrCast(&path_get_or_put_result.value_ptr.index),
                                 @sizeOf(vcaligner.rocksdb_custom.PathSeq),
                                 @ptrCast(path_get_or_put_result.key_ptr.ptr),
@@ -65,7 +65,7 @@ fn write(
                             path_get_or_put_result.value_ptr.blob_cnt += 1;
                             c.rocksdb_writebatch_put_cf(
                                 wb,
-                                storage.cf_handles.get(.b_pi_bpi),
+                                storage_handles.cfs.get(.b_pi2bpi),
                                 @ptrCast(blob_path_get_or_put_result.key_ptr),
                                 @sizeOf(vcaligner.rocksdb_custom.BlobPathKey),
                                 @ptrCast(blob_path_get_or_put_result.value_ptr),
@@ -79,7 +79,7 @@ fn write(
                         };
                         c.rocksdb_writebatch_put_cf(
                             wb,
-                            storage.cf_handles.get(.bpi_ci),
+                            storage_handles.cfs.get(.bpi2ci),
                             @ptrCast(&key),
                             @sizeOf(vcaligner.rocksdb_custom.Key),
                             null,
@@ -93,7 +93,7 @@ fn write(
                     for (commit_metas.batch.items) |*commit_meta| {
                         c.rocksdb_writebatch_put_cf(
                             wb,
-                            storage.cf_handles.get(.ci_c),
+                            storage_handles.cfs.get(.ci2c),
                             @ptrCast(&commit_meta.commit_seq),
                             @sizeOf(vcaligner.rocksdb_custom.CommitSeq),
                             @ptrCast(&commit_meta.commit_hash.id),
@@ -105,7 +105,7 @@ fn write(
             }
             if (c.rocksdb_writebatch_count(wb) > write_batch_watermark) {
                 var err_cstr: ?[*:0]u8 = null;
-                c.rocksdb_write(storage.db, woptions, wb, @ptrCast(&err_cstr));
+                c.rocksdb_write(storage_handles.db, woptions, wb, @ptrCast(&err_cstr));
                 try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
                 c.rocksdb_writebatch_clear(wb);
             }
@@ -114,7 +114,7 @@ fn write(
     }
     // 确保可能写入的列族全部刷新到磁盘。
     // NOTE: 不论是否当前是prepare for bulk load，不论是否需要修改数据库配置，都应该这么做。
-    // 写入pr2pi列族使用SstFileWriter，不要在列族数据没有排空前使用它。
+    // 写入pr_bc2pi列族使用SstFileWriter，不要在列族数据没有排空前使用它。
     flush_all: {
         const foptions = c.rocksdb_flushoptions_create().?;
         defer c.rocksdb_flushoptions_destroy(foptions);
@@ -122,8 +122,98 @@ fn write(
         var err_cstr: ?[*:0]u8 = null;
         // NOTE: 此处constCast是rocksdb的API问题所致，实际上此API绝无可能修改传入的列族family值。
         // 一说rocksdb这么设计是为了兼容古老编译器。
-        c.rocksdb_flush_cfs(storage.db, foptions, @constCast(&storage.cf_handles.values), storage.cf_handles.values.len, @ptrCast(&err_cstr));
+        c.rocksdb_flush_cfs(storage_handles.db, foptions, @constCast(&storage_handles.cfs.values), storage_handles.cfs.values.len, @ptrCast(&err_cstr));
         try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
         break :flush_all;
     }
+}
+
+const PathRegistry = @import("preprocess.zig").PathRegistry;
+
+pub fn writePrBc2Pi(
+    db: *c.rocksdb_t,
+    cf_pr_bc2pi: *c.rocksdb_column_family_handle_t,
+    path_registry: *PathRegistry.Map,
+    tmp_sst_file_path: [:0]const u8,
+    compression: bool,
+    last_diag: *vcaligner.diag.Diagnostic,
+) !void {
+    sort_path_registry: {
+        const SortContext = struct {
+            map: *const PathRegistry.Map,
+            pub fn lessThan(sctx: @This(), a_index: usize, b_index: usize) bool {
+                // 基于值中的 blob_cnt 比较。采用降序，符号翻转。
+                return sctx.map.values()[a_index].blob_cnt > sctx.map.values()[b_index].blob_cnt;
+            }
+        };
+        const sctx: SortContext = .{ .map = path_registry };
+        path_registry.sort(sctx);
+        break :sort_path_registry;
+    }
+    sst_file_write: {
+        const sst_file_writer = sst_file_writer: {
+            const env = c.rocksdb_envoptions_create().?;
+            defer c.rocksdb_envoptions_destroy(env);
+            const options = blk: {
+                const options = c.rocksdb_options_create().?;
+                storage.applyPrBc2PiCfOptions(options, compression);
+                break :blk options;
+            };
+            const sst_file_writer = c.rocksdb_sstfilewriter_create(env, options);
+            break :sst_file_writer sst_file_writer;
+        };
+        defer c.rocksdb_sstfilewriter_destroy(sst_file_writer);
+        var err_cstr: ?[*:0]u8 = null;
+        c.rocksdb_sstfilewriter_open(sst_file_writer, tmp_sst_file_path.ptr, @ptrCast(&err_cstr));
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        // 遍历排序后的`path_registry`，写入sst
+        var iter = path_registry.iterator();
+        var path_rank: vcaligner.rocksdb_custom.PathRank = undefined;
+        while (do: {
+            path_rank = .fromNative(@intCast(iter.index));
+            break :do iter.next();
+        }) |entry| {
+            // sstfilewriter每次put以后，key和value的生存期即可结束，不需要长期维持生存期
+            const key: vcaligner.rocksdb_custom.PathRankBlobCountKey = .{
+                .path_rank = path_rank,
+                .blob_count = entry.value_ptr.blob_cnt,
+            };
+            c.rocksdb_sstfilewriter_put(
+                sst_file_writer,
+                @ptrCast(&key),
+                @sizeOf(vcaligner.rocksdb_custom.PathRankBlobCountKey),
+                @ptrCast(&entry.value_ptr.index),
+                @sizeOf(vcaligner.rocksdb_custom.PathSeq),
+                @ptrCast(&err_cstr),
+            );
+            try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        }
+        c.rocksdb_sstfilewriter_finish(sst_file_writer, @ptrCast(&err_cstr));
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        break :sst_file_write;
+    }
+    // 将sst文件导入列族
+    sst_file_ingest: {
+        const iefoptions = blk: {
+            const iefoptions = c.rocksdb_ingestexternalfileoptions_create();
+            // NOTE: 接收到警告`At least one SST file opened without unique ID to verify`，后跟`global_seqno=0`
+            // 由于我们采用sst file writer方案，无法使用常规写入引入的校验机制，这个警告很正常，可忽略。
+            // 而global seqno=0也很正常，并非警告。
+            // 不要为此去设置`allow_global_seqno`，这个用于sst file之间如果存在重叠的情况，故使用全局序号以试图标记重叠的先后版本顺序。
+            // 在我们的场景，没有使用他的需求。
+            c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(iefoptions, 0);
+            // 设置此项选项后，临时sst文件将自动在ingest后被删除，无需手动删除。
+            c.rocksdb_ingestexternalfileoptions_set_move_files(iefoptions, 1);
+            break :blk iefoptions.?;
+        };
+        defer c.rocksdb_ingestexternalfileoptions_destroy(iefoptions);
+        const file_list = [_][*:0]const u8{
+            tmp_sst_file_path,
+        };
+        var err_cstr: ?[*:0]u8 = null;
+        c.rocksdb_ingest_external_file_cf(db, cf_pr_bc2pi, @ptrCast(&file_list), file_list.len, iefoptions, @ptrCast(&err_cstr));
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        break :sst_file_ingest;
+    }
+    // 无需对pr_bc2pi列族再进行一次全量compaction，原因见`storage.applyPrBc2PiCfOptions`内的注释。
 }

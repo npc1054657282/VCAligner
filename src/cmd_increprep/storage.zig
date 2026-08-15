@@ -60,7 +60,7 @@ pub const State = union(enum) {
         defer c.rocksdb_compactoptions_destroy(compact_options);
         // 遍历所有的累积写入的列族进行压缩
         const cumulative_storage: Cumulative = .fromFullStorage(&self.valid);
-        for (cumulative_storage.cf_handles.values) |cf_handle| {
+        for (cumulative_storage.cfs.values) |cf_handle| {
             c.rocksdb_compact_range_cf_opt(
                 self.valid.db,
                 cf_handle,
@@ -86,11 +86,37 @@ pub const State = union(enum) {
         errdefer self.* = .invalid;
         try self.valid.initForManualCompaction(n_rocksdbjobs, compression, rocksdb_path, last_diag);
     }
+    // 对于增量模式，需要在写入PrCb2Pi前清空其状态，此处使用drop以后重新创建。
+    pub fn resetPrCb2Pi(
+        self: *State,
+        compression: bool,
+        last_diag: *vcaligner.diag.Diagnostic,
+    ) !void {
+        var err_cstr: ?[*:0]u8 = null;
+        c.rocksdb_drop_column_family(self.valid.db, self.valid.cfs.get(.pr_bc2pi), @ptrCast(&err_cstr));
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        const cf_options = blk: {
+            const cf_options = c.rocksdb_options_create().?;
+            applyPrBc2PiCfOptions(cf_options, compression);
+            break :blk cf_options;
+        };
+        defer c.rocksdb_options_destroy(cf_options);
+        const new_cf_handle = c.rocksdb_create_column_family(
+            self.valid.db,
+            cf_options,
+            vcaligner.rocksdb_custom.cf_names.get(.pr_bc2pi),
+            @ptrCast(&err_cstr),
+        );
+        try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+        errdefer comptime unreachable;
+        c.rocksdb_column_family_handle_destroy(self.valid.cfs.get(.pr_bc2pi));
+        self.valid.cfs.set(.pr_bc2pi, new_cf_handle);
+    }
 };
 
 pub const Handles = struct {
     db: *c.rocksdb_t,
-    cf_handles: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_column_family_handle_t),
+    cfs: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_column_family_handle_t),
     fn initForWrite(
         self: *Handles,
         mode: @import("PrepRunner.zig").Mode,
@@ -148,13 +174,13 @@ pub const Handles = struct {
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
         var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_options_t) = .init(.{
-            .bpi_ci = undefined,
-            .pi_p = normal_cf_options,
-            .b_pi_bpi = undefined,
-            .ci_c = normal_cf_options,
-            .pr_pi = undefined,
+            .bpi2ci = undefined,
+            .pi2p = normal_cf_options,
+            .b_pi2bpi = undefined,
+            .ci2c = normal_cf_options,
+            .pr_bc2pi = undefined,
         });
-        all_cf_options.set(.bpi_ci, blk: {
+        all_cf_options.set(.bpi2ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             // 一定要小心，此处神坑！slicetransform和mergeoperator进入options时都会变成shared ptr并且移交所有权！
@@ -163,22 +189,20 @@ pub const Handles = struct {
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
-        all_cf_options.set(.b_pi_bpi, blk: {
+        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi2ci));
+        all_cf_options.set(.b_pi2bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.b_pi_bpi));
-        all_cf_options.set(.pr_pi, blk: {
+        defer c.rocksdb_options_destroy(all_cf_options.get(.b_pi2bpi));
+        all_cf_options.set(.pr_bc2pi, blk: {
             const cf_options = c.rocksdb_options_create().?;
-            // 如果其他列族使用自动compaction，pr2pi依然需要在最后全量手动compaction。
-            // 如果其他列族使用延迟全量compaction，预计整个数据库将要重新被打开，这里对pr2pi怎么配置都无所谓。
-            applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
+            applyPrBc2PiCfOptions(cf_options, compression);
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.pr_pi));
+        defer c.rocksdb_options_destroy(all_cf_options.get(.pr_bc2pi));
         self.db = blk: {
             var err_cstr: ?[*:0]u8 = null;
             const db = c.rocksdb_open_column_families(
@@ -187,7 +211,7 @@ pub const Handles = struct {
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(&vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
-                &self.cf_handles.values,
+                &self.cfs.values,
                 @ptrCast(&err_cstr),
             );
             try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
@@ -212,7 +236,7 @@ pub const Handles = struct {
             break :blk db_options;
         };
         defer c.rocksdb_options_destroy(db_options);
-        // 非默认列族（除b_pi_bpi外）的选项
+        // 非默认列族（除b_pi2bpi外）的选项
         const normal_cf_options = blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
@@ -220,26 +244,32 @@ pub const Handles = struct {
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
         var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*const c.rocksdb_options_t) = .init(.{
-            .bpi_ci = undefined,
-            .pi_p = normal_cf_options,
-            .b_pi_bpi = undefined,
-            .ci_c = normal_cf_options,
-            .pr_pi = normal_cf_options,
+            .bpi2ci = undefined,
+            .pi2p = normal_cf_options,
+            .b_pi2bpi = undefined,
+            .ci2c = normal_cf_options,
+            .pr_bc2pi = undefined,
         });
-        all_cf_options.set(.bpi_ci, blk: {
+        all_cf_options.set(.bpi2ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
-        all_cf_options.set(.b_pi_bpi, blk: {
+        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi2ci));
+        all_cf_options.set(.b_pi2bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.b_pi_bpi));
+        defer c.rocksdb_options_destroy(all_cf_options.get(.b_pi2bpi));
+        all_cf_options.set(.pr_bc2pi, blk: {
+            const cf_options = c.rocksdb_options_create().?;
+            applyPrBc2PiCfOptions(cf_options, compression);
+            break :blk cf_options;
+        });
+        defer c.rocksdb_options_destroy(all_cf_options.get(.pr_bc2pi));
         self.db = blk: {
             var err_cstr: ?[*:0]u8 = null;
             const new_db = c.rocksdb_open_column_families(
@@ -248,7 +278,7 @@ pub const Handles = struct {
                 vcaligner.rocksdb_custom.cf_names.values.len,
                 @ptrCast(vcaligner.rocksdb_custom.cf_names.values),
                 &all_cf_options.values,
-                &self.cf_handles,
+                &self.cfs,
                 @ptrCast(&err_cstr),
             );
             try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
@@ -256,7 +286,7 @@ pub const Handles = struct {
         };
     }
     fn deinit(self: *Handles) void {
-        var iter = std.mem.reverseIterator((&self.cf_handles.values)[0..]);
+        var iter = std.mem.reverseIterator((&self.cfs.values)[0..]);
         while (iter.next()) |cf_handle| {
             c.rocksdb_column_family_handle_destroy(cf_handle);
         }
@@ -321,20 +351,35 @@ fn applyFullCompactionOptimizationsToCfOptions(
     }
 }
 
+pub fn applyPrBc2PiCfOptions(
+    options: *c.rocksdb_options_t,
+    compression: bool,
+) void {
+    // pr_bc2pi列族有以下特征：
+    // 它永远只需要sstFileWriter写入和读取。
+    // 它的读取永远都是全量扫描。
+    // 因此，单个巨大的sst文件是最优的。我们不需要compaction，既不需要自动，也不需要手动，只需要一个巨大的sst文件。
+    // `target_file_size_base`对于sstFileWriter写入的sst文件大小没有影响。
+    // 而只要不进行写入，也不会触发compaction，因此不需要禁用自动compaction。
+    if (compression) {
+        c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
+    }
+}
+
 pub const Cumulative = struct {
     db: *c.rocksdb_t,
-    cf_handles: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
-        bpi_ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi_ci),
-        pi_p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi_p),
-        b_pi_bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi_bpi),
-        ci_c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci_c),
+    cfs: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
+        bpi2ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi2ci),
+        pi2p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi2p),
+        b_pi2bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi2bpi),
+        ci2c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci2c),
     }, ?*c.rocksdb_column_family_handle_t),
     pub fn fromFullStorage(storage: *Handles) Cumulative {
-        return .{ .db = storage.db, .cf_handles = .init(.{
-            .bpi_ci = storage.cf_handles.get(.bpi_ci),
-            .pi_p = storage.cf_handles.get(.pi_p),
-            .b_pi_bpi = storage.cf_handles.get(.b_pi_bpi),
-            .ci_c = storage.cf_handles.get(.ci_c),
+        return .{ .db = storage.db, .cfs = .init(.{
+            .bpi2ci = storage.cfs.get(.bpi2ci),
+            .pi2p = storage.cfs.get(.pi2p),
+            .b_pi2bpi = storage.cfs.get(.b_pi2bpi),
+            .ci2c = storage.cfs.get(.ci2c),
         }) };
     }
 };
