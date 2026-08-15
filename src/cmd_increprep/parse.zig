@@ -347,7 +347,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
         if (ctx.commit_registry.map.contains(id.*)) return 0;
         // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
         const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
-        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.gpa_instance.gpao().allocator, id.*, {}) catch |err| {
+        ctx.commit_registry.map.putNoClobber(ctx.commit_registry.allocator(), id.*, {}) catch |err| {
             std.log.err("Commit regisistry put no clobber failed.\n", .{});
             break :main_logic_customized_error err;
         };

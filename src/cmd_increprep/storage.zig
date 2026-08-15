@@ -18,7 +18,7 @@ pub const State = union(enum) {
         recovery_path_conf: RecoveryPathConfView,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
-        self = .{ .valid = undefined };
+        self.* = .{ .valid = undefined };
         try self.valid.initForWrite(mode, n_rocksdbjobs, compaction_strategy, compression, cf_max_write_buffer_number, rocksdb_path, last_diag);
         errdefer self.valid.deinit();
         switch (recovery_path_conf) {
@@ -28,28 +28,16 @@ pub const State = union(enum) {
                 const checkpoint_object = c.rocksdb_checkpoint_object_create(self.valid.db, @ptrCast(&err_cstr));
                 try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
                 defer c.rocksdb_checkpoint_object_destroy(checkpoint_object);
-                c.rocksdb_checkpoint_create(checkpoint_object, path, 0, &err_cstr);
+                c.rocksdb_checkpoint_create(checkpoint_object, path, 0, @ptrCast(&err_cstr));
                 try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
             },
         }
     }
-    pub fn deinit(self: *State, recovery_path_conf: RecoveryPathConfView) void {
-        switch (self.*) {
-            .valid => |*handles| {
-                switch (recovery_path_conf) {
-                    .disabled => {},
-                    .enabled => |path| try std.fs.cwd().deleteTree(path),
-                }
-                handles.deinit();
-            },
-            .invalid => {},
-        }
-    }
-    pub fn deinitOnErr(self: *State) void {
+    pub fn deinit(self: *State) void {
         switch (self.*) {
             .valid => |*handles| {
                 handles.deinit();
-                self.* = .invalid;
+                // recovery的移除可能报错，因此会在控制流末尾手动进行，而不会在deinit中完成。
             },
             .invalid => {},
         }
@@ -155,11 +143,11 @@ pub const Handles = struct {
 
         const normal_cf_options = blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyHeavyWriteOptimizationsOnCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
+            applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             break :blk cf_options;
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
-        var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*const c.rocksdb_options_t) = .init(.{
+        var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_options_t) = .init(.{
             .bpi_ci = undefined,
             .pi_p = normal_cf_options,
             .b_pi_bpi = undefined,
@@ -168,7 +156,7 @@ pub const Handles = struct {
         });
         all_cf_options.set(.bpi_ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyHeavyWriteOptimizationsOnCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
+            applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             // 一定要小心，此处神坑！slicetransform和mergeoperator进入options时都会变成shared ptr并且移交所有权！
             // 千万不要调用C API提供的`rocksdb_slicetransform_destroy`和`rocksdb_mergeoperator_destroy`！
             // 默认列族以blob-path-id为前缀。不使用布隆过滤器，因为后续使用数据库的时候基本没有需要检查无效的key的情况。
@@ -178,7 +166,7 @@ pub const Handles = struct {
         defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
         all_cf_options.set(.b_pi_bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyHeavyWriteOptimizationsOnCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
+            applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
             break :blk cf_options;
         });
@@ -187,7 +175,7 @@ pub const Handles = struct {
             const cf_options = c.rocksdb_options_create().?;
             // 如果其他列族使用自动compaction，pr2pi依然需要在最后全量手动compaction。
             // 如果其他列族使用延迟全量compaction，预计整个数据库将要重新被打开，这里对pr2pi怎么配置都无所谓。
-            applyFullCompactionOptimizationsOnCfOptions(cf_options, compression);
+            applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             break :blk cf_options;
         });
         defer c.rocksdb_options_destroy(all_cf_options.get(.pr_pi));
@@ -227,7 +215,7 @@ pub const Handles = struct {
         // 非默认列族（除b_pi_bpi外）的选项
         const normal_cf_options = blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyFullCompactionOptimizationsOnCfOptions(cf_options, compression);
+            applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             break :blk cf_options;
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
@@ -240,14 +228,14 @@ pub const Handles = struct {
         });
         all_cf_options.set(.bpi_ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyFullCompactionOptimizationsOnCfOptions(cf_options, compression);
+            applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
             break :blk cf_options;
         });
         defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
         all_cf_options.set(.b_pi_bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
-            applyFullCompactionOptimizationsOnCfOptions(cf_options, compression);
+            applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(c.git_oid)));
             break :blk cf_options;
         });
@@ -277,7 +265,7 @@ pub const Handles = struct {
     }
 };
 
-fn applyHeavyWriteOptimizationsOnCfOptions(
+fn applyHeavyWriteOptimizationsToCfOptions(
     cf_options: *c.rocksdb_options_t,
     compression: bool,
     compaction_strategy: CompactionStrategy,
@@ -319,7 +307,7 @@ fn applyHeavyWriteOptimizationsOnCfOptions(
     c.rocksdb_options_set_max_write_buffer_number(cf_options, cf_max_write_buffer_number);
 }
 
-fn applyFullCompactionOptimizationsOnCfOptions(
+fn applyFullCompactionOptimizationsToCfOptions(
     options: *c.rocksdb_options_t,
     compression: bool,
 ) void {

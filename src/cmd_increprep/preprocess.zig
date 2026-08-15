@@ -9,6 +9,7 @@ const PathSeq = vcaligner.rocksdb_custom.PathSeq;
 const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
 const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const storage = @import("storage.zig");
 
 // XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
 // 注意，这并不代表它包含一个commit及其对应的所有blob-path。
@@ -90,21 +91,24 @@ pub const PathRegistry = struct {
 pub const BlobPathRegistry = std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq);
 
 pub const WriterBoundRegistries = struct {
+    // PathRegistry和BlobPathRegistry的生命周期都与写入过程相关，所以放在一起。
+    // 目前尚未确定是使用单独的写线程，还是写线程与主线程相同。
+    // 若有单独写线程，则WriterBoundRegistries也是跨线程结构，写线程使用完毕后，主线程需要使用`path_registry`以写入`pi_bc2p`列族。
+    // 因此，对它们使用共同的专有`gpa_instance`实例，这样该分配器实例即使非线程安全也保持可用。
+    // 注意：`path_registry`与`blob_path_registry`的生命周期可能不完全相同，例如`path_registry`在主写过程结束后仍然需要使用，
+    // 而`blob_path_registry`在主写入过程结束后就不再需要使用。
     gpa_instance: vcaligner.gpa.Owned.Instance,
     path_registry: PathRegistry,
     blob_path_registry: BlobPathRegistry,
-    pub fn init(self: *WriterBoundRegistries) void {
-        self.gpa_instance = .init();
-        self.path_registry = .{ .map = .empty, .key_arena = .init(self.gpa_instance.gpao().allocator) };
-        self.blob_path_registry = .empty;
-    }
-    pub fn deinit(self: *WriterBoundRegistries) void {
-        self.blob_path_registry.deinit(self.gpa_instance.gpao().allocator);
-        self.path_registry.deinit(self.gpa_instance.gpao().allocator);
-        self.gpa_instance.deinit();
-    }
     pub fn allocator(self: *WriterBoundRegistries) std.mem.Allocator {
         return self.gpa_instance.gpao().allocator;
+    }
+    pub fn loadPathRegistryForIncremental(
+        self: *WriterBoundRegistries,
+        rocksdb: storage.Handles,
+    ) !void {
+        _ = self;
+        _ = rocksdb;
     }
 };
 
@@ -112,12 +116,42 @@ pub const CommitRegistry = struct {
     map: std.AutoHashMapUnmanaged(c.git_oid, void),
     // `CommitRegistry`存在跨线程需求。
     // 增量模式下，需要在主解析线程启动前使用它，并在主线程中继续使用。
-    // 因此这要求跨线程地保存其分配器，且此分配器应为线程安全的。
+    // 因此这要求跨线程地保存其分配器。此处的实现采用了专有分配器实例，这样可以规避线程安全的要求。
+    // 专有分配器实例也可以通过一个线程安全的全局分配器实现来模拟此处的专有分配器实例需求。
     gpa_instance: vcaligner.gpa.Owned.Instance,
     pub fn deinit(self: *CommitRegistry) void {
         self.map.deinit(self.gpa_instance.gpao().allocator);
         self.gpa_instance.deinit();
         self.* = undefined;
+    }
+    pub fn allocator(self: *CommitRegistry) std.mem.Allocator {
+        return self.gpa_instance.gpao().allocator;
+    }
+    pub fn loadForIncremental(
+        self: *CommitRegistry,
+        rocksdb: storage.Handles,
+    ) !void {
+        const it = it: {
+            const roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create().?;
+                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, CommitSeq);
+                break :blk roptions;
+            };
+            defer c.rocksdb_readoptions_destroy(roptions);
+            break :it c.rocksdb_create_iterator_cf(rocksdb.db, roptions, rocksdb.cf_handles.get(.ci_c));
+        };
+        defer c.rocksdb_iter_destroy(it);
+        c.rocksdb_iter_seek_to_first(it);
+        while (c.rocksdb_iter_valid(it) != 0) {
+            const commit_hash: c.git_oid = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                break :blk std.mem.bytesToValue(c.git_oid, c_ptr[0..c_len]);
+            };
+            try self.map.put(self.allocator(), commit_hash, {});
+            // 如果出错也没有回退状态的价值，不再进行errdefer。
+            c.rocksdb_iter_next(it);
+        }
     }
 };
 
@@ -209,9 +243,6 @@ pub const RecoveryPathConf = union(enum) {
 pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
     // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
-    var writer_bound_registries: WriterBoundRegistries = undefined;
-    writer_bound_registries.init();
-    defer writer_bound_registries.deinit();
     var commit_registry: CommitRegistry = .{ .map = .empty, .gpa_instance = .init() };
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
@@ -223,7 +254,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     var channel: Channel = .{ .mpsc_queue_ref = queue };
     // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
     // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-    const main_parser: std.Thread, const rocksdb_output: RocksdbPath = libgit2_handoff: {
+    const main_parser: std.Thread, const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = libgit2_handoff: {
         var git_error_code = c.git_libgit2_init();
         if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
         std.debug.assert(git_error_code == 1);
@@ -249,11 +280,23 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         };
     };
     defer rocksdb_output.deinit(gpa.allocator);
+    defer recovery_path_conf.deinit(gpa.allocator);
+    defer storage_state.deinit();
     // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
     // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
     // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
     // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
     defer main_parser.join();
+    var writer_bound_registries: WriterBoundRegistries = .{
+        .gpa_instance = .init(),
+        .path_registry = undefined,
+        .blob_path_registry = undefined,
+    };
+    defer writer_bound_registries.gpa_instance.deinit();
+    writer_bound_registries.path_registry = .{ .map = .empty, .key_arena = .init(writer_bound_registries.allocator()) };
+    defer writer_bound_registries.path_registry.deinit(writer_bound_registries.allocator());
+    writer_bound_registries.blob_path_registry = .empty;
+    defer writer_bound_registries.blob_path_registry.deinit(writer_bound_registries.allocator());
     // 全量模式创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
     if (runconf.mode_conf == .full) make_parent_dir: {
         // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
@@ -280,6 +323,12 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         }
         break :make_parent_dir;
     }
+
+    // 成功退出前，移除recovery。
+    switch (recovery_path_conf) {
+        .disabled => {},
+        .borrowed_from_config, .owned => |path| try std.fs.cwd().deleteTree(path),
+    }
 }
 
 fn provisionMainParser(
@@ -288,9 +337,8 @@ fn provisionMainParser(
     channel: *Channel,
     gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
-) !struct { std.Thread, RocksdbPath } {
+) !struct { std.Thread, RocksdbPath, RecoveryPathConf, storage.State } {
     const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
-    _ = compaction_strategy;
     const repo: *c.git_repository = blk: {
         var repo: ?*c.git_repository = undefined;
         const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
@@ -304,6 +352,23 @@ fn provisionMainParser(
     _ = oidtype;
     const rocksdb_output: RocksdbPath = try .init(runconf, repo, gpa.allocator, last_diag);
     errdefer rocksdb_output.deinit(gpa.allocator);
+    const recovery_path_conf: RecoveryPathConf = try .init(runconf, gpa.allocator, rocksdb_output.get());
+    errdefer recovery_path_conf.deinit(gpa.allocator);
+    var storage_state: storage.State = undefined;
+    try storage_state.init(
+        runconf.mode_conf,
+        runconf.n_rocksdbjobs,
+        compaction_strategy,
+        runconf.compression,
+        runconf.cf_max_write_buffer_number,
+        rocksdb_output.get(),
+        recovery_path_conf.view(),
+        last_diag,
+    );
+    errdefer storage_state.deinit();
+    if (runconf.mode_conf == .incremental) {
+        try commit_registry.loadForIncremental(storage_state.valid);
+    }
     const main_parser = try std.Thread.spawn(.{ .allocator = gpa.allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
         repo,
         channel,
@@ -312,7 +377,7 @@ fn provisionMainParser(
         commit_registry,
     });
     errdefer comptime unreachable;
-    return .{ main_parser, rocksdb_output };
+    return .{ main_parser, rocksdb_output, recovery_path_conf, storage_state };
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。

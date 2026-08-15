@@ -56,3 +56,22 @@ pub const cf_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
     .ci_c = "ci2c",
     .pr_pi = "pr2pi",
 });
+
+// 在读取rocksdb时，应用全局遍历的配置。
+// 如果读取的rocksdb的列族的键是固定长度的（有确定类型的），且没有配置其他比较器，则可以使用此函数配置读取选项。
+// 在本项目中，适用于：增量模式加载时的ci2c列族、pr_bc2pi列族、b_pi2bpi列族的读取；分析过程中pr_bc2pi列族的读取。
+pub fn applyFullScanOfOrderPreservingTypedKeyToReadOptions(
+    roptions: *c.rocksdb_readoptions_t,
+    K: type,
+) void {
+    // 全局遍历一次，缓存没有意义，不使用缓存避免污染。
+    c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+    // 总序遍历，按全局键序遍历整个列族。
+    // 主要是规避prefix extractor的影响。prefix extractor可能会截断key，导致无法全局遍历。
+    c.rocksdb_readoptions_set_total_order_seek(roptions, 1);
+    c.rocksdb_readoptions_set_auto_readahead_size(roptions, 1);
+    // 为了让`readahead`实际生效，配置`iterate_upper_bound`为usize最大值。
+    // [参见](https://github.com/facebook/rocksdb/blob/6a202c5570d9aca11a23c5b1a78019f8be245463/include/rocksdb/options.h#L2111-L2135)
+    const key_upper_bound: [@sizeOf(K) + 1]u8 = @as([@sizeOf(K)]u8, @splat(0xff)) ++ [1]u8{0};
+    c.rocksdb_readoptions_set_iterate_upper_bound(roptions, &key_upper_bound, key_upper_bound.len);
+}
