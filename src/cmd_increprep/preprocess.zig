@@ -9,6 +9,8 @@ const PathSeq = vcaligner.rocksdb_custom.PathSeq;
 const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
 const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const PathRankBlobCountKey = vcaligner.rocksdb_custom.PathRankBlobCountKey;
+const BlobCountNative = vcaligner.rocksdb_custom.BlobCountNative;
 const storage = @import("storage.zig");
 
 // XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
@@ -73,11 +75,32 @@ pub const MsgToWriter = union(enum) {
 pub const Queue = @import("mpsc_queue").AnyMpscQueue(MsgToWriter, null);
 pub const Channel = vcaligner.MpscChannel(Queue);
 
+const LoadRegistryForIncrementalError = error{
+    PiFromPrBc2PiNotFoundInPi2P,
+};
+pub const DiagnosticPiFromPrBc2PiNotFoundInPi2P = struct {
+    pr_bc: PathRankBlobCountKey,
+    pi: PathSeq,
+    pub fn init(pr_bc: PathRankBlobCountKey, pi: PathSeq) DiagnosticPiFromPrBc2PiNotFoundInPi2P {
+        return .{
+            .pr_bc = pr_bc,
+            .pi = pi,
+        };
+    }
+    pub fn log(self: DiagnosticPiFromPrBc2PiNotFoundInPi2P) void {
+        std.log.err("path rank: {d}\tblob count: {d}\tpath id: {d}\n", .{
+            self.pr_bc.path_rank.toNative(),
+            self.pr_bc.blob_count.toNative(),
+            self.pi.toNative(),
+        });
+    }
+};
+
 pub const PathRegistry = struct {
     pub const Map = std.StringArrayHashMapUnmanaged(struct {
         // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
         index: PathSeq,
-        blob_cnt: usize,
+        blob_cnt: BlobCountNative,
     });
     map: Map,
     // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
@@ -88,8 +111,105 @@ pub const PathRegistry = struct {
         self.key_arena.deinit();
         self.* = undefined;
     }
+    pub fn loadForIncremental(
+        self: *PathRegistry,
+        storage_handles: storage.Handles,
+        allocaotr: std.mem.Allocator,
+        last_diag: *diag.Diagnostic,
+    ) !void {
+        const it = it: {
+            const roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create().?;
+                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathRankBlobCountKey);
+                break :blk roptions;
+            };
+            defer c.rocksdb_readoptions_destroy(roptions);
+            break :it c.rocksdb_create_iterator_cf(storage_handles.db, roptions, storage_handles.cfs.get(.pr_bc2pi));
+        };
+        defer c.rocksdb_iter_destroy(it);
+        c.rocksdb_iter_seek_to_first(it);
+        const pi2p_roptions = blk: {
+            const roptions = c.rocksdb_readoptions_create();
+            // 每个键只会被`get`一次，不用缓存避免污染。
+            c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+            break :blk roptions.?;
+        };
+        defer c.rocksdb_readoptions_destroy(pi2p_roptions);
+        while (c.rocksdb_iter_valid(it) != 0) {
+            const pr_bc: PathRankBlobCountKey = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                break :blk std.mem.bytesToValue(PathRankBlobCountKey, c_ptr[0..c_len]);
+            };
+            const blob_cnt: BlobCountNative = pr_bc.blob_count.toNative();
+            const pi: PathSeq = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                break :blk std.mem.bytesToValue(PathSeq, c_ptr[0..c_len]);
+            };
+            const path: []const u8 = path: {
+                var c_len: usize = undefined;
+                var err_cstr: ?[*:0]u8 = null;
+                const c_ptr = c.rocksdb_get_cf(
+                    storage_handles.db,
+                    pi2p_roptions,
+                    storage_handles.cfs.get(.pi2p),
+                    @ptrCast(&pi),
+                    @sizeOf(PathSeq),
+                    &c_len,
+                    @ptrCast(&err_cstr),
+                );
+                try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                if (c_ptr == null) {
+                    last_diag.* = .{
+                        .PiFromPrBc2PiNotFoundInPi2P = .init(pr_bc, pi),
+                    };
+                    return LoadRegistryForIncrementalError.PiFromPrBc2PiNotFoundInPi2P;
+                }
+                defer c.rocksdb_free(c_ptr);
+                break :path try self.key_arena.allocator().dupeZ(u8, c_ptr[0..c_len]);
+            };
+            try self.map.put(allocaotr, path, .{ .index = pi, .blob_cnt = blob_cnt });
+            // 如果出错也没有回退状态的价值，不再进行errdefer。
+            c.rocksdb_iter_next(it);
+        }
+    }
 };
-pub const BlobPathRegistry = std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq);
+pub const BlobPathRegistry = struct {
+    map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq),
+    pub fn loadForIncremental(
+        self: *BlobPathRegistry,
+        storage_handles: storage.Handles,
+        allocaotr: std.mem.Allocator,
+    ) !void {
+        const it = it: {
+            const roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create().?;
+                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, BlobPathKey);
+                break :blk roptions;
+            };
+            defer c.rocksdb_readoptions_destroy(roptions);
+            break :it c.rocksdb_create_iterator_cf(storage_handles.db, roptions, storage_handles.cfs.get(.b_pi2bpi));
+        };
+        defer c.rocksdb_iter_destroy(it);
+        c.rocksdb_iter_seek_to_first(it);
+        while (c.rocksdb_iter_valid(it) != 0) {
+            const b_pi: BlobPathKey = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                break :blk std.mem.bytesToValue(BlobPathKey, c_ptr[0..c_len]);
+            };
+            const bpi: BlobPathSeq = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                break :blk std.mem.bytesToValue(BlobPathSeq, c_ptr[0..c_len]);
+            };
+            try self.map.put(allocaotr, b_pi, bpi);
+            // 如果出错也没有回退状态的价值，不再进行errdefer。
+            c.rocksdb_iter_next(it);
+        }
+    }
+};
 
 pub const WriterBoundRegistries = struct {
     // PathRegistry和BlobPathRegistry的生命周期都与写入过程相关，所以放在一起。
@@ -103,13 +223,6 @@ pub const WriterBoundRegistries = struct {
     blob_path_registry: BlobPathRegistry,
     pub fn allocator(self: *WriterBoundRegistries) std.mem.Allocator {
         return self.gpa_instance.gpao().allocator;
-    }
-    pub fn loadPathRegistryForIncremental(
-        self: *WriterBoundRegistries,
-        rocksdb: storage.Handles,
-    ) !void {
-        _ = self;
-        _ = rocksdb;
     }
 };
 
@@ -296,34 +409,10 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     defer writer_bound_registries.gpa_instance.deinit();
     writer_bound_registries.path_registry = .{ .map = .empty, .key_arena = .init(writer_bound_registries.allocator()) };
     defer writer_bound_registries.path_registry.deinit(writer_bound_registries.allocator());
-    writer_bound_registries.blob_path_registry = .empty;
-    defer writer_bound_registries.blob_path_registry.deinit(writer_bound_registries.allocator());
-    // 全量模式创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
-    if (runconf.mode_conf == .full) make_parent_dir: {
-        // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
-        // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
-        // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
-        const maybe_parent_dir: ?[]const u8 = std.fs.path.dirname(rocksdb_output.get());
-        if (maybe_parent_dir) |parent_dir| {
-            const cwd = std.fs.cwd();
-            cwd.access(parent_dir, .{}) catch |access_err| {
-                switch (access_err) {
-                    error.FileNotFound => cwd.makePath(parent_dir) catch |mkdir_err| {
-                        switch (mkdir_err) {
-                            // 考虑多进程竞争场景，可能存在同进程已经创建目录的情形。此时是安全的。
-                            error.PathAlreadyExists => {},
-                            else => {
-                                std.log.err("make dir {s} error: {s}", .{ parent_dir, @errorName(mkdir_err) });
-                                return mkdir_err;
-                            },
-                        }
-                    },
-                    else => return access_err,
-                }
-            };
-        }
-        break :make_parent_dir;
-    }
+    try writer_bound_registries.path_registry.loadForIncremental(storage_state.valid, writer_bound_registries.allocator(), last_diag);
+    writer_bound_registries.blob_path_registry = .{ .map = .empty };
+    defer writer_bound_registries.blob_path_registry.map.deinit(writer_bound_registries.allocator());
+    try writer_bound_registries.blob_path_registry.loadForIncremental(storage_state.valid, writer_bound_registries.allocator());
 
     // 成功退出前，移除recovery。
     switch (recovery_path_conf) {

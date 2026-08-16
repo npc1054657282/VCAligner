@@ -18,6 +18,32 @@ pub const State = union(enum) {
         recovery_path_conf: RecoveryPathConfView,
         last_diag: *vcaligner.diag.Diagnostic,
     ) !void {
+        // 全量模式创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
+        if (mode == .full) make_parent_dir: {
+            // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
+            // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
+            // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
+            const maybe_parent_dir: ?[]const u8 = std.fs.path.dirname(rocksdb_path);
+            if (maybe_parent_dir) |parent_dir| {
+                const cwd = std.fs.cwd();
+                cwd.access(parent_dir, .{}) catch |access_err| {
+                    switch (access_err) {
+                        error.FileNotFound => cwd.makePath(parent_dir) catch |mkdir_err| {
+                            switch (mkdir_err) {
+                                // 考虑多进程竞争场景，可能存在同进程已经创建目录的情形。此时是安全的。
+                                error.PathAlreadyExists => {},
+                                else => {
+                                    std.log.err("make dir {s} error: {s}", .{ parent_dir, @errorName(mkdir_err) });
+                                    return mkdir_err;
+                                },
+                            }
+                        },
+                        else => return access_err,
+                    }
+                };
+            }
+            break :make_parent_dir;
+        }
         self.* = .{ .valid = undefined };
         try self.valid.initForWrite(mode, n_rocksdbjobs, compaction_strategy, compression, cf_max_write_buffer_number, rocksdb_path, last_diag);
         errdefer self.valid.deinit();
@@ -59,7 +85,7 @@ pub const State = union(enum) {
         const compact_options = c.rocksdb_compactoptions_create();
         defer c.rocksdb_compactoptions_destroy(compact_options);
         // 遍历所有的累积写入的列族进行压缩
-        const cumulative_storage: Cumulative = .fromFullStorage(&self.valid);
+        const cumulative_storage: Handles.Cumulative = .fromFullStorage(&self.valid);
         for (cumulative_storage.cfs.values) |cf_handle| {
             c.rocksdb_compact_range_cf_opt(
                 self.valid.db,
@@ -293,6 +319,24 @@ pub const Handles = struct {
         c.rocksdb_close(self.db);
         self.* = undefined;
     }
+
+    pub const Cumulative = struct {
+        db: *c.rocksdb_t,
+        cfs: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
+            bpi2ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi2ci),
+            pi2p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi2p),
+            b_pi2bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi2bpi),
+            ci2c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci2c),
+        }, ?*c.rocksdb_column_family_handle_t),
+        pub fn fromFullStorage(storage: *Handles) Cumulative {
+            return .{ .db = storage.db, .cfs = .init(.{
+                .bpi2ci = storage.cfs.get(.bpi2ci),
+                .pi2p = storage.cfs.get(.pi2p),
+                .b_pi2bpi = storage.cfs.get(.b_pi2bpi),
+                .ci2c = storage.cfs.get(.ci2c),
+            }) };
+        }
+    };
 };
 
 fn applyHeavyWriteOptimizationsToCfOptions(
@@ -365,21 +409,3 @@ pub fn applyPrBc2PiCfOptions(
         c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
     }
 }
-
-pub const Cumulative = struct {
-    db: *c.rocksdb_t,
-    cfs: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
-        bpi2ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi2ci),
-        pi2p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi2p),
-        b_pi2bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi2bpi),
-        ci2c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci2c),
-    }, ?*c.rocksdb_column_family_handle_t),
-    pub fn fromFullStorage(storage: *Handles) Cumulative {
-        return .{ .db = storage.db, .cfs = .init(.{
-            .bpi2ci = storage.cfs.get(.bpi2ci),
-            .pi2p = storage.cfs.get(.pi2p),
-            .b_pi2bpi = storage.cfs.get(.b_pi2bpi),
-            .ci2c = storage.cfs.get(.ci2c),
-        }) };
-    }
-};

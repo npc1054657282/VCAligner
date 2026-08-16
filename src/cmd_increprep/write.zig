@@ -10,7 +10,7 @@ const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
 const storage = @import("storage.zig");
 
 pub fn writeCumulative(
-    storage_handles: storage.Cumulative,
+    storage_handles: storage.Handles.Cumulative,
     channel: *Channel,
     registries: *WriterBoundRegistries,
     write_batch_watermark: c_int,
@@ -57,10 +57,10 @@ pub fn writeCumulative(
                             .blob_hash = pair.blob_hash,
                             .path_seq = path_get_or_put_result.value_ptr.index,
                         };
-                        const blob_path_get_or_put_result = try registries.blob_path_registry.getOrPut(registries.allocator(), blob_path_key);
+                        const blob_path_get_or_put_result = try registries.blob_path_registry.map.getOrPut(registries.allocator(), blob_path_key);
                         if (!blob_path_get_or_put_result.found_existing) {
                             // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
-                            blob_path_get_or_put_result.value_ptr.* = .fromNative(registries.blob_path_registry.count() - 1);
+                            blob_path_get_or_put_result.value_ptr.* = .fromNative(registries.blob_path_registry.map.count() - 1);
                             // 如果这是一个新的path-blob组合，path的blob_cnt立即加1。
                             path_get_or_put_result.value_ptr.blob_cnt += 1;
                             c.rocksdb_writebatch_put_cf(
@@ -176,7 +176,7 @@ pub fn writePrBc2Pi(
             // sstfilewriter每次put以后，key和value的生存期即可结束，不需要长期维持生存期
             const key: vcaligner.rocksdb_custom.PathRankBlobCountKey = .{
                 .path_rank = path_rank,
-                .blob_count = entry.value_ptr.blob_cnt,
+                .blob_count = .fromNative(entry.value_ptr.blob_cnt),
             };
             c.rocksdb_sstfilewriter_put(
                 sst_file_writer,

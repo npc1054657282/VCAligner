@@ -37,6 +37,7 @@ pub const Diagnostic = union {
     GIT_ERROR: c_helper.DiagnosticGIT_ERROR,
     UnknownCError: c_helper.DiagnosticUnknownCError,
     RocksdbError: c_helper.DiagnosticRocksdbError,
+    PiFromPrBc2PiNotFoundInPi2P: @import("cmd_increprep/preprocess.zig").DiagnosticPiFromPrBc2PiNotFoundInPi2P,
     pub fn enterStack(last_diagnostic: *@This(), last_error: anyerror) !void {
         var diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         if (diagnostics.double_error != null) {
