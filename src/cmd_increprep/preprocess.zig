@@ -211,8 +211,8 @@ pub const BlobPathRegistry = struct {
     }
 };
 
-pub const WriterBoundRegistries = struct {
-    // PathRegistry和BlobPathRegistry的生命周期都与写入过程相关，所以放在一起。
+pub const WriterBoundRegistriesWithSelfManagedGpa = struct {
+    // PathRegistry和BlobPathRegistry的put时机都与写入过程相关，所以放在一起。
     // 目前尚未确定是使用单独的写线程，还是写线程与主线程相同。
     // 若有单独写线程，则WriterBoundRegistries也是跨线程结构，写线程使用完毕后，主线程需要使用`path_registry`以写入`pi_bc2p`列族。
     // 因此，对它们使用共同的专有`gpa_instance`实例，这样该分配器实例即使非线程安全也保持可用。
@@ -221,28 +221,28 @@ pub const WriterBoundRegistries = struct {
     gpa_instance: vcaligner.gpa.Owned.Instance,
     path_registry: PathRegistry,
     blob_path_registry: BlobPathRegistry,
-    pub fn allocator(self: *WriterBoundRegistries) std.mem.Allocator {
+    pub fn allocator(self: *WriterBoundRegistriesWithSelfManagedGpa) std.mem.Allocator {
         return self.gpa_instance.gpao().allocator;
     }
 };
 
-pub const CommitRegistry = struct {
+pub const CommitRegistryWithSelfManagedGpa = struct {
     map: std.AutoHashMapUnmanaged(c.git_oid, void),
     // `CommitRegistry`存在跨线程需求。
-    // 增量模式下，需要在主解析线程启动前使用它，并在主线程中继续使用。
+    // 增量模式下，需要在主解析线程启动前put它，并在主解析线程中继续put。
     // 因此这要求跨线程地保存其分配器。此处的实现采用了专有分配器实例，这样可以规避线程安全的要求。
     // 专有分配器实例也可以通过一个线程安全的全局分配器实现来模拟此处的专有分配器实例需求。
     gpa_instance: vcaligner.gpa.Owned.Instance,
-    pub fn deinit(self: *CommitRegistry) void {
+    pub fn deinit(self: *CommitRegistryWithSelfManagedGpa) void {
         self.map.deinit(self.gpa_instance.gpao().allocator);
         self.gpa_instance.deinit();
         self.* = undefined;
     }
-    pub fn allocator(self: *CommitRegistry) std.mem.Allocator {
+    pub fn allocator(self: *CommitRegistryWithSelfManagedGpa) std.mem.Allocator {
         return self.gpa_instance.gpao().allocator;
     }
     pub fn loadForIncremental(
-        self: *CommitRegistry,
+        self: *CommitRegistryWithSelfManagedGpa,
         rocksdb: storage.Handles,
     ) !void {
         const it = it: {
@@ -357,7 +357,7 @@ pub const RecoveryPathConf = union(enum) {
 pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
     // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
-    var commit_registry: CommitRegistry = .{ .map = .empty, .gpa_instance = .init() };
+    var commit_registry: CommitRegistryWithSelfManagedGpa = .{ .map = .empty, .gpa_instance = .init() };
     // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
     // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
     defer commit_registry.deinit();
@@ -401,7 +401,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
     // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
     defer main_parser.join();
-    var writer_bound_registries: WriterBoundRegistries = .{
+    var writer_bound_registries: WriterBoundRegistriesWithSelfManagedGpa = .{
         .gpa_instance = .init(),
         .path_registry = undefined,
         .blob_path_registry = undefined,
@@ -423,7 +423,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
 
 fn provisionMainParser(
     noalias runconf: *const PrepRunner,
-    commit_registry: *CommitRegistry,
+    commit_registry: *CommitRegistryWithSelfManagedGpa,
     channel: *Channel,
     gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
