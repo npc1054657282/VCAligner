@@ -5,14 +5,14 @@ const c = c_helper.c;
 const Channel = @import("preprocess.zig").Channel;
 const MsgToWriter = @import("preprocess.zig").MsgToWriter;
 const Parsed = @import("preprocess.zig").Parsed;
-const WriterBoundRegistries = @import("preprocess.zig").WriterBoundRegistries;
+const writer_bound_registries = @import("preprocess.zig").writer_bound_registries;
 
 const storage = @import("storage.zig");
 
 pub fn writeCumulative(
     storage_handles: storage.Handles.Cumulative,
     channel: *Channel,
-    registries: *WriterBoundRegistries,
+    registries: writer_bound_registries.Handle,
     write_batch_watermark: c_int,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
@@ -21,7 +21,7 @@ pub fn writeCumulative(
             const woptions = c.rocksdb_writeoptions_create();
             // 无论是全量还是增量，都关闭WAL。因为libgit2的`git_odb_foreach`固有的顺序不确定性，无论如何，WAL都无法做到逻辑可靠的断电续传。
             // 或者说，基于WAL的断电续传需要更复杂的设计才能支持。我们目前仅仅基于checkpoint来确保可靠性，不考虑增量的断电续传能力。
-            c.rocksdb_writeoptions_disable_WAL(1);
+            c.rocksdb_writeoptions_disable_WAL(woptions, 1);
             break :blk woptions.?;
         };
         defer c.rocksdb_writeoptions_destroy(woptions);
@@ -34,7 +34,7 @@ pub fn writeCumulative(
             switch (msg.*) {
                 .parsed => |*parsed| {
                     for (parsed.pairs.items) |*pair| {
-                        const path_get_or_put_result = try registries.path_registry.map.getOrPut(registries.allocator(), pair.path);
+                        const path_get_or_put_result = try registries.path_registry.map.getOrPut(registries.allocator, pair.path);
                         if (!path_get_or_put_result.found_existing) {
                             // 注意！`getOrPut`会直接把我们用于比较的`pair.path`作为键。但是`pair.path`的生存周期实际上并不够！
                             // 因此，我们需要重新设置一个生命周期安全的新key，也就是将当前的`pair.path`重新拷贝一份。为了这些键的拷贝，采用专为此设计的`key_arena`。
@@ -57,7 +57,7 @@ pub fn writeCumulative(
                             .blob_hash = pair.blob_hash,
                             .path_seq = path_get_or_put_result.value_ptr.index,
                         };
-                        const blob_path_get_or_put_result = try registries.blob_path_registry.map.getOrPut(registries.allocator(), blob_path_key);
+                        const blob_path_get_or_put_result = try registries.blob_path_registry.map.getOrPut(registries.allocator, blob_path_key);
                         if (!blob_path_get_or_put_result.found_existing) {
                             // 如果不存在，map的count会立刻加1。我们实际的index从0开始算，所以index是count - 1。
                             blob_path_get_or_put_result.value_ptr.* = .fromNative(registries.blob_path_registry.map.count() - 1);
@@ -109,6 +109,12 @@ pub fn writeCumulative(
                 try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
                 c.rocksdb_writebatch_clear(wb);
             }
+        } else |_| {
+            var err_cstr: ?[*:0]u8 = null;
+            c.rocksdb_write(storage_handles.db, woptions, wb, @ptrCast(&err_cstr));
+            try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+            c.rocksdb_writebatch_clear(wb);
+            std.log.debug("Parse end.\n", .{});
         }
         break :writing;
     }
@@ -128,19 +134,17 @@ pub fn writeCumulative(
     }
 }
 
-const PathRegistry = @import("preprocess.zig").PathRegistry;
-
 pub fn writePrBc2Pi(
     db: *c.rocksdb_t,
-    cf_pr_bc2pi: *c.rocksdb_column_family_handle_t,
-    path_registry: *PathRegistry.Map,
+    cf_pr_bc2pi: vcaligner.rocksdb_custom.CollumFamily.Handle(.pr_bc2pi),
+    path_registry: *writer_bound_registries.PathRegistry.Map,
     tmp_sst_file_path: [:0]const u8,
     compression: bool,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
     sort_path_registry: {
         const SortContext = struct {
-            map: *const PathRegistry.Map,
+            map: *const writer_bound_registries.PathRegistry.Map,
             pub fn lessThan(sctx: @This(), a_index: usize, b_index: usize) bool {
                 // 基于值中的 blob_cnt 比较。采用降序，符号翻转。
                 return sctx.map.values()[a_index].blob_cnt > sctx.map.values()[b_index].blob_cnt;
@@ -211,7 +215,7 @@ pub fn writePrBc2Pi(
             tmp_sst_file_path,
         };
         var err_cstr: ?[*:0]u8 = null;
-        c.rocksdb_ingest_external_file_cf(db, cf_pr_bc2pi, @ptrCast(&file_list), file_list.len, iefoptions, @ptrCast(&err_cstr));
+        c.rocksdb_ingest_external_file_cf(db, cf_pr_bc2pi.handle, @ptrCast(&file_list), file_list.len, iefoptions, @ptrCast(&err_cstr));
         try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
         break :sst_file_ingest;
     }

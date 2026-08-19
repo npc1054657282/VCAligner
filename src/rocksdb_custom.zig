@@ -51,16 +51,33 @@ pub const CollumFamily = enum {
     // Full-Rebuild 列族，构造结束以后一次性通过sstWriter写入，不可增量，每次写入全部替换
     // 键为path-rank和blob-count并列，值为path
     pr_bc2pi,
+    pub const HandlesSubViewer = vcaligner.sub_enum.EnumArrayWithSubViewer(CollumFamily, ?*c.rocksdb_column_family_handle_t);
+    pub const Handles = HandlesSubViewer.EnumArray;
+    pub fn Handle(comptime cf: CollumFamily) type {
+        return struct {
+            handle: *c.rocksdb_column_family_handle_t,
+            pub const collum_family = cf;
+            pub fn fromHandles(noalias handles: *const Handles) @This() {
+                return .{ .handle = handles.get(collum_family).? };
+            }
+        };
+    }
+    pub const names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
+        // XXX: 将来考虑默认列族改为存放元数据，专设bpi2ci列族。
+        // 当前考虑到复用已有分析数据的兼容性，仍然设计为bpi2ci使用default列族。
+        .bpi2ci = "default",
+        .pi2p = "pi2p",
+        .b_pi2bpi = "b_pi2bpi",
+        .ci2c = "ci2c",
+        .pr_bc2pi = "pr2pi",
+    });
+    pub const cumulative_keys = &[_]CollumFamily{
+        .bpi2ci,
+        .pi2p,
+        .b_pi2bpi,
+        .ci2c,
+    };
 };
-pub const cf_names: std.enums.EnumArray(CollumFamily, [*:0]const u8) = .init(.{
-    // XXX: 将来考虑默认列族改为存放元数据，专设bpi2ci列族。
-    // 当前考虑到复用已有分析数据的兼容性，仍然设计为bpi2ci使用default列族。
-    .bpi2ci = "default",
-    .pi2p = "pi2p",
-    .b_pi2bpi = "b_pi2bpi",
-    .ci2c = "ci2c",
-    .pr_bc2pi = "pr2pi",
-});
 
 // 在读取rocksdb时，应用全局遍历的配置。
 // 如果读取的rocksdb的列族的键是固定长度的（有确定类型的），且没有配置其他比较器，则可以使用此函数配置读取选项。

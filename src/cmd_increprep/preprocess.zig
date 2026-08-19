@@ -96,154 +96,172 @@ pub const DiagnosticPiFromPrBc2PiNotFoundInPi2P = struct {
     }
 };
 
-pub const PathRegistry = struct {
-    pub const Map = std.StringArrayHashMapUnmanaged(struct {
-        // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
-        index: PathSeq,
-        blob_cnt: BlobCountNative,
-    });
-    map: Map,
-    // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
-    // 注意`key_arena`不负责`StringArrayHashMapUnmanaged`，因为这是一个动态增长结构体，不适合arena。
-    key_arena: StArena,
-    pub fn deinit(self: *PathRegistry, allocator: std.mem.Allocator) void {
-        self.map.deinit(allocator);
-        self.key_arena.deinit();
-        self.* = undefined;
-    }
-    pub fn loadForIncremental(
-        self: *PathRegistry,
-        storage_handles: storage.Handles,
-        allocaotr: std.mem.Allocator,
-        last_diag: *diag.Diagnostic,
-    ) !void {
-        const it = it: {
-            const roptions = blk: {
-                const roptions = c.rocksdb_readoptions_create().?;
-                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathRankBlobCountKey);
-                break :blk roptions;
-            };
-            defer c.rocksdb_readoptions_destroy(roptions);
-            break :it c.rocksdb_create_iterator_cf(storage_handles.db, roptions, storage_handles.cfs.get(.pr_bc2pi));
-        };
-        defer c.rocksdb_iter_destroy(it);
-        c.rocksdb_iter_seek_to_first(it);
-        const pi2p_roptions = blk: {
-            const roptions = c.rocksdb_readoptions_create();
-            // 每个键只会被`get`一次，不用缓存避免污染。
-            c.rocksdb_readoptions_set_fill_cache(roptions, 0);
-            break :blk roptions.?;
-        };
-        defer c.rocksdb_readoptions_destroy(pi2p_roptions);
-        while (c.rocksdb_iter_valid(it) != 0) {
-            const pr_bc: PathRankBlobCountKey = blk: {
-                var c_len: usize = undefined;
-                const c_ptr = c.rocksdb_iter_key(it, &c_len);
-                break :blk std.mem.bytesToValue(PathRankBlobCountKey, c_ptr[0..c_len]);
-            };
-            const blob_cnt: BlobCountNative = pr_bc.blob_count.toNative();
-            const pi: PathSeq = blk: {
-                var c_len: usize = undefined;
-                const c_ptr = c.rocksdb_iter_value(it, &c_len);
-                break :blk std.mem.bytesToValue(PathSeq, c_ptr[0..c_len]);
-            };
-            const path: []const u8 = path: {
-                var c_len: usize = undefined;
-                var err_cstr: ?[*:0]u8 = null;
-                const c_ptr = c.rocksdb_get_cf(
-                    storage_handles.db,
-                    pi2p_roptions,
-                    storage_handles.cfs.get(.pi2p),
-                    @ptrCast(&pi),
-                    @sizeOf(PathSeq),
-                    &c_len,
-                    @ptrCast(&err_cstr),
-                );
-                try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
-                if (c_ptr == null) {
-                    last_diag.* = .{
-                        .PiFromPrBc2PiNotFoundInPi2P = .init(pr_bc, pi),
-                    };
-                    return LoadRegistryForIncrementalError.PiFromPrBc2PiNotFoundInPi2P;
-                }
-                defer c.rocksdb_free(c_ptr);
-                break :path try self.key_arena.allocator().dupeZ(u8, c_ptr[0..c_len]);
-            };
-            try self.map.put(allocaotr, path, .{ .index = pi, .blob_cnt = blob_cnt });
-            // 如果出错也没有回退状态的价值，不再进行errdefer。
-            c.rocksdb_iter_next(it);
+// PathRegistry和BlobPathRegistry的put时机都与写入过程相关。
+// 目前尚未确定是使用单独的写线程，还是写线程与主线程相同。
+// 若有单独写线程，则WriterBoundRegistries也是跨线程结构，写线程使用完毕后，主线程需要使用`path_registry`以写入`pi_bc2p`列族。
+// 因此，对它们使用共同的专有`gpa_instance`实例，这样该分配器实例即使非线程安全也保持可用。
+// 注意：`path_registry`与`blob_path_registry`的生命周期可能不完全相同，例如`path_registry`在主写过程结束后仍然需要使用，
+// 而`blob_path_registry`在主写入过程结束后就不再需要使用。
+pub const writer_bound_registries = struct {
+    // 因为key_arena不是一个可平凡移动的结构，因此PathRegistry也并非可平凡移动的。当前的用例没有移动需求，因此尚可接受。
+    pub const PathRegistry = struct {
+        pub const Map = std.StringArrayHashMapUnmanaged(struct {
+            // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
+            index: PathSeq,
+            blob_cnt: BlobCountNative,
+        });
+        map: Map,
+        // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
+        // 注意`key_arena`不负责`StringArrayHashMapUnmanaged`，因为这是一个动态增长结构体，不适合arena。
+        key_arena: StArena,
+        pub fn deinit(self: *PathRegistry, allocator: std.mem.Allocator) void {
+            self.map.deinit(allocator);
+            self.key_arena.deinit();
+            self.* = undefined;
         }
-    }
-};
-pub const BlobPathRegistry = struct {
-    map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq),
-    pub fn loadForIncremental(
-        self: *BlobPathRegistry,
-        storage_handles: storage.Handles,
-        allocaotr: std.mem.Allocator,
-    ) !void {
-        const it = it: {
-            const roptions = blk: {
-                const roptions = c.rocksdb_readoptions_create().?;
-                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, BlobPathKey);
-                break :blk roptions;
+        pub fn loadForIncremental(
+            self: *PathRegistry,
+            db: *c.rocksdb_t,
+            cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+                .pr_bc2pi,
+                .pi2p,
+            }),
+            allocaotr: std.mem.Allocator,
+            last_diag: *diag.Diagnostic,
+        ) !void {
+            const it = it: {
+                const roptions = blk: {
+                    const roptions = c.rocksdb_readoptions_create().?;
+                    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathRankBlobCountKey);
+                    break :blk roptions;
+                };
+                defer c.rocksdb_readoptions_destroy(roptions);
+                break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.pr_bc2pi));
             };
-            defer c.rocksdb_readoptions_destroy(roptions);
-            break :it c.rocksdb_create_iterator_cf(storage_handles.db, roptions, storage_handles.cfs.get(.b_pi2bpi));
-        };
-        defer c.rocksdb_iter_destroy(it);
-        c.rocksdb_iter_seek_to_first(it);
-        while (c.rocksdb_iter_valid(it) != 0) {
-            const b_pi: BlobPathKey = blk: {
-                var c_len: usize = undefined;
-                const c_ptr = c.rocksdb_iter_key(it, &c_len);
-                break :blk std.mem.bytesToValue(BlobPathKey, c_ptr[0..c_len]);
+            defer c.rocksdb_iter_destroy(it);
+            c.rocksdb_iter_seek_to_first(it);
+            const pi2p_roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create();
+                // 每个键只会被`get`一次，不用缓存避免污染。
+                c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+                break :blk roptions.?;
             };
-            const bpi: BlobPathSeq = blk: {
-                var c_len: usize = undefined;
-                const c_ptr = c.rocksdb_iter_value(it, &c_len);
-                break :blk std.mem.bytesToValue(BlobPathSeq, c_ptr[0..c_len]);
-            };
-            try self.map.put(allocaotr, b_pi, bpi);
-            // 如果出错也没有回退状态的价值，不再进行errdefer。
-            c.rocksdb_iter_next(it);
+            defer c.rocksdb_readoptions_destroy(pi2p_roptions);
+            while (c.rocksdb_iter_valid(it) != 0) {
+                const pr_bc: PathRankBlobCountKey = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                    break :blk std.mem.bytesToValue(PathRankBlobCountKey, c_ptr[0..c_len]);
+                };
+                const blob_cnt: BlobCountNative = pr_bc.blob_count.toNative();
+                const pi: PathSeq = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                    break :blk std.mem.bytesToValue(PathSeq, c_ptr[0..c_len]);
+                };
+                const path: []const u8 = path: {
+                    var c_len: usize = undefined;
+                    var err_cstr: ?[*:0]u8 = null;
+                    const c_ptr = c.rocksdb_get_cf(
+                        db,
+                        pi2p_roptions,
+                        cfs.get(.pi2p),
+                        @ptrCast(&pi),
+                        @sizeOf(PathSeq),
+                        &c_len,
+                        @ptrCast(&err_cstr),
+                    );
+                    try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                    if (c_ptr == null) {
+                        last_diag.* = .{
+                            .PiFromPrBc2PiNotFoundInPi2P = .init(pr_bc, pi),
+                        };
+                        return LoadRegistryForIncrementalError.PiFromPrBc2PiNotFoundInPi2P;
+                    }
+                    defer c.rocksdb_free(c_ptr);
+                    break :path try self.key_arena.allocator().dupeZ(u8, c_ptr[0..c_len]);
+                };
+                try self.map.put(allocaotr, path, .{ .index = pi, .blob_cnt = blob_cnt });
+                // 如果出错也没有回退状态的价值，不再进行errdefer。
+                c.rocksdb_iter_next(it);
+            }
         }
-    }
+    };
+    pub const BlobPathRegistry = struct {
+        map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq),
+        pub fn loadForIncremental(
+            self: *BlobPathRegistry,
+            db: *c.rocksdb_t,
+            cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+                .b_pi2bpi,
+            }),
+            allocator: std.mem.Allocator,
+        ) !void {
+            const it = it: {
+                const roptions = blk: {
+                    const roptions = c.rocksdb_readoptions_create().?;
+                    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, BlobPathKey);
+                    break :blk roptions;
+                };
+                defer c.rocksdb_readoptions_destroy(roptions);
+                break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.b_pi2bpi));
+            };
+            defer c.rocksdb_iter_destroy(it);
+            c.rocksdb_iter_seek_to_first(it);
+            while (c.rocksdb_iter_valid(it) != 0) {
+                const b_pi: BlobPathKey = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                    break :blk std.mem.bytesToValue(BlobPathKey, c_ptr[0..c_len]);
+                };
+                const bpi: BlobPathSeq = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                    break :blk std.mem.bytesToValue(BlobPathSeq, c_ptr[0..c_len]);
+                };
+                try self.map.put(allocator, b_pi, bpi);
+                // 如果出错也没有回退状态的价值，不再进行errdefer。
+                c.rocksdb_iter_next(it);
+            }
+        }
+    };
+    pub const ManagedGpaInstance = struct {
+        instance: vcaligner.gpa.Owned.Instance,
+        pub fn allocator(self: *ManagedGpaInstance) std.mem.Allocator {
+            return self.instance.gpao().allocator;
+        }
+        pub fn handle(self: *ManagedGpaInstance, path_registry: *PathRegistry, blob_path_registry: *BlobPathRegistry) Handle {
+            return .{ .allocator = self.instance.gpao().allocator, .path_registry = path_registry, .blob_path_registry = blob_path_registry };
+        }
+    };
+    pub const Handle = struct {
+        path_registry: *PathRegistry,
+        blob_path_registry: *BlobPathRegistry,
+        allocator: std.mem.Allocator,
+    };
 };
 
-pub const WriterBoundRegistriesWithSelfManagedGpa = struct {
-    // PathRegistry和BlobPathRegistry的put时机都与写入过程相关，所以放在一起。
-    // 目前尚未确定是使用单独的写线程，还是写线程与主线程相同。
-    // 若有单独写线程，则WriterBoundRegistries也是跨线程结构，写线程使用完毕后，主线程需要使用`path_registry`以写入`pi_bc2p`列族。
-    // 因此，对它们使用共同的专有`gpa_instance`实例，这样该分配器实例即使非线程安全也保持可用。
-    // 注意：`path_registry`与`blob_path_registry`的生命周期可能不完全相同，例如`path_registry`在主写过程结束后仍然需要使用，
-    // 而`blob_path_registry`在主写入过程结束后就不再需要使用。
-    gpa_instance: vcaligner.gpa.Owned.Instance,
-    path_registry: PathRegistry,
-    blob_path_registry: BlobPathRegistry,
-    pub fn allocator(self: *WriterBoundRegistriesWithSelfManagedGpa) std.mem.Allocator {
-        return self.gpa_instance.gpao().allocator;
-    }
-};
-
-pub const CommitRegistryWithSelfManagedGpa = struct {
+pub const CommitRegistryWithManagedGpaInstance = struct {
     map: std.AutoHashMapUnmanaged(c.git_oid, void),
     // `CommitRegistry`存在跨线程需求。
     // 增量模式下，需要在主解析线程启动前put它，并在主解析线程中继续put。
     // 因此这要求跨线程地保存其分配器。此处的实现采用了专有分配器实例，这样可以规避线程安全的要求。
     // 专有分配器实例也可以通过一个线程安全的全局分配器实现来模拟此处的专有分配器实例需求。
     gpa_instance: vcaligner.gpa.Owned.Instance,
-    pub fn deinit(self: *CommitRegistryWithSelfManagedGpa) void {
+    pub fn deinit(self: *CommitRegistryWithManagedGpaInstance) void {
         self.map.deinit(self.gpa_instance.gpao().allocator);
         self.gpa_instance.deinit();
         self.* = undefined;
     }
-    pub fn allocator(self: *CommitRegistryWithSelfManagedGpa) std.mem.Allocator {
+    pub fn allocator(self: *CommitRegistryWithManagedGpaInstance) std.mem.Allocator {
         return self.gpa_instance.gpao().allocator;
     }
     pub fn loadForIncremental(
-        self: *CommitRegistryWithSelfManagedGpa,
-        rocksdb: storage.Handles,
+        self: *CommitRegistryWithManagedGpaInstance,
+        db: *c.rocksdb_t,
+        cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+            .ci2c,
+        }),
     ) !void {
         const it = it: {
             const roptions = blk: {
@@ -252,7 +270,7 @@ pub const CommitRegistryWithSelfManagedGpa = struct {
                 break :blk roptions;
             };
             defer c.rocksdb_readoptions_destroy(roptions);
-            break :it c.rocksdb_create_iterator_cf(rocksdb.db, roptions, rocksdb.cfs.get(.ci2c));
+            break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.ci2c));
         };
         defer c.rocksdb_iter_destroy(it);
         c.rocksdb_iter_seek_to_first(it);
@@ -357,63 +375,75 @@ pub const RecoveryPathConf = union(enum) {
 pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
     // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
-    var commit_registry: CommitRegistryWithSelfManagedGpa = .{ .map = .empty, .gpa_instance = .init() };
-    // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
-    // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
-    defer commit_registry.deinit();
-    const queue: Queue = try .init(gpa.allocator, runconf.parsed_queue_capacity_log2);
-    // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
-    defer queue.deinit(gpa.allocator);
-    // TODO: channel的生存期未来考虑精细设计。
-    var channel: Channel = .{ .mpsc_queue_ref = queue };
-    // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
-    // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-    const main_parser: std.Thread, const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = libgit2_handoff: {
-        var git_error_code = c.git_libgit2_init();
-        if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-        std.debug.assert(git_error_code == 1);
-        // 下面的写法模拟对libgit2资源本身的`errdefer`。由于libgit2的销毁本身可能报错，且`errdefer`本身将移除捕获`err`的能力。
-        // 因此，当前的`errdefer`对于这种本身可能报错的逻辑无法收集所有信息得到最优控制流。
-        // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
-        // NOTE: 此处的主要逻辑只能放到函数里，不可以展开，[原因](https://ziggit.dev/t/idiom-for-an-old-school-try-catch-block/3821/6)。
-        break :libgit2_handoff provisionMainParser(
-            runconf,
-            &commit_registry,
-            &channel,
-            gpa,
-            last_diag,
-        ) catch |err| {
-            git_error_code = c.git_libgit2_shutdown();
-            if (git_error_code < 0) {
-                try last_diag.enterStack(err);
-                try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-                unreachable;
-            }
-            std.debug.assert(git_error_code == 0);
-            return err;
+    var wbr_gpa_instance: writer_bound_registries.ManagedGpaInstance = .{ .instance = .init() };
+    defer wbr_gpa_instance.instance.deinit();
+    var path_registry: writer_bound_registries.PathRegistry = .{ .map = .empty, .key_arena = .init(wbr_gpa_instance.allocator()) };
+    defer path_registry.deinit(wbr_gpa_instance.allocator());
+    const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = writer_and_parser: {
+        var commit_registry: CommitRegistryWithManagedGpaInstance = .{ .map = .empty, .gpa_instance = .init() };
+        // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
+        // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
+        defer commit_registry.deinit();
+        const queue: Queue = try .init(gpa.allocator, runconf.parsed_queue_capacity_log2);
+        defer queue.deinit(gpa.allocator);
+        var channel: Channel = .{ .mpsc_queue_ref = queue };
+        // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
+        // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
+        const main_parser: std.Thread, const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = libgit2_handoff: {
+            var git_error_code = c.git_libgit2_init();
+            if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+            std.debug.assert(git_error_code == 1);
+            // 下面的写法模拟对libgit2资源本身的`errdefer`。由于libgit2的销毁本身可能报错，且`errdefer`本身将移除捕获`err`的能力。
+            // 因此，当前的`errdefer`对于这种本身可能报错的逻辑无法收集所有信息得到最优控制流。
+            // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
+            // NOTE: 此处的主要逻辑只能放到函数里，不可以展开，[原因](https://ziggit.dev/t/idiom-for-an-old-school-try-catch-block/3821/6)。
+            break :libgit2_handoff provisionMainParser(
+                runconf,
+                &commit_registry,
+                &channel,
+                gpa,
+                last_diag,
+            ) catch |err| {
+                git_error_code = c.git_libgit2_shutdown();
+                if (git_error_code < 0) {
+                    try last_diag.enterStack(err);
+                    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+                    unreachable;
+                }
+                std.debug.assert(git_error_code == 0);
+                return err;
+            };
+        };
+        defer rocksdb_output.deinit(gpa.allocator);
+        errdefer {
+            storage_state.deinit();
+            recovery_path_conf.deinit(gpa.allocator);
+        }
+        // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
+        // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
+        // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
+        // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
+        defer main_parser.join();
+        var blob_path_registry: writer_bound_registries.BlobPathRegistry = .{ .map = .empty };
+        defer blob_path_registry.map.deinit(wbr_gpa_instance.allocator());
+        const wbr: writer_bound_registries.Handle = .{
+            .path_registry = &path_registry,
+            .blob_path_registry = &blob_path_registry,
+            .allocator = wbr_gpa_instance.allocator(),
+        };
+        try wbr.path_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs }, wbr.allocator, last_diag);
+        try wbr.blob_path_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs }, wbr.allocator);
+        try @import("write.zig").writeCumulative(.fromFullStorage(&storage_state.valid), &channel, wbr, runconf.writebatch_watermark, last_diag);
+        break :writer_and_parser .{
+            recovery_path_conf,
+            storage_state,
         };
     };
-    defer rocksdb_output.deinit(gpa.allocator);
-    defer recovery_path_conf.deinit(gpa.allocator);
-    defer storage_state.deinit();
-    // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
-    // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
-    // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
-    // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
-    defer main_parser.join();
-    var writer_bound_registries: WriterBoundRegistriesWithSelfManagedGpa = .{
-        .gpa_instance = .init(),
-        .path_registry = undefined,
-        .blob_path_registry = undefined,
-    };
-    defer writer_bound_registries.gpa_instance.deinit();
-    writer_bound_registries.path_registry = .{ .map = .empty, .key_arena = .init(writer_bound_registries.allocator()) };
-    defer writer_bound_registries.path_registry.deinit(writer_bound_registries.allocator());
-    try writer_bound_registries.path_registry.loadForIncremental(storage_state.valid, writer_bound_registries.allocator(), last_diag);
-    writer_bound_registries.blob_path_registry = .{ .map = .empty };
-    defer writer_bound_registries.blob_path_registry.map.deinit(writer_bound_registries.allocator());
-    try writer_bound_registries.blob_path_registry.loadForIncremental(storage_state.valid, writer_bound_registries.allocator());
-
+    defer {
+        storage_state.deinit();
+        recovery_path_conf.deinit(gpa.allocator);
+    }
+    // TODO: 延迟compaction模式下的compaction，以及pr_bc2pi列族的写入。
     // 成功退出前，移除recovery。
     switch (recovery_path_conf) {
         .disabled => {},
@@ -423,7 +453,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
 
 fn provisionMainParser(
     noalias runconf: *const PrepRunner,
-    commit_registry: *CommitRegistryWithSelfManagedGpa,
+    commit_registry: *CommitRegistryWithManagedGpaInstance,
     channel: *Channel,
     gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
@@ -457,7 +487,7 @@ fn provisionMainParser(
     );
     errdefer storage_state.deinit();
     if (runconf.mode_conf == .incremental) {
-        try commit_registry.loadForIncremental(storage_state.valid);
+        try commit_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs });
     }
     const main_parser = try std.Thread.spawn(.{ .allocator = gpa.allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
         repo,

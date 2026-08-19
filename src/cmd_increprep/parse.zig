@@ -5,7 +5,7 @@ const diag = vcaligner.diag;
 const StArena = vcaligner.StArena;
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
-const CommitRegistry = @import("preprocess.zig").CommitRegistryWithSelfManagedGpa;
+const CommitRegistry = @import("preprocess.zig").CommitRegistryWithManagedGpaInstance;
 const Parsed = @import("preprocess.zig").Parsed;
 const CommitMeta = @import("preprocess.zig").CommitMeta;
 const MsgToWriter = @import("preprocess.zig").MsgToWriter;
@@ -301,7 +301,7 @@ pub fn mainParseTakeRepo(
     try c_helper.gitErrorCodeToZigError(git_error_code_or_customized_error_code, last_diag);
     switch (ctx.commit_meta_batch_to_flush) {
         .inited => |*to_flush| {
-            flush_commit_meta_batch(to_flush, channel, &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local);
+            flushCommitMetaBatch(to_flush, channel, &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local);
             ctx.commit_meta_batch_to_flush = .uninited;
         },
         .uninited => {},
@@ -372,7 +372,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
                 .commit_seq = commit_seq,
             });
             if (to_flush.inited.batch.items.len == to_flush.inited.batch.capacity) {
-                flush_commit_meta_batch(
+                flushCommitMetaBatch(
                     &to_flush.inited,
                     ctx.channel,
                     &ctx.parsers_ctx.heap_ptr.main_parser_block.station.producer_local,
@@ -409,7 +409,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
     return customized_error_enum.toBackingInt();
 }
 
-fn flush_commit_meta_batch(to_flush: *CommitMeta.Batch, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
+fn flushCommitMetaBatch(to_flush: *CommitMeta.Batch, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
     const ticket, const to_produce: *MsgToWriter = channel.claimProduce(producer_local, null);
     defer channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。
@@ -451,10 +451,10 @@ pub fn subParseTask(
             break :blk tree.?;
         };
         defer c.git_tree_free(tree);
-        parse_tree(tree, repo, lctx, &@as([0]u8, .{}), commit_seq, channel) catch |err| break :main_logic err;
+        parseTree(tree, repo, lctx, &@as([0]u8, .{}), commit_seq, channel) catch |err| break :main_logic err;
         switch (lctx.to_flush) {
             .inited => |*parsed| {
-                flush_relation_batch(parsed, channel, &lctx.producer_local);
+                flushRelationBatch(parsed, channel, &lctx.producer_local);
                 lctx.to_flush = .uninited;
             },
             .uninited => {},
@@ -468,7 +468,7 @@ pub fn subParseTask(
     };
 }
 
-fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStation, base_path: []const u8, commit_seq: vcaligner.rocksdb_custom.CommitSeq, channel: *Channel) !void {
+fn parseTree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStation, base_path: []const u8, commit_seq: vcaligner.rocksdb_custom.CommitSeq, channel: *Channel) !void {
     const entry_count = c.git_tree_entrycount(tree);
     for (0..entry_count) |i| {
         const entry = c.git_tree_entry_byindex(tree, i).?;
@@ -492,7 +492,7 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
                     break :blk try std.fmt.allocPrintSentinel(lctx.current_task_scratch_arena.allocator(), "{s}/{s}", .{ base_path, entry_name_slice }, 0);
                 };
                 defer lctx.current_task_scratch_arena.allocator().free(child_path);
-                try parse_tree(subtree, repo, lctx, child_path, commit_seq, channel);
+                try parseTree(subtree, repo, lctx, child_path, commit_seq, channel);
             },
             c.GIT_OBJECT_BLOB => {
                 append_relation: {
@@ -537,7 +537,7 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
                     break :append_relation;
                 }
                 if (lctx.to_flush.inited.pairs.items.len == lctx.to_flush.inited.pairs.capacity) {
-                    flush_relation_batch(&lctx.to_flush.inited, channel, &lctx.producer_local);
+                    flushRelationBatch(&lctx.to_flush.inited, channel, &lctx.producer_local);
                     lctx.to_flush = .uninited;
                 }
             },
@@ -546,7 +546,7 @@ fn parse_tree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserSta
     }
 }
 
-fn flush_relation_batch(to_flush: *Parsed, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
+fn flushRelationBatch(to_flush: *Parsed, channel: *Channel, producer_local: *Queue.ProducerLocal) void {
     const ticket, const to_produce: *MsgToWriter = channel.claimProduce(producer_local, null);
     defer channel.publishProducedUnsafe(ticket);
     // ArenaAllocator和ArrayList经过源码验证，直接拷贝均安全。

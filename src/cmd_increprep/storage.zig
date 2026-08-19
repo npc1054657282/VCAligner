@@ -85,11 +85,10 @@ pub const State = union(enum) {
         const compact_options = c.rocksdb_compactoptions_create();
         defer c.rocksdb_compactoptions_destroy(compact_options);
         // 遍历所有的累积写入的列族进行压缩
-        const cumulative_storage: Handles.Cumulative = .fromFullStorage(&self.valid);
-        for (cumulative_storage.cfs.values) |cf_handle| {
+        for (std.enums.values(vcaligner.rocksdb_custom.CollumFamily.cumulative_keys)) |cf_key| {
             c.rocksdb_compact_range_cf_opt(
                 self.valid.db,
-                cf_handle,
+                self.valid.cfs.get(cf_key),
                 compact_options,
                 // null 代表从头开始
                 null,
@@ -130,7 +129,7 @@ pub const State = union(enum) {
         const new_cf_handle = c.rocksdb_create_column_family(
             self.valid.db,
             cf_options,
-            vcaligner.rocksdb_custom.cf_names.get(.pr_bc2pi),
+            vcaligner.rocksdb_custom.CollumFamily.names.get(.pr_bc2pi),
             @ptrCast(&err_cstr),
         );
         try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
@@ -142,7 +141,7 @@ pub const State = union(enum) {
 
 pub const Handles = struct {
     db: *c.rocksdb_t,
-    cfs: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_column_family_handle_t),
+    cfs: vcaligner.rocksdb_custom.CollumFamily.Handles,
     fn initForWrite(
         self: *Handles,
         mode: @import("PrepRunner.zig").Mode,
@@ -234,8 +233,8 @@ pub const Handles = struct {
             const db = c.rocksdb_open_column_families(
                 db_options,
                 rocksdb_path,
-                vcaligner.rocksdb_custom.cf_names.values.len,
-                @ptrCast(&vcaligner.rocksdb_custom.cf_names.values),
+                vcaligner.rocksdb_custom.CollumFamily.names.values.len,
+                @ptrCast(&vcaligner.rocksdb_custom.CollumFamily.names.values),
                 &all_cf_options.values,
                 &self.cfs.values,
                 @ptrCast(&err_cstr),
@@ -301,8 +300,8 @@ pub const Handles = struct {
             const new_db = c.rocksdb_open_column_families(
                 db_options,
                 rocksdb_path,
-                vcaligner.rocksdb_custom.cf_names.values.len,
-                @ptrCast(vcaligner.rocksdb_custom.cf_names.values),
+                vcaligner.rocksdb_custom.CollumFamily.names.values.len,
+                @ptrCast(vcaligner.rocksdb_custom.CollumFamily.names.values),
                 &all_cf_options.values,
                 &self.cfs,
                 @ptrCast(&err_cstr),
@@ -320,15 +319,15 @@ pub const Handles = struct {
         self.* = undefined;
     }
 
+    // 在`writeCumulative`中被使用的Cumulative没法复用自制的EnumArray的sub view抽象。
+    // 主要是因为`rocksdb_flush_cfs`中对于绝对稠密的数组的需求，因而此处必须是重新构造的数组，而不能是完整array的视图。
     pub const Cumulative = struct {
         db: *c.rocksdb_t,
-        cfs: std.enums.EnumArray(enum(std.meta.Tag(vcaligner.rocksdb_custom.CollumFamily)) {
-            bpi2ci = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.bpi2ci),
-            pi2p = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.pi2p),
-            b_pi2bpi = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.b_pi2bpi),
-            ci2c = @intFromEnum(vcaligner.rocksdb_custom.CollumFamily.ci2c),
-        }, ?*c.rocksdb_column_family_handle_t),
-        pub fn fromFullStorage(storage: *Handles) Cumulative {
+        cfs: std.enums.EnumArray(vcaligner.sub_enum.SubEnum(
+            vcaligner.rocksdb_custom.CollumFamily,
+            vcaligner.rocksdb_custom.CollumFamily.cumulative_keys,
+        ), ?*c.rocksdb_column_family_handle_t),
+        pub fn fromFullStorage(noalias storage: *const Handles) Cumulative {
             return .{ .db = storage.db, .cfs = .init(.{
                 .bpi2ci = storage.cfs.get(.bpi2ci),
                 .pi2p = storage.cfs.get(.pi2p),
