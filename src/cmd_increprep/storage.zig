@@ -69,7 +69,7 @@ pub const State = union(enum) {
         }
     }
     // 假定`self`是`valid`的情境下允许调用。仅用于全量写入后的延迟全量compaction。
-    pub fn reopenAndWaitForFullCompaction(
+    pub fn reopenAndFullCompaction(
         self: *State,
         n_rocksdbjobs: c_int,
         compression: bool,
@@ -85,7 +85,7 @@ pub const State = union(enum) {
         const compact_options = c.rocksdb_compactoptions_create();
         defer c.rocksdb_compactoptions_destroy(compact_options);
         // 遍历所有的累积写入的列族进行压缩
-        for (std.enums.values(vcaligner.rocksdb_custom.CollumFamily.cumulative_keys)) |cf_key| {
+        for (vcaligner.rocksdb_custom.CollumFamily.cumulative_keys) |cf_key| {
             c.rocksdb_compact_range_cf_opt(
                 self.valid.db,
                 self.valid.cfs.get(cf_key),
@@ -268,7 +268,7 @@ pub const Handles = struct {
             break :blk cf_options;
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
-        var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*const c.rocksdb_options_t) = .init(.{
+        var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_options_t) = .init(.{
             .bpi2ci = undefined,
             .pi2p = normal_cf_options,
             .b_pi2bpi = undefined,
@@ -301,9 +301,9 @@ pub const Handles = struct {
                 db_options,
                 rocksdb_path,
                 vcaligner.rocksdb_custom.CollumFamily.names.values.len,
-                @ptrCast(vcaligner.rocksdb_custom.CollumFamily.names.values),
+                @ptrCast(&vcaligner.rocksdb_custom.CollumFamily.names.values),
                 &all_cf_options.values,
-                &self.cfs,
+                &self.cfs.values,
                 @ptrCast(&err_cstr),
             );
             try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);

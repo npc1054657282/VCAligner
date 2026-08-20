@@ -379,7 +379,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     defer wbr_gpa_instance.instance.deinit();
     var path_registry: writer_bound_registries.PathRegistry = .{ .map = .empty, .key_arena = .init(wbr_gpa_instance.allocator()) };
     defer path_registry.deinit(wbr_gpa_instance.allocator());
-    const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = writer_and_parser: {
+    const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = writer_and_parser: {
         var commit_registry: CommitRegistryWithManagedGpaInstance = .{ .map = .empty, .gpa_instance = .init() };
         // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
         // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
@@ -414,10 +414,10 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
                 return err;
             };
         };
-        defer rocksdb_output.deinit(gpa.allocator);
         errdefer {
             storage_state.deinit();
             recovery_path_conf.deinit(gpa.allocator);
+            rocksdb_output.deinit(gpa.allocator);
         }
         // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
         // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
@@ -435,6 +435,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         try wbr.blob_path_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs }, wbr.allocator);
         try @import("write.zig").writeCumulative(.fromFullStorage(&storage_state.valid), &channel, wbr, runconf.writebatch_watermark, last_diag);
         break :writer_and_parser .{
+            rocksdb_output,
             recovery_path_conf,
             storage_state,
         };
@@ -442,8 +443,39 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     defer {
         storage_state.deinit();
         recovery_path_conf.deinit(gpa.allocator);
+        rocksdb_output.deinit(gpa.allocator);
     }
-    // TODO: 延迟compaction模式下的compaction，以及pr_bc2pi列族的写入。
+    // 延迟compaction模式下的compaction.
+    switch (runconf.mode_conf.compactionStrategy()) {
+        .manual_delayed => {
+            try storage_state.reopenAndFullCompaction(runconf.n_rocksdbjobs, runconf.compression, rocksdb_output.get(), last_diag);
+        },
+        else => {},
+    }
+    // pr_bc2pi列族的写入。
+    // 确定临时的sst文件路径
+    write_pr_bc2pi: {
+        const tmp_sst_file_path = blk: {
+            var sst_file_name_writer: std.Io.Writer.Allocating = .init(gpa.allocator);
+            try sst_file_name_writer.writer.print("{s}/{d}-{d}-pr_bc2pi-sst", .{
+                std.fs.path.dirname(rocksdb_output.get()) orelse ".",
+                runconf.proc_stamp.pid,
+                runconf.proc_stamp.ts,
+            });
+            break :blk try sst_file_name_writer.toOwnedSliceSentinel(0);
+        };
+        defer gpa.allocator.free(tmp_sst_file_path);
+        try @import("write.zig").writePrBc2Pi(
+            storage_state.valid.db,
+            .fromHandles(&storage_state.valid.cfs),
+            &path_registry.map,
+            tmp_sst_file_path,
+            runconf.compression,
+            last_diag,
+        );
+        break :write_pr_bc2pi;
+    }
+
     // 成功退出前，移除recovery。
     switch (recovery_path_conf) {
         .disabled => {},
@@ -458,7 +490,6 @@ fn provisionMainParser(
     gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
 ) !struct { std.Thread, RocksdbPath, RecoveryPathConf, storage.State } {
-    const compaction_strategy: PrepRunner.CompactionStrategy = runconf.mode_conf.compactionStrategy();
     const repo: *c.git_repository = blk: {
         var repo: ?*c.git_repository = undefined;
         const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
@@ -478,7 +509,7 @@ fn provisionMainParser(
     try storage_state.init(
         runconf.mode_conf,
         runconf.n_rocksdbjobs,
-        compaction_strategy,
+        runconf.mode_conf.compactionStrategy(),
         runconf.compression,
         runconf.cf_max_write_buffer_number,
         rocksdb_output.get(),
