@@ -41,6 +41,8 @@ pub fn writeCumulative(
                             // 虽然文档让我们不要修改键，但我想我知道我们现在在做什么。
                             path_get_or_put_result.key_ptr.* = try registries.path_registry.key_arena.allocator().dupe(u8, pair.path);
                             path_get_or_put_result.value_ptr.* = .{
+                                // NOTE: 此处使用`@intCast`是绝对安全的行为，`path_get_or_put_result`看似内部的`index`是`usize`类型，
+                                // 但是标准库的`ArrayHashMap`的索引内部实际限制了上界绝不可能超过32bit，因此此处是绝对安全的。
                                 .index = .fromNative(@intCast(path_get_or_put_result.index)),
                                 .blob_cnt = 0, // 接下来很快会因为`blob_path_registry不命中而增加至1。
                             };
@@ -174,7 +176,7 @@ pub fn writePrBc2Pi(
         var iter = path_registry.iterator();
         var path_rank: vcaligner.rocksdb_custom.PathRank = undefined;
         while (do: {
-            path_rank = .fromNative(@intCast(iter.index));
+            path_rank = .fromNative(iter.index);
             break :do iter.next();
         }) |entry| {
             // sstfilewriter每次put以后，key和value的生存期即可结束，不需要长期维持生存期
