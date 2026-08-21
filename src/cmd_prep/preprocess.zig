@@ -1,187 +1,535 @@
 const std = @import("std");
+const PrepRunner = @import("PrepRunner.zig");
 const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
-const PrepRunner = @import("PrepRunner.zig");
 const diag = vcaligner.diag;
-const Pool = vcaligner.Pool;
+const StArena = vcaligner.StArena;
+const PathSeq = vcaligner.rocksdb_custom.PathSeq;
+const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
+const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
+const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
+const PathRankBlobCountKey = vcaligner.rocksdb_custom.PathRankBlobCountKey;
+const BlobCountNative = vcaligner.rocksdb_custom.BlobCountNative;
+const storage = @import("storage.zig");
 
-pub fn preprocess(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    ctx.writer = .{
-        // 记录路径与序号的ArrayHashMap。各键值的过程由写线程全权负责。后续的写后读、排序等内容由主线程负责。
-        .path_registry = .{ .arena = .init(vcaligner.getAllocator()) },
-        .blob_path_registry = .{ .arena = .init(vcaligner.getAllocator()) },
+// XXX: 当前，一个`Parsed`允许包含一个commit及其对应的多个blob-path。
+// 注意，这并不代表它包含一个commit及其对应的所有blob-path。
+// 因为一个commit如果对应的blob-path过多，它可能被切割为多个`Parsed`。
+// 未来可能考虑如果一个commit包含的blob-path过少，则一个`Parsed`可以承载多个commit。
+// 这可能要求此结构变得复杂一些，一个`Parsed`需要跨任务完成。
+// 目前的考虑是，`Parsed`任务批量发送主要出于减少任务碰撞，大多数情况下一个commit承载的blob-path对数量解析数量足够防止碰撞。
+// 相较于写入的io成本，这里的`Parsed`均衡的效果可能微不足道，暂不为此增加复杂度。
+pub const Parsed = struct {
+    // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
+    // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
+    // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
+    gpa_instance: vcaligner.gpa.Owned.Instance,
+    arena_state: StArena.State,
+    commit_seq: CommitSeq,
+    // NOTE: `parsed_unints`的大小是预先分配好的，由flush阈值决定，并非动态增长
+    // 因此它同样基于本结构内的`arena`分配。
+    pairs: std.ArrayList(BlobPathPair),
+    pub const BlobPathPair = struct {
+        blob_hash: c.git_oid,
+        // `path`的所有权属于`Parsed`内的`arena`。
+        path: []u8,
+    };
+    pub fn deinit(self: *Parsed) void {
+        self.arena_state.promote(self.gpa_instance.gpao().allocator).deinit();
+        self.gpa_instance.deinit();
+    }
+};
+pub const CommitMeta = struct {
+    commit_hash: c.git_oid,
+    commit_seq: CommitSeq,
+    pub const Batch = struct {
+        batch: std.ArrayList(CommitMeta),
+        gpa_instance: vcaligner.gpa.Owned.Instance,
+        pub fn deinit(self: *Batch) void {
+            self.batch.deinit(self.gpa_instance.gpao().allocator);
+            self.gpa_instance.deinit();
+        }
+    };
+};
+// XXX: 当前的commit信息采用了一种“由主线程单独设置阈值批量写入ci2c列族”的设计，称当前设计为甲设计。
+// 与之竞争的乙设计：各个子解析线程在所有的内容写入以后，在最后一次（或者第一次）写入时把commit信息交给写线程。
+// 可能考虑乙设计的理由，是这种设计与pi2p和b_pi2bpi列族写入的一致性——都是当核心关系列族里第一次出现相关的索引时，写入与索引相关的信息。
+// 我曾经青睐过乙设计的另一个后被验证不成立的理由，是我曾经以为，乙设计有助于在开启WAL下的断电续传。
+// 详细一点地说：如果每次ci2c的相关列族信息的写入一定在其它相关关系之后。如果因为断电失效了，或许可以利用WAL续传，
+// 此时恢复的时候，因为数据不完整的commit不会被恢复，就可以重新解析。
+// 但是，这建立在一个假设上——如果git仓库没有变动，那么libgit2解析出来的ci顺序就是稳定的。实际并非如此！
+// 我们实际上使用`git_odb_foreach`来分配commit的ci次序。然而这个API，即使是libgit2始终解析同一个git仓库，得到的遍历顺序也是不同的！
+// 因此，结论是使用WAL没有帮助，即使增量模式也不该使用WAL。选择乙方案的最主要理由不成立，能够支持乙方案的也就仅限“和其他列族的一致性”。
+// 而当前使用甲方案，让ci2c列族的写入是独立的。优点在于它可以使得写入此列族“绝对顺序”。
+// 如果交给子线程再决定写入时机，则ci2c本可能顺序写入，也被迫只得乱序写入。
+// 这使得未来有另一个优化方向，就是ci2c列族的写入不通过writebatch，而是sstFileWriter。目前尚未使用此方案，writebatch纯顺序写入的性能也已经足够高。
+// 另附一种如果开启WAL，断点续传可能可行的方案（不打算实现，仅讨论）：添加一个有效ci的列族。当子解析线程第一次写入一个commit时，把commit信息提交给写线程并写入ci2c。
+// 当子解析线程最后一次写入一个commit时，把commit信息提交给写线程并写入有效ci列族。
+// 断电续传的时候，把所有ci2c重构为哈希map，但是如果有效ci列族里没有，标记为脏。后续如果发现标记为脏的commit，也需要重新解析。
+// 为了断电续传这种设计浪费太多，不考虑。
+pub const MsgToWriter = union(enum) {
+    commit_meta: CommitMeta.Batch,
+    parsed: Parsed,
+};
+pub const Queue = @import("mpsc_queue").AnyMpscQueue(MsgToWriter, null);
+pub const Channel = vcaligner.MpscChannel(Queue);
+
+const LoadRegistryForIncrementalError = error{
+    PiFromPrBc2PiNotFoundInPi2P,
+};
+pub const DiagnosticPiFromPrBc2PiNotFoundInPi2P = struct {
+    pr_bc: PathRankBlobCountKey,
+    pi: PathSeq,
+    pub fn init(pr_bc: PathRankBlobCountKey, pi: PathSeq) DiagnosticPiFromPrBc2PiNotFoundInPi2P {
+        return .{
+            .pr_bc = pr_bc,
+            .pi = pi,
+        };
+    }
+    pub fn log(self: DiagnosticPiFromPrBc2PiNotFoundInPi2P) void {
+        std.log.err("path rank: {d}\tblob count: {d}\tpath id: {d}\n", .{
+            self.pr_bc.path_rank.toNative(),
+            self.pr_bc.blob_count.toNative(),
+            self.pi.toNative(),
+        });
+    }
+};
+
+// PathRegistry和BlobPathRegistry的put时机都与写入过程相关。
+// 目前尚未确定是使用单独的写线程，还是写线程与主线程相同。
+// 若有单独写线程，则WriterBoundRegistries也是跨线程结构，写线程使用完毕后，主线程需要使用`path_registry`以写入`pi_bc2p`列族。
+// 因此，对它们使用共同的专有`gpa_instance`实例，这样该分配器实例即使非线程安全也保持可用。
+// 注意：`path_registry`与`blob_path_registry`的生命周期可能不完全相同，例如`path_registry`在主写过程结束后仍然需要使用，
+// 而`blob_path_registry`在主写入过程结束后就不再需要使用。
+pub const writer_bound_registries = struct {
+    // 因为key_arena不是一个可平凡移动的结构，因此PathRegistry也并非可平凡移动的。当前的用例没有移动需求，因此尚可接受。
+    pub const PathRegistry = struct {
+        pub const Map = std.StringArrayHashMapUnmanaged(struct {
+            // 初次插入时的index。插入同时记录，因为后续排序时，原始index会丢失
+            index: PathSeq,
+            blob_cnt: BlobCountNative,
+        });
+        map: Map,
+        // 注意`StringArrayHashMapUnmanaged`不会拷贝键，因此键需要自己手动拷贝保存，因此使用`key_arena`
+        // 注意`key_arena`不负责`StringArrayHashMapUnmanaged`，因为这是一个动态增长结构体，不适合arena。
+        key_arena: StArena,
+        pub fn deinit(self: *PathRegistry, allocator: std.mem.Allocator) void {
+            self.map.deinit(allocator);
+            self.key_arena.deinit();
+            self.* = undefined;
+        }
+        pub fn loadForIncremental(
+            self: *PathRegistry,
+            db: *c.rocksdb_t,
+            cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+                .pr_bc2pi,
+                .pi2p,
+            }),
+            allocaotr: std.mem.Allocator,
+            last_diag: *diag.Diagnostic,
+        ) !void {
+            const it = it: {
+                const roptions = blk: {
+                    const roptions = c.rocksdb_readoptions_create().?;
+                    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathRankBlobCountKey);
+                    break :blk roptions;
+                };
+                defer c.rocksdb_readoptions_destroy(roptions);
+                break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.pr_bc2pi));
+            };
+            defer c.rocksdb_iter_destroy(it);
+            c.rocksdb_iter_seek_to_first(it);
+            const pi2p_roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create();
+                // 每个键只会被`get`一次，不用缓存避免污染。
+                c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+                break :blk roptions.?;
+            };
+            defer c.rocksdb_readoptions_destroy(pi2p_roptions);
+            while (c.rocksdb_iter_valid(it) != 0) {
+                const pr_bc: PathRankBlobCountKey = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                    break :blk std.mem.bytesToValue(PathRankBlobCountKey, c_ptr[0..c_len]);
+                };
+                const blob_cnt: BlobCountNative = pr_bc.blob_count.toNative();
+                const pi: PathSeq = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                    break :blk std.mem.bytesToValue(PathSeq, c_ptr[0..c_len]);
+                };
+                const path: []const u8 = path: {
+                    var c_len: usize = undefined;
+                    var err_cstr: ?[*:0]u8 = null;
+                    const c_ptr = c.rocksdb_get_cf(
+                        db,
+                        pi2p_roptions,
+                        cfs.get(.pi2p),
+                        @ptrCast(&pi),
+                        @sizeOf(PathSeq),
+                        &c_len,
+                        @ptrCast(&err_cstr),
+                    );
+                    try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                    if (c_ptr == null) {
+                        last_diag.* = .{
+                            .PiFromPrBc2PiNotFoundInPi2P = .init(pr_bc, pi),
+                        };
+                        return LoadRegistryForIncrementalError.PiFromPrBc2PiNotFoundInPi2P;
+                    }
+                    defer c.rocksdb_free(c_ptr);
+                    break :path try self.key_arena.allocator().dupeZ(u8, c_ptr[0..c_len]);
+                };
+                try self.map.put(allocaotr, path, .{ .index = pi, .blob_cnt = blob_cnt });
+                // 如果出错也没有回退状态的价值，不再进行errdefer。
+                c.rocksdb_iter_next(it);
+            }
+        }
+    };
+    pub const BlobPathRegistry = struct {
+        map: std.AutoHashMapUnmanaged(BlobPathKey, BlobPathSeq),
+        pub fn loadForIncremental(
+            self: *BlobPathRegistry,
+            db: *c.rocksdb_t,
+            cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+                .b_pi2bpi,
+            }),
+            allocator: std.mem.Allocator,
+        ) !void {
+            const it = it: {
+                const roptions = blk: {
+                    const roptions = c.rocksdb_readoptions_create().?;
+                    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, BlobPathKey);
+                    break :blk roptions;
+                };
+                defer c.rocksdb_readoptions_destroy(roptions);
+                break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.b_pi2bpi));
+            };
+            defer c.rocksdb_iter_destroy(it);
+            c.rocksdb_iter_seek_to_first(it);
+            while (c.rocksdb_iter_valid(it) != 0) {
+                const b_pi: BlobPathKey = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_key(it, &c_len);
+                    break :blk std.mem.bytesToValue(BlobPathKey, c_ptr[0..c_len]);
+                };
+                const bpi: BlobPathSeq = blk: {
+                    var c_len: usize = undefined;
+                    const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                    break :blk std.mem.bytesToValue(BlobPathSeq, c_ptr[0..c_len]);
+                };
+                try self.map.put(allocator, b_pi, bpi);
+                // 如果出错也没有回退状态的价值，不再进行errdefer。
+                c.rocksdb_iter_next(it);
+            }
+        }
+    };
+    pub const ManagedGpaInstance = struct {
+        instance: vcaligner.gpa.Owned.Instance,
+        pub fn allocator(self: *ManagedGpaInstance) std.mem.Allocator {
+            return self.instance.gpao().allocator;
+        }
+        pub fn handle(self: *ManagedGpaInstance, path_registry: *PathRegistry, blob_path_registry: *BlobPathRegistry) Handle {
+            return .{ .allocator = self.instance.gpao().allocator, .path_registry = path_registry, .blob_path_registry = blob_path_registry };
+        }
+    };
+    pub const Handle = struct {
+        path_registry: *PathRegistry,
+        blob_path_registry: *BlobPathRegistry,
+        allocator: std.mem.Allocator,
+    };
+};
+
+pub const CommitRegistryWithManagedGpaInstance = struct {
+    map: std.AutoHashMapUnmanaged(c.git_oid, void),
+    // `CommitRegistry`存在跨线程需求。
+    // 增量模式下，需要在主解析线程启动前put它，并在主解析线程中继续put。
+    // 因此这要求跨线程地保存其分配器。此处的实现采用了专有分配器实例，这样可以规避线程安全的要求。
+    // 专有分配器实例也可以通过一个线程安全的全局分配器实现来模拟此处的专有分配器实例需求。
+    gpa_instance: vcaligner.gpa.Owned.Instance,
+    pub fn deinit(self: *CommitRegistryWithManagedGpaInstance) void {
+        self.map.deinit(self.gpa_instance.gpao().allocator);
+        self.gpa_instance.deinit();
+        self.* = undefined;
+    }
+    pub fn allocator(self: *CommitRegistryWithManagedGpaInstance) std.mem.Allocator {
+        return self.gpa_instance.gpao().allocator;
+    }
+    pub fn loadForIncremental(
+        self: *CommitRegistryWithManagedGpaInstance,
+        db: *c.rocksdb_t,
+        cfs: vcaligner.rocksdb_custom.CollumFamily.HandlesSubViewer.SubViewConst(&[_]vcaligner.rocksdb_custom.CollumFamily{
+            .ci2c,
+        }),
+    ) !void {
+        const it = it: {
+            const roptions = blk: {
+                const roptions = c.rocksdb_readoptions_create().?;
+                vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, CommitSeq);
+                break :blk roptions;
+            };
+            defer c.rocksdb_readoptions_destroy(roptions);
+            break :it c.rocksdb_create_iterator_cf(db, roptions, cfs.get(.ci2c));
+        };
+        defer c.rocksdb_iter_destroy(it);
+        c.rocksdb_iter_seek_to_first(it);
+        while (c.rocksdb_iter_valid(it) != 0) {
+            const commit_hash: c.git_oid = blk: {
+                var c_len: usize = undefined;
+                const c_ptr = c.rocksdb_iter_value(it, &c_len);
+                break :blk std.mem.bytesToValue(c.git_oid, c_ptr[0..c_len]);
+            };
+            try self.map.put(self.allocator(), commit_hash, {});
+            // 如果出错也没有回退状态的价值，不再进行errdefer。
+            c.rocksdb_iter_next(it);
+        }
+    }
+};
+
+pub const RocksdbPath = union(enum) {
+    borrowed_from_config: [:0]const u8,
+    owned: [:0]u8,
+    pub fn init(
+        noalias runconf: *const PrepRunner,
+        repo: *c.git_repository,
+        allocator: std.mem.Allocator,
+        last_diag: *diag.Diagnostic,
+    ) !RocksdbPath {
+        return switch (runconf.mode_conf) {
+            .full => |full_conf| switch (full_conf.rocksdb_output) {
+                .manual => |path| .{ .borrowed_from_config = path },
+                .auto => blk: {
+                    // repo_id曾考虑参与更多，如在rocksdb中被保存
+                    // 由于repo_id目前实现不完善（仅仅只有repo中包含远程origin才能提取）且目前仅在自动创建rocksdb_outpu时才有用
+                    // 因此它的创建目前仅仅在自动创建rocksdb_output时才会进行。
+                    const repo_id = try getRepoId(repo, allocator, last_diag);
+                    defer allocator.free(repo_id);
+                    var rocksdb_output_auto_writer: std.Io.Writer.Allocating = .init(allocator);
+                    errdefer rocksdb_output_auto_writer.deinit();
+                    try rocksdb_output_auto_writer.writer.print("tmp/{s}/{d}-{d}-rocksdb", .{
+                        repo_id,
+                        runconf.proc_stamp.pid,
+                        runconf.proc_stamp.ts,
+                    });
+                    break :blk .{ .owned = try rocksdb_output_auto_writer.toOwnedSliceSentinel(0) };
+                },
+            },
+            .incremental => |inc_conf| .{ .borrowed_from_config = inc_conf.rocksdb_output },
+        };
+    }
+    pub fn deinit(self: RocksdbPath, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed_from_config => {},
+            .owned => |path| allocator.free(path),
+        }
+    }
+    pub fn get(self: RocksdbPath) [:0]const u8 {
+        return switch (self) {
+            .borrowed_from_config, .owned => |path| path,
+        };
+    }
+};
+
+pub const RecoveryPathConf = union(enum) {
+    disabled: void,
+    borrowed_from_config: [:0]const u8,
+    owned: [:0]u8,
+    pub fn init(
+        noalias runconf: *const PrepRunner,
+        allocator: std.mem.Allocator,
+        rocksdb_path: [:0]const u8,
+    ) !RecoveryPathConf {
+        return switch (runconf.mode_conf) {
+            .full => .disabled,
+            .incremental => |inc_conf| switch (inc_conf.recovery) {
+                .disabled => .disabled,
+                .enabled_with_custom_path => |path| .{ .borrowed_from_config = path },
+                .enabled_with_auto_path => blk: {
+                    var recovery_path_writer: std.Io.Writer.Allocating = .init(allocator);
+                    errdefer recovery_path_writer.deinit();
+                    // TODO: 不完善：如果rocksdb path以"/"结尾或者不以"/"结尾，生成结果不一样，会令人困惑。
+                    try recovery_path_writer.writer.print("{s}.recovery", .{rocksdb_path});
+                    break :blk .{ .owned = try recovery_path_writer.toOwnedSliceSentinel(0) };
+                },
+            },
+        };
+    }
+    pub fn deinit(self: RecoveryPathConf, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .disabled, .borrowed_from_config => {},
+            .owned => |path| allocator.free(path),
+        }
+    }
+    pub fn view(self: RecoveryPathConf) RecoveryPathConf.View {
+        return switch (self) {
+            .disabled => .{ .disabled = {} },
+            .borrowed_from_config, .owned => |path| .{ .enabled = path },
+        };
+    }
+    pub const View = union(enum) {
+        disabled: void,
+        enabled: [:0]const u8,
+    };
+};
+
+pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+    // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
+    // 计划进一步重构为：主线程收集其他线程的错误。解析主线程和写入线程均另开线程。
+    var wbr_gpa_instance: writer_bound_registries.ManagedGpaInstance = .{ .instance = .init() };
+    defer wbr_gpa_instance.instance.deinit();
+    var path_registry: writer_bound_registries.PathRegistry = .{ .map = .empty, .key_arena = .init(wbr_gpa_instance.allocator()) };
+    defer path_registry.deinit(wbr_gpa_instance.allocator());
+    const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = writer_and_parser: {
+        var commit_registry: CommitRegistryWithManagedGpaInstance = .{ .map = .empty, .gpa_instance = .init() };
+        // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
+        // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
+        defer commit_registry.deinit();
+        const queue: Queue = try .init(gpa.allocator, runconf.parsed_queue_capacity_log2);
+        defer queue.deinit(gpa.allocator);
+        var channel: Channel = .{ .mpsc_queue_ref = queue };
+        // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
+        // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
+        const main_parser: std.Thread, const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = libgit2_handoff: {
+            var git_error_code = c.git_libgit2_init();
+            if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+            std.debug.assert(git_error_code == 1);
+            // 下面的写法模拟对libgit2资源本身的`errdefer`。由于libgit2的销毁本身可能报错，且`errdefer`本身将移除捕获`err`的能力。
+            // 因此，当前的`errdefer`对于这种本身可能报错的逻辑无法收集所有信息得到最优控制流。
+            // 因此还是选择将主要逻辑放进函数里，模拟`errdefer`的行为。
+            // NOTE: 此处的主要逻辑只能放到函数里，不可以展开，[原因](https://ziggit.dev/t/idiom-for-an-old-school-try-catch-block/3821/6)。
+            break :libgit2_handoff provisionMainParser(
+                runconf,
+                &commit_registry,
+                &channel,
+                gpa,
+                last_diag,
+            ) catch |err| {
+                git_error_code = c.git_libgit2_shutdown();
+                if (git_error_code < 0) {
+                    try last_diag.enterStack(err);
+                    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
+                    unreachable;
+                }
+                std.debug.assert(git_error_code == 0);
+                return err;
+            };
+        };
+        errdefer {
+            storage_state.deinit();
+            recovery_path_conf.deinit(gpa.allocator);
+            rocksdb_output.deinit(gpa.allocator);
+        }
+        // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
+        // 此处的join依然有保障本函数结束前此线程持有的libgit2全局资源以及repo被释放的能力。
+        // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
+        // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
+        defer main_parser.join();
+        var blob_path_registry: writer_bound_registries.BlobPathRegistry = .{ .map = .empty };
+        defer blob_path_registry.map.deinit(wbr_gpa_instance.allocator());
+        const wbr: writer_bound_registries.Handle = .{
+            .path_registry = &path_registry,
+            .blob_path_registry = &blob_path_registry,
+            .allocator = wbr_gpa_instance.allocator(),
+        };
+        try wbr.path_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs }, wbr.allocator, last_diag);
+        try wbr.blob_path_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs }, wbr.allocator);
+        try @import("write.zig").writeCumulative(.fromFullStorage(&storage_state.valid), &channel, wbr, runconf.writebatch_watermark, last_diag);
+        break :writer_and_parser .{
+            rocksdb_output,
+            recovery_path_conf,
+            storage_state,
+        };
     };
     defer {
-        ctx.writer.path_registry.map.deinit(ctx.writer.path_registry.arena.allocator());
-        ctx.writer.path_registry.arena.deinit();
-        ctx.writer.blob_path_registry.map.deinit(ctx.writer.blob_path_registry.arena.allocator());
-        ctx.writer.blob_path_registry.arena.deinit();
-        ctx.writer = undefined;
+        storage_state.deinit();
+        recovery_path_conf.deinit(gpa.allocator);
+        rocksdb_output.deinit(gpa.allocator);
     }
-    try parseAndWrite(ctx, allocator, last_diag);
-    // 如果rocksdb_output并未手动提供，那么它理应在`parseAndWrite`步骤中被自动生成。
-    defer switch (ctx.rocksdb_output) {
-        .manual => {},
-        .auto => allocator.free(ctx.rocksdb_output.auto),
-    };
-    // 压缩rocksdb的写入内容。
-    try @import("compaction.zig").compaction(ctx, allocator, last_diag);
+    // 延迟compaction模式下的compaction.
+    switch (runconf.mode_conf.compactionStrategy()) {
+        .manual_delayed => {
+            try storage_state.reopenAndFullCompaction(runconf.n_rocksdbjobs, runconf.compression, rocksdb_output.get(), last_diag);
+        },
+        else => {},
+    }
+    // pr_bc2pi列族的写入。
+    // 确定临时的sst文件路径
+    write_pr_bc2pi: {
+        const tmp_sst_file_path = blk: {
+            var sst_file_name_writer: std.Io.Writer.Allocating = .init(gpa.allocator);
+            try sst_file_name_writer.writer.print("{s}/{d}-{d}-pr_bc2pi-sst", .{
+                std.fs.path.dirname(rocksdb_output.get()) orelse ".",
+                runconf.proc_stamp.pid,
+                runconf.proc_stamp.ts,
+            });
+            break :blk try sst_file_name_writer.toOwnedSliceSentinel(0);
+        };
+        defer gpa.allocator.free(tmp_sst_file_path);
+        try @import("write.zig").writePrBc2Pi(
+            storage_state.valid.db,
+            .fromHandles(&storage_state.valid.cfs),
+            &path_registry.map,
+            tmp_sst_file_path,
+            runconf.compression,
+            last_diag,
+        );
+        break :write_pr_bc2pi;
+    }
+
+    // 成功退出前，移除recovery。
+    switch (recovery_path_conf) {
+        .disabled => {},
+        .borrowed_from_config, .owned => |path| try std.fs.cwd().deleteTree(path),
+    }
 }
 
-// mpsc，多生产者解析，单消费者写入。具体逻辑见`parse.zig`和`write.zig`。其中，写入对于rocksdb为仅写入，无压缩。
-// XXX: 可能需要重构。目前设计为主线程分发解析，线程池解析，然后另设计一个线程写入。
-// 考虑到最终的操作为rocksdb操作最多，或许应当重构为主线程写入，另创建一个线程分发解析，分发解析线程内再创建线程池。
-// 重新思考：另开写线程未尝不可，只是可能要根据情况决定是由线程自己打开rocksdb数据库，还是主线程打开然后让rocksdb数据库持有使用权。
-pub fn parseAndWrite(ctx: *PrepRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    std.log.debug("verbose: {}, compression: {}, path: {s}\n", .{ ctx.global.verbose, ctx.compression, ctx.bare_repo_path });
-    var git_error_code = c.git_libgit2_init();
-    if (git_error_code != 1) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-    defer {
-        git_error_code = c.git_libgit2_shutdown();
-        var tmp_diagnostics: diag.Diagnostics = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
-        defer tmp_diagnostics.arena.deinit();
-        c_helper.gitErrorCodeToZigError(git_error_code, &tmp_diagnostics.last_diagnostic) catch |err| tmp_diagnostics.log_all(err);
-    }
-    ctx.repo = blk: {
+fn provisionMainParser(
+    noalias runconf: *const PrepRunner,
+    commit_registry: *CommitRegistryWithManagedGpaInstance,
+    channel: *Channel,
+    gpa: vcaligner.gpa.Concurrent,
+    last_diag: *diag.Diagnostic,
+) !struct { std.Thread, RocksdbPath, RecoveryPathConf, storage.State } {
+    const repo: *c.git_repository = blk: {
         var repo: ?*c.git_repository = undefined;
-        git_error_code = c.git_repository_open_bare(&repo, ctx.bare_repo_path.ptr);
+        const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
         try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
         break :blk repo.?;
     };
-    defer {
-        c.git_repository_free(ctx.repo);
-        ctx.repo = undefined;
-    }
-    ctx.odb = blk: {
-        var odb: ?*c.git_odb = undefined;
-        git_error_code = c.git_repository_odb(&odb, ctx.repo);
-        try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-        break :blk odb.?;
-    };
-    defer {
-        c.git_odb_free(ctx.odb);
-        ctx.odb = undefined;
-    }
+    errdefer c.git_repository_free(repo);
     // oidtype标识仓库的hash是SHA1还是SHA256。
-    const oidtype = c.git_repository_oid_type(ctx.repo);
+    // TODO: 将它输出，与repo id一起写进数据库里。
+    const oidtype = c.git_repository_oid_type(repo);
     _ = oidtype;
-    // 如果rocksdb_output未指定，基于仓库构造repo_id来设置rocksdb_output。
-    switch (ctx.rocksdb_output) {
-        .manual => {},
-        .auto => {
-            // repo_id原放在`ctx`中，曾考虑参与更多，如在rocksdb中被保存
-            // 由于repo_id目前实现不完善（仅仅只有repo中包含远程origin才能提取）且目前仅在自动创建rocksdb_outpu时才有用
-            // 因此它的创建目前仅仅在自动创建rocksdb_output时才会进行。
-            const repo_id = try getRepoId(ctx.repo, allocator, last_diag);
-            defer allocator.free(repo_id);
-            std.log.debug("repo-id: {s}\n", .{repo_id});
-            ctx.rocksdb_output.auto = blk: {
-                var rocksdb_output_auto_writer: std.Io.Writer.Allocating = .init(allocator);
-                errdefer rocksdb_output_auto_writer.deinit();
-                try rocksdb_output_auto_writer.writer.print("tmp/{s}/{d}-{d}-rocksdb", .{
-                    repo_id,
-                    ctx.proc_stamp.pid,
-                    ctx.proc_stamp.ts,
-                });
-                break :blk try rocksdb_output_auto_writer.toOwnedSliceSentinel(0);
-            };
-        },
+    const rocksdb_output: RocksdbPath = try .init(runconf, repo, gpa.allocator, last_diag);
+    errdefer rocksdb_output.deinit(gpa.allocator);
+    const recovery_path_conf: RecoveryPathConf = try .init(runconf, gpa.allocator, rocksdb_output.get());
+    errdefer recovery_path_conf.deinit(gpa.allocator);
+    var storage_state: storage.State = undefined;
+    try storage_state.init(
+        runconf.mode_conf,
+        runconf.n_rocksdbjobs,
+        runconf.mode_conf.compactionStrategy(),
+        runconf.compression,
+        runconf.cf_max_write_buffer_number,
+        rocksdb_output.get(),
+        recovery_path_conf.view(),
+        last_diag,
+    );
+    errdefer storage_state.deinit();
+    if (runconf.mode_conf == .incremental) {
+        try commit_registry.loadForIncremental(storage_state.valid.db, .{ .view = &storage_state.valid.cfs });
     }
-    errdefer switch (ctx.rocksdb_output) {
-        .manual => {},
-        .auto => allocator.free(ctx.rocksdb_output.auto),
-    };
-    // 创建rocksdb_output的父目录。这是因为rocksdb没有自动创建父目录的能力。
-    make_parent_dir: {
-        // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
-        // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
-        // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
-        const maybe_parent_dir: ?[]const u8 = std.fs.path.dirname(ctx.rocksdb_output.get());
-        if (maybe_parent_dir) |parent_dir| {
-            const cwd = std.fs.cwd();
-            cwd.access(parent_dir, .{}) catch |access_err| {
-                switch (access_err) {
-                    error.FileNotFound => cwd.makePath(parent_dir) catch |mkdir_err| {
-                        switch (mkdir_err) {
-                            // 考虑多进程竞争场景，可能存在同进程已经创建目录的情形。此时是安全的。
-                            error.PathAlreadyExists => {},
-                            else => {
-                                std.log.err("make dir {s} error: {s}", .{ parent_dir, @errorName(mkdir_err) });
-                                return mkdir_err;
-                            },
-                        }
-                    },
-                    else => return access_err,
-                }
-            };
-        }
-        break :make_parent_dir;
-    }
-    ctx.commit_registry = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
-    defer {
-        ctx.commit_registry.map.deinit(ctx.commit_registry.arena.allocator());
-        ctx.commit_registry.arena.deinit();
-        ctx.commit_registry = undefined;
-    }
-    // rocksdb的使用方案[参见](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ)。
-    // 采用多线程解析，单线程写入的模型。解析线程同样涉及odb的I/O读取，并不是纯cpu工作，所以恐怕不会比写入的I/O慢。
-    const queue = try PrepRunner.Queue.init(allocator, ctx.task_queue_capacity_log2);
-    defer queue.deinit(allocator);
-    ctx.channel = .{ .mpsc_queue_ref = queue };
-    defer ctx.channel = undefined;
-    // 创建解析线程池。需要为主线程和写线程各预留1个线程数量。rocksdb的后台flush线程为I/O密集线程，不需要预留。
-    try ctx.parsers.init(allocator, ctx.n_jobs - 2, &ctx.channel);
-    defer ctx.parsers.deinit(allocator);
-    // 创建写线程。
-    var writer = try std.Thread.spawn(.{ .allocator = allocator }, @import("write.zig").task, .{ctx});
-    defer {
-        ctx.parsers.pool.waitAndWork(&ctx.parsers.wait_group);
-        ctx.channel.notifyConsumerDone();
-        writer.join();
-        std.log.debug("Writer end.\n", .{});
-    }
-    git_error_code = c.git_odb_foreach(ctx.odb, index_builder_cb, ctx);
-    try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
-}
-
-fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) c_int {
-    var ctx: *PrepRunner = @ptrCast(@alignCast(payload.?));
-    const obj_type: c.git_object_t = blk: {
-        var obj: ?*c.git_odb_object = undefined;
-        const git_error_code = c.git_odb_read(@as([*c]?*c.git_odb_object, &obj), ctx.odb, id);
-        if (git_error_code != 0) return git_error_code;
-        defer c.git_odb_object_free(obj);
-        break :blk c.git_odb_object_type(obj);
-    };
-    // 只处理commit对象
-    if (obj_type != c.GIT_OBJECT_COMMIT) return 0;
-    // 注意：遍历过程中，可能出现重复的对象。
-    // 参见<https://stackoverflow.com/questions/41050175/why-do-i-see-duplicate-object-ids-when-using-git-odb-foreach>。
-    // 这是因为odb仓库可能存在多个后端，遍历odb会把每个后端都遍历一遍，并且不对外开放指定后端的遍历。只遍历指定后端也容易遗漏。
-    // 因此，引入本地hash表用于commit去重。如果已存在则不再继续。
-    if (ctx.commit_registry.map.contains(id.*)) return 0;
-    // 每个commit分配一个序列号，因为每次写入的commit都需要20字节太长了，压缩到4个字节。这个分配过程在此处就执行，并且没有做驻留保存工作。
-    const commit_seq: vcaligner.rocksdb_custom.CommitSeq = .fromNative(ctx.commit_registry.map.count());
-    ctx.commit_registry.map.putNoClobber(ctx.commit_registry.arena.allocator(), id.*, commit_seq) catch {
-        std.log.err("Commit regisistry put no clobber failed.\n", .{});
-        vcaligner.crash_dump.dumpAndCrash(@src());
-    };
-    // 在添加线程池任务前，检查`task_in_queue_count`。若已满，自己也来帮忙执行。此处的最大task数目和另一个mpsc队列共用一个`task_queue_capacity_log2`
-    const task_in_queue_count = ctx.parsers.task_in_queue_count.fetchAdd(1, .acquire);
-    if ((task_in_queue_count >> ctx.task_queue_capacity_log2) > 0) help_do_work: {
-        const run_node = blk: {
-            ctx.parsers.pool.mutex.lock();
-            defer ctx.parsers.pool.mutex.unlock();
-            break :blk ctx.parsers.pool.run_queue.popFirst() orelse break :help_do_work;
-        };
-        const runnable: *Pool.Runnable = @fieldParentPtr("node", run_node);
-        runnable.runFn(runnable, 0);
-    }
-    // XXX: 一种可能选项是不拷贝id的20字节，而是直接用HashMap里的commi id键指针。
-    // 但是，实践中这可能破坏数据局部性，缓存未命中的性能影响远超过此处的拷贝。
-    ctx.parsers.pool.spawnWgId(&ctx.parsers.wait_group, @import("parse.zig").task, .{ ctx, id.*, commit_seq });
-    return 0;
+    const main_parser = try std.Thread.spawn(.{ .allocator = gpa.allocator }, @import("parse.zig").mainParseTaskTakeRepo, .{
+        repo,
+        channel,
+        // n_jobs是排除rocksdb自动创建线程外的线程数。而解析子线程的数量还需要再排除主解析和写线程各一个。
+        runconf.n_jobs - 2,
+        commit_registry,
+    });
+    errdefer comptime unreachable;
+    return .{ main_parser, rocksdb_output, recovery_path_conf, storage_state };
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。

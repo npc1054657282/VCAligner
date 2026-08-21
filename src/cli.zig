@@ -3,7 +3,7 @@ const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 pub const Runner = union(enum) {
-    prep: @import("cmd_increprep/PrepRunner.zig"),
+    prep: @import("cmd_prep/PrepRunner.zig"),
     ana: @import("cmd_ana/AnaRunner.zig"),
     pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
