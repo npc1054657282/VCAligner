@@ -456,6 +456,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     // pr_bc2pi列族的写入。
     // 确定临时的sst文件路径
     write_pr_bc2pi: {
+        try storage_state.resetPrCb2Pi(runconf.compression, last_diag);
         const tmp_sst_file_path = blk: {
             var sst_file_name_writer: std.Io.Writer.Allocating = .init(gpa.allocator);
             try sst_file_name_writer.writer.print("{s}/{d}-{d}-pr_bc2pi-sst", .{

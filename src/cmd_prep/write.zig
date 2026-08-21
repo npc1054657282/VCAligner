@@ -211,8 +211,8 @@ pub fn writePrBc2Pi(
             // 假设当前数据库的seqno已经走到了1000，RocksDB希望刚刚导入的这批数据具备最新的seqno（比如1001）。
             // 如果开启global seqno：rocksdb无需修改SST文件本身，直接在MANIFEST元数据里记录该文件的global seqno是 1001。
             // 以后读取这个文件时，RocksDB只要看到seqno是 0，就自动把它当作1001对待。
-            // 作为最后补充写入的列族的SST，此配置是必须的。
-            c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(iefoptions, 1);
+            // 在我们的场景，没有使用他的需求：我们始终删除此列族并从头写入。
+            c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(iefoptions, 0);
             // 设置此项选项后，临时sst文件将自动在ingest后被删除，无需手动删除。
             c.rocksdb_ingestexternalfileoptions_set_move_files(iefoptions, 1);
             break :blk iefoptions.?;
