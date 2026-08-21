@@ -154,10 +154,12 @@ pub const Handles = struct {
     ) !void {
         const db_options = blk: {
             const db_options = c.rocksdb_options_create().?;
-            c.rocksdb_options_set_create_if_missing(db_options, switch (mode) {
+            const create_if_missing: u8 = switch (mode) {
                 .full => 1,
                 .incremental => 0,
-            });
+            };
+            c.rocksdb_options_set_create_if_missing(db_options, create_if_missing);
+            c.rocksdb_options_set_create_missing_column_families(db_options, create_if_missing);
             c.rocksdb_options_set_error_if_exists(db_options, switch (mode) {
                 .full => 1,
                 .incremental => 0,

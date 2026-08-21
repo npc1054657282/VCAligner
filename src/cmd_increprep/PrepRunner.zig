@@ -103,7 +103,7 @@ pub const cmd = blk: {
             \\
         ))
         // 启用增量模式（基于已经解析过的预处理rocksdb数据库进行增量解析）。不提供此选项，则启用全量模式。
-        .arg(zargs.Arg.optArg("increment", bool).short('i').long("increment").help(
+        .arg(zargs.Arg.opt("increment", bool).short('i').long("increment").help(
             \\Enable incremental parsing mode. 
         ++ vcaligner.cli.helpNewLine(cmd_config) ++
             \\Must be used with an existing database via --rocksdb-output.
