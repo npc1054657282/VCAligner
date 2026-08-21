@@ -235,7 +235,7 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
     errdefer allocator.free(bare_repo_path);
     const mode_conf: ModeConf = if (args.increment) blk: {
         const rocksdb_output = if (args.rocksdb_output) |rocksdb_output| try allocator.dupeZ(u8, rocksdb_output) else {
-            std.log.err("Option `bare-repo-path` or `repo-path` is necessary.\n", .{});
+            std.log.err("Option `rocksdb-output` is necessary under increment mode.\n", .{});
             return cli.Runner.Error.CliArgInvalidInput;
         };
         errdefer allocator.free(rocksdb_output);

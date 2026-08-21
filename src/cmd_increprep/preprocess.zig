@@ -348,6 +348,7 @@ pub const RecoveryPathConf = union(enum) {
                 .enabled_with_auto_path => blk: {
                     var recovery_path_writer: std.Io.Writer.Allocating = .init(allocator);
                     errdefer recovery_path_writer.deinit();
+                    // TODO: 不完善：如果rocksdb path以"/"结尾或者不以"/"结尾，生成结果不一样，会令人困惑。
                     try recovery_path_writer.writer.print("{s}.recovery", .{rocksdb_path});
                     break :blk .{ .owned = try recovery_path_writer.toOwnedSliceSentinel(0) };
                 },

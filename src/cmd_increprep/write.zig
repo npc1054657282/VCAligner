@@ -205,9 +205,14 @@ pub fn writePrBc2Pi(
             // NOTE: 接收到警告`At least one SST file opened without unique ID to verify`，后跟`global_seqno=0`
             // 由于我们采用sst file writer方案，无法使用常规写入引入的校验机制，这个警告很正常，可忽略。
             // 而global seqno=0也很正常，并非警告。
-            // 不要为此去设置`allow_global_seqno`，这个用于sst file之间如果存在重叠的情况，故使用全局序号以试图标记重叠的先后版本顺序。
-            // 在我们的场景，没有使用他的需求。
-            c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(iefoptions, 0);
+            // 在 RocksDB中，每一条写入的数据都有一个单调递增的序列号seqno。seqno越大，数据越新。
+            // 当使用SstFileWriter在外部从无到有生成一个SST文件时，由于它脱离了RocksDB实例的运行环境，文件里所有数据的seqno默认全部被硬编码为0
+            // 调用IngestExternalFile把这个文件挂载进RocksDB时，RocksDB必须把这批数据安插进当前的时间线里。
+            // 假设当前数据库的seqno已经走到了1000，RocksDB希望刚刚导入的这批数据具备最新的seqno（比如1001）。
+            // 如果开启global seqno：rocksdb无需修改SST文件本身，直接在MANIFEST元数据里记录该文件的global seqno是 1001。
+            // 以后读取这个文件时，RocksDB只要看到seqno是 0，就自动把它当作1001对待。
+            // 作为最后补充写入的列族的SST，此配置是必须的。
+            c.rocksdb_ingestexternalfileoptions_set_allow_global_seqno(iefoptions, 1);
             // 设置此项选项后，临时sst文件将自动在ingest后被删除，无需手动删除。
             c.rocksdb_ingestexternalfileoptions_set_move_files(iefoptions, 1);
             break :blk iefoptions.?;
