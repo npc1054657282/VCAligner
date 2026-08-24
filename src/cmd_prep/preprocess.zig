@@ -406,6 +406,8 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         // XXX: 如果不把libgit2全局资源和repo的所有权传递给解析线程，而是选择在此处`join`之后由本线程释放呢？
         // 这么写代码逻辑会更简单一些，不过所有权提交给解析线程有机会可以更早释放。
         defer main_parser.join();
+        // TODO: 当前尚未准备好io的取消实现，因此选择出错即崩溃的权宜之计。
+        errdefer vcaligner.crash_dump.dumpAndCrash(@src());
         var blob_path_registry: writer_bound_registries.BlobPathRegistry = .{ .map = .empty };
         defer blob_path_registry.map.deinit(wbr_gpa_instance.allocator());
         const wbr: writer_bound_registries.Handle = .{
