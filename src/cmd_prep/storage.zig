@@ -3,7 +3,7 @@ const vcaligner = @import("vcaligner");
 const c_helper = vcaligner.c_helper;
 const c = c_helper.c;
 const CompactionStrategy = @import("PrepRunner.zig").CompactionStrategy;
-const RecoveryPathConfView = @import("preprocess.zig").RecoveryPathConf.View;
+const RecoveryPathConfView = @import("PrepRunner.zig").RecoveryPathConfView;
 pub const State = union(enum) {
     valid: Handles,
     invalid: void,
@@ -23,6 +23,7 @@ pub const State = union(enum) {
             // NOTE：父目录解析为`null`存在一个合法可能：`rocksdb_output`只有名字。此时父目录解析为`null`意味着父目录为当前目录。
             // 其它情况下解析为`null`的情况，不论是`rocksdb_output`是当前目录，或者是一个盘符都是非法的。
             // 这种情况将在`rocksdb`创建数据库的时候报告错误，因此此处不再检查。
+            // 由于rocksdb_output已经在参数解析过程中进行了resolve，因此不必担心出现"a/."这种可能导致错误解析的情况。
             const maybe_parent_dir: ?[]const u8 = std.fs.path.dirname(rocksdb_path);
             if (maybe_parent_dir) |parent_dir| {
                 const cwd = std.fs.cwd();

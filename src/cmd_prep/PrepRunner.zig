@@ -14,6 +14,10 @@ pub const CompactionStrategy = union(enum) {
     // 默认自动压缩
     auto_default: void,
 };
+pub const RecoveryPathConfView = union(enum) {
+    disabled: void,
+    enabled: [:0]const u8,
+};
 pub const ModeConf = union(Mode) {
     full: struct {
         rocksdb_output: union(enum) { manual: [:0]u8, auto: void },
@@ -33,8 +37,7 @@ pub const ModeConf = union(Mode) {
         },
         recovery: union(enum) {
             disabled: void,
-            enabled_with_custom_path: [:0]u8,
-            enabled_with_auto_path: void,
+            enabled: [:0]u8,
         },
     },
     pub fn deinit(noalias self: *const @This(), allocator: std.mem.Allocator) void {
@@ -47,8 +50,8 @@ pub const ModeConf = union(Mode) {
             .incremental => |inc_conf| {
                 allocator.free(inc_conf.rocksdb_output);
                 switch (inc_conf.recovery) {
-                    .enabled_with_custom_path => |path| allocator.free(path),
-                    .disabled, .enabled_with_auto_path => {},
+                    .enabled => |path| allocator.free(path),
+                    .disabled => {},
                 }
             },
         }
@@ -57,6 +60,15 @@ pub const ModeConf = union(Mode) {
         return switch (self.*) {
             .full => |full_conf| full_conf.compaction_strategy,
             .incremental => |inc_conf| inc_conf.compaction_strategy.asParent(),
+        };
+    }
+    pub fn recoveryPathConfView(noalias self: *const @This()) RecoveryPathConfView {
+        return switch (self.*) {
+            .full => .disabled,
+            .incremental => |inc_conf| switch (inc_conf.recovery) {
+                .disabled => .disabled,
+                .enabled => |path| .{ .enabled = path },
+            },
         };
     }
 };
@@ -234,15 +246,38 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
     };
     errdefer allocator.free(bare_repo_path);
     const mode_conf: ModeConf = if (args.increment) blk: {
-        const rocksdb_output = if (args.rocksdb_output) |rocksdb_output| try allocator.dupeZ(u8, rocksdb_output) else {
+        // 在增量模式下，由于可能存在自动构造recovery路径的需求，所以需要尽可能获取rocksdb output的basename的名字。
+        // 为了尽可能消除可能的`.`和`..`的影响，基于cwd解析出尽可能准确的绝对路径。
+        const rocksdb_output: [:0]u8 = if (args.rocksdb_output) |rocksdb_output| rocksdb_output: {
+            const cwd_path = try std.process.getCwdAlloc(allocator);
+            defer allocator.free(cwd_path);
+            const unsentineled = try std.fs.path.resolve(allocator, &[_][]const u8{
+                cwd_path,
+                rocksdb_output,
+            });
+            defer allocator.free(unsentineled);
+            break :rocksdb_output try allocator.dupeZ(u8, unsentineled);
+        } else {
             std.log.err("Option `rocksdb-output` is necessary under increment mode.\n", .{});
             return cli.Runner.Error.CliArgInvalidInput;
         };
         errdefer allocator.free(rocksdb_output);
         const recovery: @FieldType(@FieldType(ModeConf, "incremental"), "recovery") =
             if (args.no_increment_recovery) .disabled else if (args.increment_recovery_path) |recovery_path| .{
-                .enabled_with_custom_path = try allocator.dupeZ(u8, recovery_path),
-            } else .enabled_with_auto_path;
+                .enabled = try allocator.dupeZ(u8, recovery_path),
+            } else .{ .enabled = auto_recovery_path: {
+                const basename = std.fs.path.basename(rocksdb_output);
+                if (basename.len == 0) {
+                    std.log.err(
+                        \\Cannot automatically generate a recovery path because the specified RocksDB output is a root directory. 
+                        \\Please explicitly provide a recovery path using the `increment-recovery-path` option.
+                        \\
+                        \\
+                    , .{});
+                    return cli.Runner.Error.CliArgInvalidInput;
+                }
+                break :auto_recovery_path try std.fmt.allocPrintSentinel(allocator, "{s}/../{s}.recovery", .{ rocksdb_output, basename }, 0);
+            } };
         errdefer comptime unreachable;
         break :blk .{ .incremental = .{
             .rocksdb_output = rocksdb_output,
@@ -254,7 +289,11 @@ pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator)
         } };
     } else blk: {
         const rocksdb_output: @FieldType(@FieldType(ModeConf, "full"), "rocksdb_output") =
-            if (args.rocksdb_output) |rocksdb_output| .{ .manual = try allocator.dupeZ(u8, rocksdb_output) } else .auto;
+            if (args.rocksdb_output) |rocksdb_output| .{ .manual = rocksdb_output: {
+                const unsentineled = try std.fs.path.resolve(allocator, &[_][]const u8{rocksdb_output});
+                defer allocator.free(unsentineled);
+                break :rocksdb_output try allocator.dupeZ(u8, unsentineled);
+            } } else .auto;
         errdefer comptime unreachable;
         break :blk .{ .full = .{
             .rocksdb_output = rocksdb_output,

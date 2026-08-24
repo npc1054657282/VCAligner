@@ -331,47 +331,29 @@ pub const RocksdbPath = union(enum) {
     }
 };
 
-pub const RecoveryPathConf = union(enum) {
-    disabled: void,
-    borrowed_from_config: [:0]const u8,
-    owned: [:0]u8,
-    pub fn init(
-        noalias runconf: *const PrepRunner,
-        allocator: std.mem.Allocator,
-        rocksdb_path: [:0]const u8,
-    ) !RecoveryPathConf {
-        return switch (runconf.mode_conf) {
-            .full => .disabled,
-            .incremental => |inc_conf| switch (inc_conf.recovery) {
-                .disabled => .disabled,
-                .enabled_with_custom_path => |path| .{ .borrowed_from_config = path },
-                .enabled_with_auto_path => blk: {
-                    var recovery_path_writer: std.Io.Writer.Allocating = .init(allocator);
-                    errdefer recovery_path_writer.deinit();
-                    // TODO: 不完善：如果rocksdb path以"/"结尾或者不以"/"结尾，生成结果不一样，会令人困惑。
-                    try recovery_path_writer.writer.print("{s}.recovery", .{rocksdb_path});
-                    break :blk .{ .owned = try recovery_path_writer.toOwnedSliceSentinel(0) };
-                },
-            },
-        };
+fn testResolvePosix(paths: []const []const u8, expected: []const u8) !void {
+    const actual = try std.fs.path.resolvePosix(std.testing.allocator, paths);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+fn testBasename(input: []const u8, expected_output: []const u8) !void {
+    try std.testing.expectEqualSlices(u8, expected_output, std.fs.path.basename(input));
+}
+fn testDirnamePosix(input: []const u8, expected_output: ?[]const u8) !void {
+    if (std.fs.path.dirnamePosix(input)) |output| {
+        try std.testing.expect(std.mem.eql(u8, output, expected_output.?));
+    } else {
+        try std.testing.expect(expected_output == null);
     }
-    pub fn deinit(self: RecoveryPathConf, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .disabled, .borrowed_from_config => {},
-            .owned => |path| allocator.free(path),
-        }
-    }
-    pub fn view(self: RecoveryPathConf) RecoveryPathConf.View {
-        return switch (self) {
-            .disabled => .{ .disabled = {} },
-            .borrowed_from_config, .owned => |path| .{ .enabled = path },
-        };
-    }
-    pub const View = union(enum) {
-        disabled: void,
-        enabled: [:0]const u8,
-    };
-};
+}
+test testResolvePosix {
+    try testResolvePosix(&[_][]const u8{""}, ".");
+    try testResolvePosix(&[_][]const u8{".."}, "..");
+    try testResolvePosix(&[_][]const u8{ "..", "../b" }, "../../b");
+    try testBasename("../..", "..");
+    try testDirnamePosix("../..", "..");
+    try testDirnamePosix("a/.", "a");
+}
 
 pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     // TODO: 此重构版本，主线程为写入线程，解析主线程另开线程。
@@ -380,7 +362,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     defer wbr_gpa_instance.instance.deinit();
     var path_registry: writer_bound_registries.PathRegistry = .{ .map = .empty, .key_arena = .init(wbr_gpa_instance.allocator()) };
     defer path_registry.deinit(wbr_gpa_instance.allocator());
-    const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = writer_and_parser: {
+    const rocksdb_output: RocksdbPath, var storage_state: storage.State = writer_and_parser: {
         var commit_registry: CommitRegistryWithManagedGpaInstance = .{ .map = .empty, .gpa_instance = .init() };
         // NOTE：commit_registry的生存期：如果是立即写入子列族，一般在解析线程那里就可以释放了。如果是仅延迟写入子列族，那么写入线程的延迟写入阶段结束可以释放。
         // TODO: 目前的解构时机是出于简单考虑，未来考虑精细设计。
@@ -390,7 +372,7 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         var channel: Channel = .{ .mpsc_queue_ref = queue };
         // 将libgit2初始化本身作为一种资源。本块会初始化这个资源，最终将它的所有权移交给main parser线程来shutdown。
         // 在main parser线程创建前，依赖于libgit2获取的其他资源一并由这个块返回。
-        const main_parser: std.Thread, const rocksdb_output: RocksdbPath, const recovery_path_conf: RecoveryPathConf, var storage_state: storage.State = libgit2_handoff: {
+        const main_parser: std.Thread, const rocksdb_output: RocksdbPath, var storage_state: storage.State = libgit2_handoff: {
             var git_error_code = c.git_libgit2_init();
             if (git_error_code < 0) try c_helper.gitErrorCodeToZigError(git_error_code, last_diag);
             std.debug.assert(git_error_code == 1);
@@ -417,7 +399,6 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         };
         errdefer {
             storage_state.deinit();
-            recovery_path_conf.deinit(gpa.allocator);
             rocksdb_output.deinit(gpa.allocator);
         }
         // 即使后续的mpsc协调中，能保障此线程的生产者生产完毕本函数才退出，
@@ -437,13 +418,11 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
         try @import("write.zig").writeCumulative(.fromFullStorage(&storage_state.valid), &channel, wbr, runconf.writebatch_watermark, last_diag);
         break :writer_and_parser .{
             rocksdb_output,
-            recovery_path_conf,
             storage_state,
         };
     };
     defer {
         storage_state.deinit();
-        recovery_path_conf.deinit(gpa.allocator);
         rocksdb_output.deinit(gpa.allocator);
     }
     // 延迟compaction模式下的compaction.
@@ -479,9 +458,9 @@ pub fn preprocess(noalias runconf: *const PrepRunner, gpa: vcaligner.gpa.Concurr
     }
 
     // 成功退出前，移除recovery。
-    switch (recovery_path_conf) {
+    switch (runconf.mode_conf.recoveryPathConfView()) {
         .disabled => {},
-        .borrowed_from_config, .owned => |path| try std.fs.cwd().deleteTree(path),
+        .enabled => |path| try std.fs.cwd().deleteTree(path),
     }
 }
 
@@ -491,7 +470,7 @@ fn provisionMainParser(
     channel: *Channel,
     gpa: vcaligner.gpa.Concurrent,
     last_diag: *diag.Diagnostic,
-) !struct { std.Thread, RocksdbPath, RecoveryPathConf, storage.State } {
+) !struct { std.Thread, RocksdbPath, storage.State } {
     const repo: *c.git_repository = blk: {
         var repo: ?*c.git_repository = undefined;
         const git_error_code = c.git_repository_open_bare(&repo, runconf.bare_repo_path.ptr);
@@ -505,8 +484,6 @@ fn provisionMainParser(
     _ = oidtype;
     const rocksdb_output: RocksdbPath = try .init(runconf, repo, gpa.allocator, last_diag);
     errdefer rocksdb_output.deinit(gpa.allocator);
-    const recovery_path_conf: RecoveryPathConf = try .init(runconf, gpa.allocator, rocksdb_output.get());
-    errdefer recovery_path_conf.deinit(gpa.allocator);
     var storage_state: storage.State = undefined;
     try storage_state.init(
         runconf.mode_conf,
@@ -515,7 +492,7 @@ fn provisionMainParser(
         runconf.compression,
         runconf.cf_max_write_buffer_number,
         rocksdb_output.get(),
-        recovery_path_conf.view(),
+        runconf.mode_conf.recoveryPathConfView(),
         last_diag,
     );
     errdefer storage_state.deinit();
@@ -530,7 +507,7 @@ fn provisionMainParser(
         commit_registry,
     });
     errdefer comptime unreachable;
-    return .{ main_parser, rocksdb_output, recovery_path_conf, storage_state };
+    return .{ main_parser, rocksdb_output, storage_state };
 }
 
 /// 将git url转换为repo-id。repo-id会将git url的协议信息剥去，因为同一仓库往往支持不同协议的git url。
