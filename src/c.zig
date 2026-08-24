@@ -54,11 +54,15 @@ pub const Libgit2Error = error{
 
 // 我能想到的一种可能的处理方法是：编译时遍历`Libgit2Error`的错误名，然后用`@field`访问其声明，分别与`git_error_code`进行比较。
 // 但是，即使遍历得到了匹配的错误名，但依旧没有任何办法直接得到错误。因此，目前手工制作该表是唯一解。
-pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic) Libgit2Error!void {
+// TODO: 重构请求：没有必要把`Libgit2Error`设计为一个错误集，既然它们的处理方式相同，那么只需要设计为报告单个`Libgit2Error`错误即可。
+// 具体的错误与分析逻辑到了diag结构里使用标签联合体分析。
+pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic) (Libgit2Error || error{UnableToConstructDiagnostic})!void {
     return switch (git_error_code) {
         c.GIT_OK => return,
         c.GIT_ERROR => blk: {
-            last_diag.* = .{ .GIT_ERROR = DiagnosticGIT_ERROR.init() };
+            last_diag.* = .{ .GIT_ERROR = DiagnosticGIT_ERROR.init(last_diag.getAllocator()) catch |e| {
+                return last_diag.unableToConstructDiagnostic(e);
+            } };
             break :blk Libgit2Error.GIT_ERROR;
         },
         c.GIT_ENOTFOUND => Libgit2Error.GIT_ENOTFOUND,
@@ -102,12 +106,20 @@ pub fn gitErrorCodeToZigError(git_error_code: c_int, last_diag: *diag.Diagnostic
 }
 
 pub const DiagnosticGIT_ERROR = struct {
-    last_error: *const c.git_error,
-    pub fn init() DiagnosticGIT_ERROR {
-        return .{ .last_error = c.git_error_last() };
+    message: [:0]u8,
+    klass: c_int,
+    pub fn init(allocator: std.mem.Allocator) !DiagnosticGIT_ERROR {
+        // TODO: last_error理应是线程安全的，但是可能需要增加一个检测libgit2特性确定其是否支持线程安全的断言。
+        const last_error: *const c.git_error = c.git_error_last();
+        const message: [:0]u8 = try std.fmt.allocPrintSentinel(allocator, "{s}", .{last_error.message}, 0);
+        errdefer comptime unreachable;
+        return .{
+            .klass = last_error.klass,
+            .message = message,
+        };
     }
     pub fn log(self: DiagnosticGIT_ERROR) void {
-        std.log.err("libgit2: {s}\n", .{self.last_error.message});
+        std.log.err("libgit2: {s}\n", .{self.message});
     }
 };
 
@@ -117,3 +129,34 @@ pub const DiagnosticUnknownCError = struct {
         std.log.err("unknown c: {d}\n", .{self.code});
     }
 };
+
+pub const DiagnosticRocksdbError = struct {
+    message: [:0]u8,
+    src: std.builtin.SourceLocation,
+    pub fn init(ecstr: [*:0]u8, src: std.builtin.SourceLocation, allocator: std.mem.Allocator) !DiagnosticRocksdbError {
+        const message: [:0]u8 = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ecstr}, 0);
+        errdefer comptime unreachable;
+        return .{ .message = message, .src = src };
+    }
+    pub fn log(self: DiagnosticRocksdbError) void {
+        std.log.err("rocksdb: {s}\n{s}:{s}:{s}:{d}:{d}", .{
+            self.message,
+            self.src.module,
+            self.src.file,
+            self.src.fn_name,
+            self.src.line,
+            self.src.column,
+        });
+    }
+};
+
+pub fn checkRocksdbErr(err_cstr: ?[*:0]u8, src: std.builtin.SourceLocation, last_diag: *diag.Diagnostic) error{ RocksdbError, UnableToConstructDiagnostic }!void {
+    if (err_cstr) |ecstr| {
+        defer c.rocksdb_free(ecstr);
+        last_diag.* = .{ .RocksdbError = DiagnosticRocksdbError.init(ecstr, src, last_diag.getAllocator()) catch |e| {
+            return last_diag.unableToConstructDiagnostic(e);
+        } };
+        return error.RocksdbError;
+    }
+    return;
+}

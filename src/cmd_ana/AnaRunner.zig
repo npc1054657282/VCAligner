@@ -104,15 +104,15 @@ pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("ana"))
     .arg(zargs.Arg.optArg("point_lookup_cache_mb", u64).long("point-lookup-cache-mb").default(512))
     .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"));
 
-pub fn run(self: *AnaRunner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
-    try @import("analysis.zig").analysis(self, allocator, last_diag);
+pub fn run(self: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+    try @import("analysis.zig").analysis(self, gpa, last_diag);
     return;
 }
 pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
     const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
     return .{
         .ana = .{
-            .global = CliRunner.Global.initGlobal(args),
+            .global = .init(args),
             .rocksdb_path = try allocator.dupeZ(u8, args.rocksdb_path),
             .release_path = try allocator.dupeZ(u8, args.release_path),
             .report_output = if (args.report_output) |report_output| .{

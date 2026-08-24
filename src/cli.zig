@@ -1,9 +1,11 @@
 const std = @import("std");
 const zargs = @import("zargs");
-const diag = @import("diagnostics.zig");
+const vcaligner = @import("vcaligner");
+const diag = vcaligner.diag;
 pub const Runner = union(enum) {
     prep: @import("cmd_prep/PrepRunner.zig"),
     ana: @import("cmd_ana/AnaRunner.zig"),
+    pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
         var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
             .about("git version commit aligner")
@@ -12,7 +14,7 @@ pub const Runner = union(enum) {
         for (@typeInfo(Runner).@"union".fields) |field| {
             building_cmd = building_cmd.sub(field.type.cmd);
         }
-        break :blk building_cmd;
+        break :blk building_cmd.config(cmd_config);
     };
     pub const Global = struct {
         verbose: bool,
@@ -20,7 +22,7 @@ pub const Runner = union(enum) {
         pub fn sharedArgs(sub_cmd: zargs.Command) zargs.Command {
             return sub_cmd.arg(zargs.Arg.opt("verbose", bool).short('v').long("verbose"));
         }
-        pub fn initGlobal(args: anytype) Global {
+        pub fn init(args: anytype) Global {
             comptime std.debug.assert(@hasField(@TypeOf(args), "verbose"));
             return .{
                 .verbose = args.verbose,
@@ -42,9 +44,9 @@ pub const Runner = union(enum) {
         }
     }
     /// NOTE: allocator必须线程安全
-    pub fn run(self: *Runner, allocator: std.mem.Allocator, last_diag: *diag.Diagnostic) !void {
+    pub fn run(self: *Runner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
         switch (self.*) {
-            inline else => |*case| return case.run(allocator, last_diag),
+            inline else => |*case| return case.run(gpa, last_diag),
         }
     }
     pub const Error = error{
@@ -63,4 +65,27 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Runner {
     var runner: Runner = undefined;
     runner = try Runner.initFromArgs(args, allocator);
     return runner;
+}
+
+const ztype = @import("ztype");
+pub const CommandConfig = @typeInfo(@TypeOf(zargs.Command.config)).@"fn".params[1].type.?;
+pub fn helpNewLine(comptime cmd_conf: CommandConfig) ztype.LiteralString {
+    return comptime ret: {
+        var ret: [:0]const u8 =
+            \\
+            \\
+        ;
+        for (0..cmd_conf.format.left_max + cmd_conf.format.indent) |_| ret = ret ++ " ";
+        break :ret ret;
+    };
+}
+pub fn helpLastLine(comptime cmd_conf: CommandConfig) ztype.LiteralString {
+    return comptime ret: {
+        var ret: [:0]const u8 =
+            \\
+            \\
+        ;
+        for (0..cmd_conf.format.left_max + cmd_conf.format.indent - 1) |_| ret = ret ++ " ";
+        break :ret ret;
+    };
 }

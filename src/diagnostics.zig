@@ -36,11 +36,15 @@ pub const Diagnostics = struct {
 pub const Diagnostic = union {
     GIT_ERROR: c_helper.DiagnosticGIT_ERROR,
     UnknownCError: c_helper.DiagnosticUnknownCError,
+    RocksdbError: c_helper.DiagnosticRocksdbError,
+    PiFromPrBc2PiNotFoundInPi2P: @import("cmd_prep/preprocess.zig").DiagnosticPiFromPrBc2PiNotFoundInPi2P,
     pub fn enterStack(last_diagnostic: *@This(), last_error: anyerror) !void {
-        var diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+        var diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         if (diagnostics.double_error != null) {
             return last_error;
         }
+        // TODO: ArrayList本身不适合用arena分配器而适合gpa。考虑改为使用arena的child allocator而非arena的allocator本身。
+        // 当然此诊断抽象本身拟移除。
         diagnostics.error_stack.append(diagnostics.arena.allocator(), .{ .code = last_error, .diagnostic = last_diagnostic.* }) catch |double_error| {
             diagnostics.double_error = double_error;
             return last_error;
@@ -48,11 +52,11 @@ pub const Diagnostic = union {
         last_diagnostic.* = undefined;
     }
     pub fn getAllocator(last_diagnostic: *@This()) std.mem.Allocator {
-        const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+        const diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         return diagnostics.arena.allocator();
     }
-    pub fn unableToConstructDiagnostic(last_diagnostic: *@This(), err: anyerror) !void {
-        const diagnostics: *Diagnostics = @fieldParentPtr("last_diagnostic", last_diagnostic);
+    pub fn unableToConstructDiagnostic(last_diagnostic: *@This(), err: anyerror) error{UnableToConstructDiagnostic}!void {
+        const diagnostics: *Diagnostics = @alignCast(@fieldParentPtr("last_diagnostic", last_diagnostic));
         diagnostics.double_error = err;
         return error.UnableToConstructDiagnostic;
     }
