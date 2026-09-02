@@ -2,17 +2,36 @@ const std = @import("std");
 const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
+
+// 解耦：不是所有的Runner都附带子命令定义。
+const runner_types_with_sub_cmd = [_]type{
+    @FieldType(Runner, "prep"),
+    @FieldType(Runner, "ana_topology"),
+};
+
+const sub_cmd_name_to_runner_type_map = blk: {
+    const entries = entries: {
+        var arr: [runner_types_with_sub_cmd.len]struct { []const u8, type } = undefined;
+        for (runner_types_with_sub_cmd, 0..) |T, i| {
+            const key = @field(T, "sub_cmd_name");
+            arr[i] = .{ key, T };
+        }
+        break :entries arr;
+    };
+    break :blk std.StaticStringMap(type).initComptime(&entries);
+};
 pub const Runner = union(enum) {
     prep: @import("cmd_prep/PrepRunner.zig"),
-    ana: @import("cmd_ana/AnaRunner.zig"),
+    ana_topology: @import("cmd_ana/AnaTopologyRunner.zig"),
+    ana_strict: @import("cmd_ana/AnaStrictRunner.zig"),
     pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
         var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
             .about("git version commit aligner")
-            .version("0.1.0-casestudy")
+            .version("0.2.0")
             .author("npc1054657282");
-        for (@typeInfo(Runner).@"union".fields) |field| {
-            building_cmd = building_cmd.sub(field.type.cmd);
+        for (sub_cmd_name_to_runner_type_map.values()) |SubCmdRunner| {
+            building_cmd = building_cmd.sub(SubCmdRunner.cmd);
         }
         break :blk building_cmd.config(cmd_config);
     };
@@ -34,7 +53,7 @@ pub const Runner = union(enum) {
         // 因此这块全局参数的处理逻辑不实现。
         switch (args.sub) {
             inline else => |subarg, subtag| {
-                return try @FieldType(Runner, @tagName(subtag)).initFromArgs(subarg, allocator);
+                return try sub_cmd_name_to_runner_type_map.get(@tagName(subtag)).?.initFromArgs(subarg, allocator);
             },
         }
     }
