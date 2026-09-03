@@ -96,7 +96,7 @@ candidate_parser: struct {
     }
 } = undefined,
 
-const cmd = @import("AnaTopologyRunner.zig").cmd;
+const cmd = @import("ana_runner_dispatch.zig").cmd;
 
 pub fn run(self: *AnaStrictRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     try @import("analysis_strict.zig").analysis(self, gpa, last_diag);
