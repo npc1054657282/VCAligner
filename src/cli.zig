@@ -3,14 +3,17 @@ const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 
+pub const PrepRunner = @import("cmd_prep/PrepRunner.zig");
+pub const ana_runner = @import("cmd_ana/ana_runner.zig");
+
 // 解耦：不是所有的Runner都附带子命令定义，而是引入runner dispatcher的概念。
 // 无需分发的dispatcher和其唯一的Runner是一体的，而需要分发的则加入了独立层。
 const sub_cmd_runner_dispatchers = [_]type{
-    @FieldType(Runner, "prep"),
-    @import("cmd_ana/ana_runner_dispatch.zig"),
+    PrepRunner,
+    ana_runner,
 };
 
-const sub_cmd_name_to_runner_dispatchers_map: std.StaticStringMap(type) = blk: {
+const sub_cmd_name_to_runner_dispatcher_map: std.StaticStringMap(type) = blk: {
     const entries = entries: {
         var arr: [sub_cmd_runner_dispatchers.len]struct { []const u8, type } = undefined;
         for (sub_cmd_runner_dispatchers, 0..) |T, i| {
@@ -22,9 +25,9 @@ const sub_cmd_name_to_runner_dispatchers_map: std.StaticStringMap(type) = blk: {
     break :blk .initComptime(&entries);
 };
 pub const Runner = union(enum) {
-    prep: @import("cmd_prep/PrepRunner.zig"),
-    ana_topology: @import("cmd_ana/AnaTopologyRunner.zig"),
-    ana_strict: @import("cmd_ana/AnaStrictRunner.zig"),
+    prep: PrepRunner,
+    ana_topology: ana_runner.Topology,
+    ana_strict: ana_runner.Strict,
     pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
         var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
@@ -54,7 +57,7 @@ pub const Runner = union(enum) {
         // 因此这块全局参数的处理逻辑不实现。
         switch (args.sub) {
             inline else => |subarg, subtag| {
-                return try sub_cmd_name_to_runner_dispatchers_map.get(@tagName(subtag)).?.initFromArgs(subarg, allocator);
+                return try sub_cmd_name_to_runner_dispatcher_map.get(@tagName(subtag)).?.initFromArgs(subarg, allocator);
             },
         }
     }

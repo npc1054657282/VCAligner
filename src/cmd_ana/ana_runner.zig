@@ -71,7 +71,10 @@ pub const cmd = blk: {
 
 pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
     return switch (args.strategy) {
-        .strict => @import("AnaStrictRunner.zig").initFromArgs(args, allocator),
-        .topology => @import("AnaTopologyRunner.zig").initFromArgs(args, allocator),
+        .strict => Strict.initFromArgs(args, allocator),
+        .topology => Topology.initFromArgs(args, allocator),
     };
 }
+
+pub const Strict = @import("strict/AnaRunner.zig");
+pub const Topology = @import("topology/AnaRunner.zig");

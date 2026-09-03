@@ -5,7 +5,7 @@ const c = vcaligner.c_helper.c;
 const diag = vcaligner.diag;
 const PathSeq = vcaligner.rocksdb_custom.PathSeq;
 const CliRunner = vcaligner.cli.Runner;
-const AnaStrictRunner = @This();
+const AnaRunner = @This();
 
 global: CliRunner.Global,
 rocksdb_path: [:0]u8,
@@ -96,10 +96,10 @@ candidate_parser: struct {
     }
 } = undefined,
 
-const cmd = @import("ana_runner_dispatch.zig").cmd;
+const cmd = vcaligner.cli.ana_runner.cmd;
 
-pub fn run(self: *AnaStrictRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
-    try @import("analysis_strict.zig").analysis(self, gpa, last_diag);
+pub fn run(self: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+    try @import("analysis.zig").analysis(self, gpa, last_diag);
     return;
 }
 pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
@@ -118,7 +118,7 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !CliRunner
         },
     };
 }
-pub fn deinit(self: *AnaStrictRunner, allocator: std.mem.Allocator) void {
+pub fn deinit(self: *AnaRunner, allocator: std.mem.Allocator) void {
     allocator.free(self.rocksdb_path);
     self.rocksdb_path = undefined;
     allocator.free(self.release_path);

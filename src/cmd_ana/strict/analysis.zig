@@ -1,7 +1,7 @@
 const std = @import("std");
 const vcaligner = @import("vcaligner");
 const c = vcaligner.c_helper.c;
-const AnaStrictRunner = @import("AnaStrictRunner.zig");
+const AnaRunner = @import("AnaRunner.zig");
 const diag = vcaligner.diag;
 const Pool = vcaligner.Pool;
 const PathSeq = vcaligner.rocksdb_custom.PathSeq;
@@ -12,7 +12,7 @@ const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const Key = vcaligner.rocksdb_custom.Key;
 const CommitRange = vcaligner.commit_range.CommitRange;
 
-pub fn analysis(ctx: *AnaStrictRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     const allocator = gpa.allocator;
     _ = last_diag;
     var err_cstr: ?[*:0]u8 = null;
@@ -365,7 +365,7 @@ pub fn analysis(ctx: *AnaStrictRunner, gpa: vcaligner.gpa.Concurrent, last_diag:
     try output_writer.interface.flush();
 }
 
-fn parse_agenda(gctx: *AnaStrictRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
+fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
     const lctx = &gctx.candidate_parser.agenda_parsers.items[agenda_index];
     var err_cstr: ?[*:0]u8 = null;
     const path_from_cwd: [:0]u8, const path: [:0]u8 = blk: {

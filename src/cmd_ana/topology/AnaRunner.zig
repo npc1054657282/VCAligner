@@ -3,7 +3,7 @@ const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 const cli = vcaligner.cli;
-const AnaTopologyRunner = @This();
+const AnaRunner = @This();
 
 global: cli.Runner.Global,
 rocksdb_path: [:0]u8,
@@ -15,10 +15,10 @@ report_output: union(enum) {
 point_lookup_cache_mb: u64,
 n_jobs: usize,
 
-const cmd = @import("ana_runner_dispatch.zig").cmd;
+const cmd = cli.ana_runner.cmd;
 
-pub fn run(noalias self: *const AnaTopologyRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
-    try @import("analysis_topology.zig").analysis(self, gpa, last_diag);
+pub fn run(noalias self: *const AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
+    try @import("analysis.zig").analysis(self, gpa, last_diag);
     return;
 }
 
@@ -37,7 +37,7 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
         },
     };
 }
-pub fn deinit(noalias self: *const AnaTopologyRunner, allocator: std.mem.Allocator) void {
+pub fn deinit(noalias self: *const AnaRunner, allocator: std.mem.Allocator) void {
     allocator.free(self.rocksdb_path);
     allocator.free(self.release_path);
     switch (self.report_output) {
