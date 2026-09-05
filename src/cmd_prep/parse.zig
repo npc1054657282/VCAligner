@@ -361,7 +361,7 @@ fn index_builder_cb(id: [*c]const c.git_oid, payload: ?*anyopaque) callconv(.c) 
                         to_flush.inited.gpa_instance.deinit();
                         to_flush.* = .uninited;
                     }
-                    to_flush.inited.batch = std.ArrayList(CommitMeta).initCapacity(to_flush.inited.gpa_instance.gpao().allocator, flush_threshold: {
+                    to_flush.inited.batch = std.ArrayList(CommitMeta).initCapacity(to_flush.inited.gpa_instance.gpae().allocator, flush_threshold: {
                         // XXX: 当前设计为硬编码。或改为用户配置。
                         break :flush_threshold 512;
                     }) catch |err| break :main_logic_customized_error err;
@@ -509,7 +509,7 @@ fn parseTree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStat
                                 lctx.to_flush.inited.gpa_instance.deinit();
                                 lctx.to_flush = .uninited;
                             }
-                            to_flush_arena = .init(lctx.to_flush.inited.gpa_instance.gpao().allocator);
+                            to_flush_arena = .init(lctx.to_flush.inited.gpa_instance.gpae().allocator);
                             errdefer to_flush_arena.deinit();
                             lctx.to_flush.inited.pairs = try .initCapacity(to_flush_arena.allocator(), flush_threshold: {
                                 // XXX: 当前设计为硬编码。或改为用户配置。
@@ -517,7 +517,7 @@ fn parseTree(tree: *const c.git_tree, repo: *c.git_repository, lctx: *ParserStat
                             });
                             errdefer comptime unreachable;
                         },
-                        .inited => |*parsed| to_flush_arena = parsed.arena_state.promote(parsed.gpa_instance.gpao().allocator),
+                        .inited => |*parsed| to_flush_arena = parsed.arena_state.promote(parsed.gpa_instance.gpae().allocator),
                     }
                     defer lctx.to_flush.inited.arena_state = to_flush_arena.state;
                     // 不同之处在于此full path将移交writer，应使用to flush的arena且不会再释放。

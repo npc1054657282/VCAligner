@@ -25,7 +25,7 @@ pub const runtime_safety = switch (@import("builtin").mode) {
 pub var crash_dump: CrashDump = undefined;
 
 /// gpa是本程序主要使用的分配器类型，此类分配器的每次分配都必须对应一次释放。
-/// 本程序进一步使用`Concurrent`与`Owned`标注此类分配器的两种可能需求形态。
+/// 本程序进一步使用`Concurrent`与`Exclusive`标注此类分配器的两种可能需求形态。
 pub const gpa = struct {
     /// `gpa.Concurrent`可能并发地在多个线程上同时分配或释放。因此它必须是线程安全的。
     /// 如果它的实现缺少线程本地缓存优化，在多个线程分别包含它的一个实例有助于以锁分片的形式进一步减少竞争。
@@ -56,14 +56,15 @@ pub const gpa = struct {
             };
         }
     };
-    /// `gpa.Owned`描述一种所有权独占的分配契约，其一个实例生命周期内服务一个特定的对象（数据结构）。
-    /// 对象可能跨线程进行分配或释放，但这些行为在物理时间上不会同时发生。因此`gpa.Owned`允许非线程安全。
-    /// `gpa.Owned.Instance`必须允许通过拷贝的方式转移所有权（即不存在自引用）。
-    /// Instance必须包含`init() Self`、`deinit(self: *Self) void`、`gpao(self: *Self) Owned`三种方法。
-    pub const Owned = struct {
+    /// `gpa.Exclusive`描述一种所有权独占的分配契约，其一个实例生命周期内服务一个或一批生命周期独特的特定对象（数据结构）。
+    /// 这些对象可能跨线程进行分配或释放，但这些行为在物理时间上不会同时发生。因此`gpa.Exclusive`允许非线程安全。
+    /// `gpa.Exclusive.Instance`必须允许通过拷贝的方式转移所有权（即不存在自引用）。
+    /// Instance必须包含`init() Self`、`deinit(self: *Self) void`、`gpae(self: *Self) Exclusive`三种方法。
+    pub const Exclusive = struct {
         allocator: std.mem.Allocator,
-        // XXX: 一个`Owned`可能实现是将本地线程缓存改为块缓存的SmpAllocator，或者一个精简掉泄露分析功能的线程不安全的DebugAllocator。
-        // 但是实际上本程序对它的使用更多是出于逻辑上的，因此直接套用Concurrent的空实例即可。
+        // XXX: 一个`Exclusive`的理想实现是一个非线程安全的Chunked Free-list Allocator，各个Chunked内部是TLSF。
+        // zig标准库目前没有提供如此抽象的分配器。
+        // 因此，实际上本程序对它的使用当前更多是出于逻辑上的，直接套用Concurrent的空实例即可。
         pub const Instance = InstanceWrappedFrom(CAllocatorInstance);
         pub fn InstanceWrappedFrom(comptime AllocatorInstance: type) type {
             return struct {
@@ -74,8 +75,8 @@ pub const gpa = struct {
                 pub fn deinit(self: *@This()) void {
                     return self.impl.deinit();
                 }
-                pub fn gpao(self: *@This()) Owned {
-                    return self.impl.gpao();
+                pub fn gpae(self: *@This()) Exclusive {
+                    return self.impl.gpae();
                 }
             };
         }
@@ -93,7 +94,7 @@ const CAllocatorInstance = struct {
         _ = self;
         return .{ .allocator = std.heap.c_allocator };
     }
-    pub fn gpao(self: *CAllocatorInstance) gpa.Owned {
+    pub fn gpae(self: *CAllocatorInstance) gpa.Exclusive {
         _ = self;
         return .{ .allocator = std.heap.c_allocator };
     }
@@ -111,7 +112,7 @@ const DebugAllocatorInstance = struct {
     pub fn gpac(self: *DebugAllocatorInstance) gpa.Concurrent {
         return .{ .allocator = self.debug_allocator_instance.allocator() };
     }
-    pub fn gpao(self: *DebugAllocatorInstance) gpa.Owned {
+    pub fn gpae(self: *DebugAllocatorInstance) gpa.Exclusive {
         return .{ .allocator = self.debug_allocator_instance.allocator() };
     }
 };
@@ -127,16 +128,11 @@ const SmpAllocatorInstance = struct {
         _ = self;
         return .{ .allocator = std.heap.smp_allocator };
     }
-    pub fn gpao(self: *SmpAllocatorInstance) gpa.Owned {
+    pub fn gpae(self: *SmpAllocatorInstance) gpa.Exclusive {
         _ = self;
         return .{ .allocator = std.heap.smp_allocator };
     }
 };
-
-pub fn getAllocator() std.mem.Allocator {
-    // if (runtime_safety) return gpa.allocator();
-    return std.heap.c_allocator;
-}
 
 pub fn main() !void {
     var gpa_instance: gpa.Concurrent.Instance = .init();
