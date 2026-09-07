@@ -3,6 +3,7 @@ const zargs = @import("zargs");
 const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 const cli = vcaligner.cli;
+const c = vcaligner.c_helper.c;
 
 const cmd_config: cli.CommandConfig = cli.Runner.cmd_config;
 pub const sub_cmd_name = "ana";
@@ -78,3 +79,12 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
 
 pub const Strict = @import("strict/AnaRunner.zig");
 pub const Topology = @import("topology/AnaRunner.zig");
+
+// 空文件的git blob sha1哈希总是一个确定值。
+pub const empty_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 } };
+
+test empty_git_blob_sha1_hash {
+    var hasher: std.crypto.hash.Sha1 = .init(.{});
+    hasher.update("blob 0\x00");
+    try std.testing.expectEqual(empty_git_blob_sha1_hash.id, hasher.finalResult());
+}

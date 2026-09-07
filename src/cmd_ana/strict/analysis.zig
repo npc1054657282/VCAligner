@@ -425,7 +425,7 @@ fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.All
             switch (maybe_blob_hash) {
                 .file_empty => {
                     lctx.is_empty = .empty;
-                    break :blk empty_git_blob_sha1_hash;
+                    break :blk vcaligner.cli.ana_runner.empty_git_blob_sha1_hash;
                 },
                 .file_not_empty => |blob_hash| {
                     lctx.is_empty = .not_empty;
@@ -619,15 +619,6 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !union(enum
         },
     }
     return .{ .file_not_empty = .{ .id = hasher.finalResult() } };
-}
-
-// 空文件的git blob sha1哈希总是一个确定值。
-const empty_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 } };
-
-test empty_git_blob_sha1_hash {
-    var hasher: std.crypto.hash.Sha1 = .init(.{});
-    hasher.update("blob 0\x00");
-    try std.testing.expectEqual(empty_git_blob_sha1_hash.id, hasher.finalResult());
 }
 
 // 第一步：读取pr2pi列族和pi2p列族，获得一个path和pi的有序列表。

@@ -151,7 +151,7 @@ fn gitBlobSha1Hash(
             const file = try dir.openFileZ(path, .{});
             defer file.close();
             const file_size = try file.getEndPos();
-            if (file_size == 0) return empty_git_blob_sha1_hash;
+            if (file_size == 0) return vcaligner.cli.ana_runner.empty_git_blob_sha1_hash;
             const prefix = try std.fmt.allocPrint(allocator, "blob {}\x00", .{file_size});
             defer allocator.free(prefix);
             hasher.update(prefix);
@@ -164,5 +164,3 @@ fn gitBlobSha1Hash(
     }
     return .{ .id = hasher.finalResult() };
 }
-
-const empty_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 } };
