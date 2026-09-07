@@ -49,6 +49,7 @@ pub const mainWorkerManagedGpa = struct {
 };
 
 pub const release_artifact = struct {
+    pub const Kind = enum { file, sym_link };
     pub const Paths = struct {
         arena_state: vcaligner.StArena.State,
         pub const Index = struct {
