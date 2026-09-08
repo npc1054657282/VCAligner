@@ -14,15 +14,15 @@ pub fn collectArtifactsBlob(
     release_path: [:0]const u8,
     gpa: analysis.mainWorkerManagedGpa,
 ) !struct {
-    analysis.release_artifact.Paths,
+    analysis.release_artifact.PathDepot,
     analysis.release_artifact.Node.Depot,
-    analysis.BlobAgendas.Building,
+    analysis.ReleaseArtifactBlobManifest.Building,
 } {
-    var release_artifact_paths_appending: analysis.release_artifact.Paths.PinnedAppending = .init(gpa);
+    var release_artifact_paths_appending: analysis.release_artifact.PathDepot.PinnedAppending = .init(gpa);
     errdefer release_artifact_paths_appending.deinit();
     var node_depot_appending: analysis.release_artifact.Node.Depot.PinnedAppending = .init(gpa);
     errdefer node_depot_appending.deinit();
-    var blob_agendas_building: analysis.BlobAgendas.Building = .{ .list = .empty };
+    var blob_agendas_building: analysis.ReleaseArtifactBlobManifest.Building = .{ .list = .empty };
     errdefer blob_agendas_building.deinit(gpa);
     var release_dir = try std.fs.cwd().openDirZ(release_path, .{ .iterate = true });
     defer release_dir.close();

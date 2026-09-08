@@ -9,11 +9,11 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
     var gpae_instance: mainWorkerManagedGpa.Instance = .{ .instance = .init() };
     const gpae = gpae_instance.gpa();
     // 仅前半部分需要并行解析的部分需要频繁复用pool，此为其生存期。
-    var release_artifact_paths_depot: release_artifact.Paths, var blob_agendas: BlobAgendas = pool_lifetime: {
+    var release_artifact_paths_depot: release_artifact.PathDepot, var blob_agendas: ReleaseArtifactBlobManifest = pool_lifetime: {
         var pool: vcaligner.Pool = undefined;
         try pool.init(.{ .allocator = gpac.allocator, .n_jobs = runconf.n_jobs - 1 });
         defer pool.deinit();
-        var release_artifact_paths_depot: release_artifact.Paths, var blob_agendas: BlobAgendas = collect_artifacts_blob: {
+        var release_artifact_paths_depot: release_artifact.PathDepot, var blob_agendas: ReleaseArtifactBlobManifest = collect_artifacts_blob: {
             const paths_depot, var node_depot, var blob_agendas_building = try @import("collect_artifacts_blob.zig").collectArtifactsBlob(
                 &pool,
                 runconf.release_path,
@@ -23,6 +23,9 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
             defer node_depot.deinit(gpae);
             break :collect_artifacts_blob .{ paths_depot, try blob_agendas_building.toBlobAgendas(gpae, &node_depot) };
         };
+        blob_topology: {
+            break :blob_topology;
+        }
         _ = &release_artifact_paths_depot;
         _ = &blob_agendas;
         break :pool_lifetime .{ release_artifact_paths_depot, blob_agendas };
@@ -50,7 +53,7 @@ pub const mainWorkerManagedGpa = struct {
 
 pub const release_artifact = struct {
     pub const Kind = enum { file, sym_link };
-    pub const Paths = struct {
+    pub const PathDepot = struct {
         arena_state: vcaligner.StArena.State,
         pub const Index = struct {
             path: [:0]const u8,
@@ -63,7 +66,7 @@ pub const release_artifact = struct {
             pub fn deinit(noalias self: *const PinnedAppending) void {
                 return self.arena.deinit();
             }
-            pub fn toUnpinned(noalias self: *const PinnedAppending) Paths {
+            pub fn toUnpinned(noalias self: *const PinnedAppending) PathDepot {
                 return .{ .arena_state = self.arena.state };
             }
             pub fn appendDupeZ(self: *PinnedAppending, path: []const u8) !Index {
@@ -74,10 +77,10 @@ pub const release_artifact = struct {
                 return i.path;
             }
         };
-        pub fn deinit(noalias self: *const Paths, gpa: mainWorkerManagedGpa) void {
+        pub fn deinit(noalias self: *const PathDepot, gpa: mainWorkerManagedGpa) void {
             self.arena_state.promote(gpa.allocator()).deinit();
         }
-        pub fn get(noalias self: *const Paths, i: Index) [:0]const u8 {
+        pub fn get(noalias self: *const PathDepot, i: Index) [:0]const u8 {
             _ = self;
             return i.path;
         }
@@ -85,7 +88,7 @@ pub const release_artifact = struct {
     // XXX: 目前暂未考虑Node的常驻遍历。我的意思是，目前我把release path nodes的转换操作弄到BlobAgenda那边了。
     // 所以这里留了实现空间，如果未来想要Node的常驻遍历，可以在这里再实现一次。
     pub const Node = struct {
-        path_i: Paths.Index,
+        path_i: PathDepot.Index,
         blob_hash: c.git_oid,
         pub const Depot = struct {
             arena_state: vcaligner.StArena.State,
@@ -122,19 +125,19 @@ pub const release_artifact = struct {
     };
 };
 
-pub const BlobAgenda = struct {
-    _: void align(std.atomic.cache_line) = {},
+pub const ReleaseArtifactBlobEntry = struct {
     blob_hash: c.git_oid,
-    release_artifact_paths_slicer: ReleaseArtifactPaths.Slicer,
-    pub fn deinit(self: *BlobAgenda) void {
-        _ = self;
-    }
+    release_artifact_paths_slicer: ReleaseArtifactBlobManifest.ReleaseArtifactPathIndexesBacking.Slicer,
 };
-pub const BlobAgendas = struct {
-    agendas: []BlobAgenda,
-    release_artifact_paths: ReleaseArtifactPaths,
+pub const ReleaseArtifactBlobManifest = struct {
+    entrys: []ReleaseArtifactBlobEntry,
+    release_artifact_paths: ReleaseArtifactPathIndexesBacking,
+    pub fn deinit(self: *ReleaseArtifactBlobManifest, gpa: mainWorkerManagedGpa) void {
+        gpa.allocator().free(self.entrys);
+        self.release_artifact_paths.deinit(gpa);
+    }
     pub const Building = struct {
-        list: std.ArrayListUnmanaged(ReleaseArtifactPaths.Unit),
+        list: std.ArrayListUnmanaged(ReleaseArtifactPathIndexesBacking.Unit),
         pub fn deinit(self: *Building, gpa: mainWorkerManagedGpa) void {
             self.list.deinit(gpa.allocator());
         }
@@ -145,16 +148,16 @@ pub const BlobAgendas = struct {
             self: *Building,
             gpa: mainWorkerManagedGpa,
             node_depot: *const release_artifact.Node.Depot,
-        ) !BlobAgendas {
+        ) !ReleaseArtifactBlobManifest {
             const SortContext = struct {
                 node_depot: *const release_artifact.Node.Depot,
-                pub fn lessThan(context: @This(), a: ReleaseArtifactPaths.Unit, b: ReleaseArtifactPaths.Unit) bool {
+                pub fn lessThan(context: @This(), a: ReleaseArtifactPathIndexesBacking.Unit, b: ReleaseArtifactPathIndexesBacking.Unit) bool {
                     return c.git_oid_cmp(&context.node_depot.get(a.ni).blob_hash, &context.node_depot.get(b.ni).blob_hash) < 0;
                 }
             };
-            std.sort.pdq(ReleaseArtifactPaths.Unit, self.list.items, @as(SortContext, .{ .node_depot = node_depot }), SortContext.lessThan);
+            std.sort.pdq(ReleaseArtifactPathIndexesBacking.Unit, self.list.items, @as(SortContext, .{ .node_depot = node_depot }), SortContext.lessThan);
             const agendas = blk: {
-                var agenda_list: std.ArrayListUnmanaged(BlobAgenda) = .empty;
+                var agenda_list: std.ArrayListUnmanaged(ReleaseArtifactBlobEntry) = .empty;
                 errdefer agenda_list.deinit(gpa.allocator());
                 var i: usize = 0;
                 while (i < self.list.items.len) {
@@ -180,38 +183,32 @@ pub const BlobAgendas = struct {
             };
             errdefer gpa.allocator().free(agendas);
             return .{
-                .agendas = agendas,
+                .entrys = agendas,
                 .release_artifact_paths = .{ .backing = try self.list.toOwnedSlice(gpa.allocator()) },
             };
         }
     };
-    pub fn deinit(self: *BlobAgendas, gpa: mainWorkerManagedGpa) void {
-        for (self.agendas) |*agenda| agenda.deinit();
-        gpa.allocator().free(self.agendas);
-        self.release_artifact_paths.deinit(gpa);
-    }
-};
-
-pub const ReleaseArtifactPaths = struct {
-    backing: []Unit,
-    pub const Unit = union {
-        ni: release_artifact.Node.Depot.Index,
-        pi: release_artifact.Paths.Index,
-    };
-    pub fn deinit(self: ReleaseArtifactPaths, gpa: mainWorkerManagedGpa) void {
-        gpa.allocator().free(self.backing);
-    }
-    pub const Slicer = struct {
-        start: usize,
-        len: usize,
-    };
-    pub const PathView = struct {
-        slice: []const Unit,
-        pub fn get(self: PathView, index: usize) release_artifact.Paths.Index {
-            return self.slice[index].pi;
+    pub const ReleaseArtifactPathIndexesBacking = struct {
+        backing: []Unit,
+        pub const Unit = union {
+            ni: release_artifact.Node.Depot.Index,
+            pi: release_artifact.PathDepot.Index,
+        };
+        pub fn deinit(self: ReleaseArtifactPathIndexesBacking, gpa: mainWorkerManagedGpa) void {
+            gpa.allocator().free(self.backing);
+        }
+        pub const Slicer = struct {
+            start: usize,
+            len: usize,
+        };
+        pub const SlicedView = struct {
+            slice: []const Unit,
+            pub fn get(self: SlicedView, index: usize) release_artifact.PathDepot.Index {
+                return self.slice[index].pi;
+            }
+        };
+        pub fn slicedView(self: ReleaseArtifactPathIndexesBacking, slicer: Slicer) SlicedView {
+            return .{ .slice = self.backing[slicer.start..][0..slicer.len] };
         }
     };
-    pub fn slicedPathView(self: ReleaseArtifactPaths, slicer: Slicer) PathView {
-        return .{ .slice = self.backing[slicer.start..][0..slicer.len] };
-    }
 };
