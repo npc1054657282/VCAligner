@@ -124,7 +124,7 @@ pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag
         }
         for (0..ctx.candidate_parser.agenda_parsers.items.len) |i| {
             // 要求传入的分配器是线程安全的。
-            pool.spawnWg(&wait_group, parse_agenda, .{ ctx, i, allocator });
+            pool.spawnWg(&wait_group, parseAgenda, .{ ctx, i, allocator });
         }
         break :parse_agendas;
     }
@@ -365,7 +365,7 @@ pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag
     try output_writer.interface.flush();
 }
 
-fn parse_agenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
+fn parseAgenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allocator) void {
     const lctx = &gctx.candidate_parser.agenda_parsers.items[agenda_index];
     var err_cstr: ?[*:0]u8 = null;
     const path_from_cwd: [:0]u8, const path: [:0]u8 = blk: {

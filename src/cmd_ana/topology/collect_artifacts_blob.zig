@@ -84,7 +84,7 @@ pub fn collectArtifactsBlob(
         const ni = try node_depot_appending.create();
         try blob_agendas_building.append(gpa, ni);
         const node = node_depot_appending.get(ni);
-        node.* = .{ .path_i = pi, .blob_hash = undefined };
+        node.* = .{ .path_key = pi, .blob_hash = undefined };
         pool.spawnWg(&wait_group, subTask, .{
             release_dir,
             release_artifact_paths_appending.get(pi),
