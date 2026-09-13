@@ -15,6 +15,7 @@ pub const sub_enum = @import("sub_enum.zig");
 // 0.16起，zig的Arena采用线程安全模式。我的项目里不会存在任何线程安全需求的Arena，因此我会使用原线程不安全版本。
 // 虽然当前代码仍然基于0.15.2版本，但出于向前兼容考虑，定义`StArena`为线程不安全的Arena，将尽可能替代源代码里标准库的Arena。
 pub const StArena = @import("thread_unsafe_arena.zig").ArenaAllocator;
+pub const ExclusiveRecyclingArena = @import("exclusive_recycling_arena.zig").ExclusiveRecyclingArena;
 
 pub const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,
