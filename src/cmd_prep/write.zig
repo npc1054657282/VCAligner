@@ -81,7 +81,7 @@ pub fn writeCumulative(
                         };
                         c.rocksdb_writebatch_put_cf(
                             wb,
-                            storage_handles.cfs.get(.bpi2ci),
+                            storage_handles.cfs.get(.bpi_ci),
                             @ptrCast(&key),
                             @sizeOf(vcaligner.rocksdb_custom.Key),
                             null,

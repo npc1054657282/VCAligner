@@ -89,7 +89,4 @@ test empty_git_blob_sha1_hash {
     try std.testing.expectEqual(empty_git_blob_sha1_hash.id, hasher.finalResult());
 }
 
-pub const Storage = struct {
-    db: *c.rocksdb_t,
-    cfs: vcaligner.rocksdb_custom.CollumFamily.Handles,
-};
+pub const Storage = @import("Storage.zig");
