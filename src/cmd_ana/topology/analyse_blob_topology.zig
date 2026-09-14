@@ -42,6 +42,7 @@ pub fn analyseBlobTopology(
     blobs_info_out: [*]PerBlobAnalysed,
     pool: *vcaligner.Pool,
     storage: vcaligner.cli.ana_runner.Storage,
+    analyser_ctxs: []BlobAnalyserStation,
 ) void {
     var wait_group = .{};
     defer pool.waitAndWork(&wait_group);
@@ -50,16 +51,21 @@ pub fn analyseBlobTopology(
             blob_hashes_entry[i].blob_hash,
             per_blob_to_be_analysed,
             storage,
+            analyser_ctxs,
         });
     }
 }
 
 pub fn analyseBlobTopologyTask(
+    thrd_id: usize,
     blob_hash: c.git_oid,
     blob_info_out: *PerBlobAnalysed,
     storage: vcaligner.cli.ana_runner.Storage,
+    analyser_ctxs: []BlobAnalyserStation,
 ) void {
+    _ = thrd_id;
     _ = blob_hash;
     _ = blob_info_out;
     _ = storage;
+    _ = analyser_ctxs;
 }
