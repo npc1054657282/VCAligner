@@ -478,7 +478,7 @@ fn parseAgenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allo
                 const ci: CommitSeq = std.mem.bytesAsValue(Key, key_ptr[0..klen]).commit_seq;
                 break :blk ci.toNative();
             };
-            builder.appendAssumeGreaterNative(ts_allocator, ci_native) catch vcaligner.crash_dump.dumpAndCrash(@src());
+            builder.appendNativeAssumeGreater(ts_allocator, ci_native) catch vcaligner.crash_dump.dumpAndCrash(@src());
         }
         // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
         break :commit_collection .{ .parsed = builder.toOwnedCommitRanges(ts_allocator) catch |err| {

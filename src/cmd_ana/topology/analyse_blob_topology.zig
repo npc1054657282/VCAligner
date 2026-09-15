@@ -8,38 +8,46 @@ pub const TopologyShapeKind = enum {
     dynamic_bitset,
 };
 
-pub fn TopologyEntry(comptime kind: TopologyShapeKind) type {
+pub fn Topology(comptime kind: TopologyShapeKind) type {
     return struct {
-        shape: Shape,
-        commits: vcaligner.commit_range.CommitCollection,
-        pub const Shape: type = switch (kind) {
-            .integer_bitset => std.bit_set.IntegerBitSet(@bitSizeOf(usize)),
-            .dynamic_bitset => std.bit_set.DynamicBitSetUnmanaged,
+        pub const Shape = struct {
+            raw: switch (kind) {
+                .integer_bitset => std.bit_set.IntegerBitSet(@bitSizeOf(usize)),
+                .dynamic_bitset => std.bit_set.DynamicBitSetUnmanaged,
+            },
+            pub fn initEmpty(allocator: std.mem.Allocator, bit_length: usize) !Shape {
+                return switch (kind) {
+                    .integer_bitset => .{ .raw = .initEmpty() },
+                    .dynamic_bitset => .{ .raw = try .initEmpty(allocator, bit_length) },
+                };
+            }
+            pub fn deinit(self: *Shape, allocator: std.mem.Allocator) void {
+                switch (kind) {
+                    .integer_bitset => {},
+                    .dynamic_bitset => self.raw.deinit(allocator),
+                }
+            }
+            pub fn clone(self: *const Shape, new_allocator: std.mem.Allocator) !Shape {
+                return switch (kind) {
+                    .integer_bitset => .{ .raw = self.raw },
+                    .dynamic_bitset => .{ .raw = try self.raw.clone(new_allocator) },
+                };
+            }
+            pub fn unsetAll(self: *Shape) void {
+                switch (kind) {
+                    .integer_bitset => self.raw = .initEmpty(),
+                    .dynamic_bitset => self.raw.unsetAll(),
+                }
+            }
         };
-        pub fn shapeClone(shape: *const Shape, allocator: std.mem.Allocator) !Shape {
-            return switch (kind) {
-                .integer_bitset => shape.*,
-                .dynamic_bitset => shape.clone(allocator),
+        pub const Entry = struct {
+            shape: Shape,
+            commits: vcaligner.commit_range.CommitCollection,
+            pub const Building = struct {
+                shape: Shape,
+                commits: vcaligner.commit_range.CommitCollection.Builder,
             };
-        }
-        pub fn shapeInitEmpty(allocator: std.mem.Allocator, bit_length: usize) !Shape {
-            return switch (kind) {
-                .integer_bitset => .initEmpty(),
-                .dynamic_bitset => try std.bit_set.DynamicBitSetUnmanaged.initEmpty(allocator, bit_length),
-            };
-        }
-        pub fn shapeDeinit(shape: *Shape, allocator: std.mem.Allocator) void {
-            switch (kind) {
-                .integer_bitset => {},
-                .dynamic_bitset => shape.deinit(allocator),
-            }
-        }
-        pub fn shapeUnsetAll(shape: *Shape) void {
-            switch (kind) {
-                .integer_bitset => shape.* = .initEmpty(),
-                .dynamic_bitset => shape.unsetAll(),
-            }
-        }
+        };
     };
 }
 
@@ -48,8 +56,8 @@ pub const Topologies = union(enum) {
     none: void,
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
     single: vcaligner.commit_range.CommitCollection.View,
-    integer_bitset: []TopologyEntry(.integer_bitset),
-    dynamic_bitset: []TopologyEntry(.dynamic_bitset),
+    integer_bitset: []Topology(.integer_bitset).Entry,
+    dynamic_bitset: []Topology(.dynamic_bitset).Entry,
 };
 
 pub const PerBlobAnalysed = struct {
@@ -197,7 +205,7 @@ pub fn analyseBlobTopologySub(
                         const ci: vcaligner.rocksdb_custom.CommitSeq = key.commit_seq;
                         break :blk ci.toNative();
                     };
-                    try builder.appendAssumeGreaterNative(result_allocator, ci_native);
+                    try builder.appendNativeAssumeGreater(result_allocator, ci_native);
                 }
                 break :commit_collection try builder.toOwnedCommitRanges(result_allocator);
             };
@@ -232,22 +240,22 @@ fn topologyAnalysis(
     if (commit_collections_per_repo_path.len < @bitSizeOf(usize)) {}
 }
 
-fn sweepLineFast(
+fn sweepLine(
     comptime kind: TopologyShapeKind,
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
     allocator: std.mem.Allocator,
-) []TopologyEntry(kind) {
+) []Topology(kind).Entry {
     const num_repo_path = commit_collections_per_repo_path.len;
     std.debug.assert(num_repo_path > 0);
-    var topologies: std.ArrayListUnmanaged(TopologyEntry(kind)) = .empty;
+    var topologies: std.ArrayListUnmanaged(Topology(kind).Entry) = .empty;
     errdefer topologies.deinit(allocator);
     const cursors = try allocator.alloc(usize, num_repo_path);
     @memset(cursors, 0);
     defer allocator.free(cursors);
-    var active_repo_paths: TopologyEntry(kind).Shape = try TopologyEntry(kind).shapeInitEmpty(allocator, num_repo_path);
-    defer TopologyEntry(kind).shapeDeinit(active_repo_paths, allocator);
-    var repos_triggering_at_min: TopologyEntry(kind).Shape = try TopologyEntry(kind).shapeInitEmpty(allocator, num_repo_path);
-    defer TopologyEntry(kind).shapeDeinit(repos_triggering_at_min, allocator);
+    var active_repo_paths: Topology(kind).Shape = try .initEmpty(allocator, num_repo_path);
+    defer active_repo_paths.deinit(allocator);
+    var repos_triggering_at_min: Topology(kind).Shape = try .initEmpty(allocator, num_repo_path);
+    defer repos_triggering_at_min.deinit(allocator);
     var current_time: vcaligner.rocksdb_custom.CommitSeqNative = 0;
     // 每个range被认为是发送开始事件和结束时间，时间向前跑，不断翻转在range内和不在range内的状态。
     while (true) {
@@ -256,27 +264,27 @@ fn sweepLineFast(
         scan_min_event_time: for (commit_collections_per_repo_path, 0..) |commit_collection, r| {
             if (cursors[r] >= commit_collection.ranges.len) continue :scan_min_event_time;
             const range = commit_collection.ranges[cursors[r]];
-            const event_time = if (active_repo_paths.isSet(r)) range.end + 1 else range.start;
+            const event_time = if (active_repo_paths.raw.isSet(r)) range.end + 1 else range.start;
             reset_old_state: {
                 if (maybe_min_event_time) |min_event_time| {
                     if (event_time > min_event_time) continue :scan_min_event_time;
                     if (event_time == min_event_time) break :reset_old_state;
                 }
                 maybe_min_event_time = event_time;
-                TopologyEntry(kind).shapeUnsetAll(repos_triggering_at_min);
+                repos_triggering_at_min.unsetAll();
             }
-            repos_triggering_at_min.set(r);
+            repos_triggering_at_min.raw.set(r);
         }
         if (maybe_min_event_time) |min_event_time| {
-            if (active_repo_paths.count() > 0 and current_time < min_event_time) {
+            if (active_repo_paths.raw.count() > 0 and current_time < min_event_time) {
                 const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time);
                 try commitToTopology(kind, allocator, &topologies, &active_repo_paths, valid_range);
             }
             // 状态推进
-            var it = repos_triggering_at_min.iterator(.{});
+            var it = repos_triggering_at_min.raw.iterator(.{});
             while (it.next()) |r| {
-                active_repo_paths.toggle(r);
-                if (!active_repo_paths.isSet(r)) {
+                active_repo_paths.raw.toggle(r);
+                if (!active_repo_paths.raw.isSet(r)) {
                     cursors[r] += 1;
                 }
             }
@@ -288,8 +296,8 @@ fn sweepLineFast(
 fn commitToTopology(
     comptime kind: TopologyShapeKind,
     allocator: std.mem.Allocator,
-    topologies: *std.ArrayListUnmanaged(TopologyEntry(kind)),
-    shape: *const TopologyEntry(kind).Shape,
+    topologies: *std.ArrayListUnmanaged(Topology(kind).Entry),
+    shape: *const Topology(kind).Shape,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
     _ = allocator;

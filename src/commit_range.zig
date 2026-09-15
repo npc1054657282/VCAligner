@@ -39,35 +39,42 @@ pub const CommitCollection = struct {
         }
     };
     pub const Builder = struct {
-        b: std.ArrayList(CommitRange),
-        maybe_last_range: ?CommitRange,
-        pub const init: Builder = .{ .b = .empty, .maybe_last_range = null };
-        /// 在构建过程中添加新值，并假定这个值比已知所有值都要更大，以省去重新排序
-        pub fn appendAssumeGreaterNative(self: *Builder, allocator: std.mem.Allocator, ci_native: CommitSeqNative) !void {
-            if (self.maybe_last_range) |last_range| {
-                if (ci_native <= last_range.end) std.debug.panic(
-                    \\Input a commit seq not greater than last range in builder.  
+        b: std.ArrayListUnmanaged(CommitRange),
+        pub const init: Builder = .{ .b = .empty };
+        /// 在构建过程中添加一整个CommitRange，并假定这个Range在所有已知当前Range之后
+        pub fn appendRangeAssumeGreater(self: *Builder, allocator: std.mem.Allocator, range: CommitRange) !void {
+            if (self.b.items.len > 0) {
+                const last_range: *CommitRange = &self.b.items[self.b.items.len - 1];
+                if (range.start <= last_range.end) {
+                    std.log.err("Input range start ({d}) not strictly greater than last range end ({d})." ++
+                        \\
+                        \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
+                        \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
+                    , .{ range.start, last_range.end });
+                    return Error.AppendAssumptionViolation;
+                }
+                if (range.start == last_range.end + 1) {
+                    last_range.end = range.end;
+                    return;
+                }
+            }
+            try self.b.append(allocator, range);
+        }
+        pub fn appendNativeAssumeGreater(self: *Builder, allocator: std.mem.Allocator, ci_native: CommitSeqNative) !void {
+            try self.appendRangeAssumeGreater(allocator, .packStartEnd(ci_native, ci_native));
+        }
+        pub fn toOwnedCommitRanges(self: *Builder, allocator: std.mem.Allocator) !CommitCollection {
+            if (self.b.items.len == 0) {
+                std.log.err(
+                    \\Builded CommitCollection is empty.
                     \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
                     \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
                 , .{});
-                std.debug.assert(last_range.end >= last_range.start);
-                if (ci_native == last_range.end + 1) {
-                    self.maybe_last_range = .packStartEnd(last_range.start, ci_native);
-                } else {
-                    try self.b.append(allocator, last_range);
-                    self.maybe_last_range = .packStartEnd(ci_native, ci_native);
-                }
-            } else {
-                self.maybe_last_range = .packStartEnd(ci_native, ci_native);
+                return error.EmptyCommitRanges;
             }
-        }
-        /// 将内容转换为一个拥有所有权的CommitRanges
-        pub fn toOwnedCommitRanges(self: *Builder, allocator: std.mem.Allocator) !CommitCollection {
-            if (self.maybe_last_range) |last_range| {
-                try self.b.append(allocator, last_range);
-            } else return error.EmptyCommitRanges;
             return .{ .ranges = try self.b.toOwnedSlice(allocator) };
         }
+        pub const Error = error{ EmptyCommitRanges, AppendAssumptionViolation };
     };
     pub fn fromBuilder(builder: *Builder, allocator: std.mem.Allocator) !CommitCollection {
         return builder.toOwnedCommitRanges(allocator);
