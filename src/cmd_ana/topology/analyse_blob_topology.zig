@@ -51,7 +51,7 @@ pub fn Topology(comptime kind: TopologyShapeKind) type {
     };
 }
 
-pub const Topologies = union(enum) {
+pub const BlobTopologies = union(enum) {
     // 没有repo path seq
     none: void,
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
@@ -60,7 +60,7 @@ pub const Topologies = union(enum) {
     dynamic_bitset: []Topology(.dynamic_bitset).Entry,
 };
 
-pub const PerBlobAnalysed = struct {
+pub const BlobAnalysisResult = struct {
     _: void align(std.atomic.cache_line),
     analyser_id: usize,
     // 以下堆上内容均通过其所属analyser的result_recycling_arena分配。
@@ -69,7 +69,7 @@ pub const PerBlobAnalysed = struct {
     commit_collections_per_repo_path: [*]vcaligner.commit_range.CommitCollection,
     topologies: union(TopologyDecision) {
         // 不需要tag，因为如果分析了，实际类别与repo_path_seqs的数量挂钩。
-        proceed: vcaligner.BareUnion(Topologies),
+        proceed: vcaligner.BareUnion(BlobTopologies),
         // 跳过分析，表现形式为把所有repo path seqs的CommitCollection做并集。
         skip: vcaligner.commit_range.CommitCollection,
     },
@@ -82,7 +82,7 @@ pub const BlobAnalyserStation = struct {
 
 pub fn analyseBlobTopology(
     blob_hashes_entry: []const analysis.ReleaseArtifactBlobManifest.Entry,
-    blobs_info_out: [*]PerBlobAnalysed,
+    blobs_info_out: [*]BlobAnalysisResult,
     pool: *vcaligner.Pool,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
@@ -104,7 +104,7 @@ pub fn analyseBlobTopology(
 pub fn analyseBlobTopologySubTask(
     thrd_id: usize,
     blob_hash: c.git_oid,
-    blob_info_out: *PerBlobAnalysed,
+    blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
     gpac: vcaligner.gpa.Concurrent,
@@ -124,7 +124,7 @@ pub fn analyseBlobTopologySubTask(
 pub fn analyseBlobTopologySub(
     thrd_id: usize,
     blob_hash: c.git_oid,
-    blob_info_out: *PerBlobAnalysed,
+    blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
     gpac: vcaligner.gpa.Concurrent,
@@ -222,7 +222,7 @@ pub fn analyseBlobTopologySub(
     }
     std.debug.assert(commit_collections_per_repo_path.len == repo_path_seqs.len);
 
-    const topologies: @FieldType(PerBlobAnalysed, "topologies") = switch (decideTopologyAnalysis(blob_hash)) {
+    const topologies: @FieldType(BlobAnalysisResult, "topologies") = switch (decideTopologyAnalysis(blob_hash)) {
         .proceed => {},
         .skip => {
             // TODO: 对所有commit collection做并集运算。
@@ -234,7 +234,7 @@ pub fn analyseBlobTopologySub(
 
 fn topologyAnalysis(
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
-) vcaligner.BareUnion(Topologies) {
+) vcaligner.BareUnion(BlobTopologies) {
     if (commit_collections_per_repo_path.len == 0) return .none;
     if (commit_collections_per_repo_path.len == 1) return .{ .single = commit_collections_per_repo_path[0].view() };
     if (commit_collections_per_repo_path.len < @bitSizeOf(usize)) {}
@@ -249,6 +249,18 @@ fn sweepLine(
     std.debug.assert(num_repo_path > 0);
     var topologies: std.ArrayListUnmanaged(Topology(kind).Entry) = .empty;
     errdefer topologies.deinit(allocator);
+    var building_topologies: std.ArrayListUnmanaged(Topology(kind).Entry.Building) = .empty;
+    defer building_topologies.deinit(allocator);
+    errdefer {
+        for (topologies.items) |*entry| {
+            entry.shape.deinit(allocator);
+            entry.commits.deinit(allocator);
+        }
+        for (building_topologies.items[topologies.items.len..]) |*building_entry| {
+            building_entry.shape.deinit(allocator);
+            building_entry.commits.b.deinit(allocator);
+        }
+    }
     const cursors = try allocator.alloc(usize, num_repo_path);
     @memset(cursors, 0);
     defer allocator.free(cursors);
@@ -278,7 +290,7 @@ fn sweepLine(
         if (maybe_min_event_time) |min_event_time| {
             if (active_repo_paths.raw.count() > 0 and current_time < min_event_time) {
                 const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time);
-                try commitToTopology(kind, allocator, &topologies, &active_repo_paths, valid_range);
+                try commitToBuildingTopologies(kind, allocator, &building_topologies, &active_repo_paths, valid_range);
             }
             // 状态推进
             var it = repos_triggering_at_min.raw.iterator(.{});
@@ -291,19 +303,36 @@ fn sweepLine(
             current_time = min_event_time;
         }
     }
+    try topologies.ensureTotalCapacity(allocator, building_topologies.items.len);
+    for (building_topologies.items) |*building_entry|
+        topologies.appendAssumeCapacity(.{
+            .shape = building_entry.shape,
+            .commits = try building_entry.commits.toOwnedCommitRanges(allocator),
+        });
+    return try topologies.toOwnedSlice(allocator);
 }
 
-fn commitToTopology(
+fn commitToBuildingTopologies(
     comptime kind: TopologyShapeKind,
     allocator: std.mem.Allocator,
-    topologies: *std.ArrayListUnmanaged(Topology(kind).Entry),
+    building_topologies: *std.ArrayListUnmanaged(Topology(kind).Entry.Building),
     shape: *const Topology(kind).Shape,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
-    _ = allocator;
-    _ = topologies;
-    _ = shape;
-    _ = valid_range;
+    for (building_topologies.items) |*entry| {
+        if (entry.shape.raw.eql(shape.raw)) {
+            try entry.commits.appendRangeAssumeGreater(allocator, valid_range);
+            break;
+        }
+    } else {
+        var new_entry: Topology(kind).Entry.Building = .{ .shape = try shape.clone(allocator), .commits = .init };
+        errdefer {
+            new_entry.shape.deinit(allocator);
+            new_entry.commits.b.deinit(allocator);
+        }
+        try new_entry.commits.appendRangeAssumeGreater(allocator, valid_range);
+        try building_topologies.append(allocator, new_entry);
+    }
 }
 
 pub const TopologyDecision = enum {
@@ -323,7 +352,7 @@ pub fn decideTopologyAnalysis(
 // 事后过滤，看了拓扑分析结果决定是否使用拓扑
 // XXX: 当前的设计仅考虑拓扑数量，且实际上并不真的投入使用。将来可能允许自定义配置尤其是拓扑数量阈值
 pub fn decideTopologyUsage(
-    topologies: Topologies,
+    topologies: BlobTopologies,
 ) TopologyDecision {
     const topologies_num = switch (topologies) {
         .none, .single => return .proceed,

@@ -21,7 +21,7 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
             );
             errdefer paths_depot.deinit(gpae);
             defer node_depot.deinit(gpae);
-            break :collect_artifacts_blob .{ paths_depot, try blob_agendas_building.toBlobAgendas(gpae, &node_depot) };
+            break :collect_artifacts_blob .{ paths_depot, try blob_agendas_building.toBlobManifest(gpae, &node_depot) };
         };
         blob_topology: {
             break :blob_topology;
@@ -85,7 +85,7 @@ pub const release_artifact = struct {
             return i.raw;
         }
     };
-    // XXX: 目前暂未考虑Node的常驻遍历。我的意思是，目前我把release path nodes的转换操作弄到BlobAgenda那边了。
+    // XXX: 目前暂未考虑Node的常驻遍历。我的意思是，目前我把release path nodes的转换操作弄到BlobManifest那边了。
     // 所以这里留了实现空间，如果未来想要Node的常驻遍历，可以在这里再实现一次。
     pub const Node = struct {
         path_key: PathDepot.Key,
@@ -144,7 +144,7 @@ pub const ReleaseArtifactBlobManifest = struct {
         pub fn append(self: *Building, gpa: mainWorkerManagedGpa, ni: release_artifact.Node.Depot.Key) !void {
             return try self.list.append(gpa.allocator(), .{ .nk = ni });
         }
-        pub fn toBlobAgendas(
+        pub fn toBlobManifest(
             self: *Building,
             gpa: mainWorkerManagedGpa,
             node_depot: *const release_artifact.Node.Depot,
