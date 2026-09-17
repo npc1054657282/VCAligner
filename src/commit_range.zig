@@ -41,6 +41,19 @@ pub const CommitCollection = struct {
     pub const Builder = struct {
         b: std.ArrayListUnmanaged(CommitRange),
         pub const init: Builder = .{ .b = .empty };
+        // 在构建过程中添加一整个CommitRange，并断言这个Range的start不小于当前最新Range的start
+        pub fn appendRangeAssertStartGte(self: *Builder, allocator: std.mem.Allocator, range: CommitRange) !void {
+            if (self.b.items.len > 0) {
+                const last_range: *CommitRange = &self.b.items[self.b.items.len - 1];
+                std.debug.assert(range.start >= last_range.start);
+                const current_end = last_range.end;
+                if (range.start <= current_end + 1) {
+                    last_range.end = @max(current_end, range.end);
+                    return;
+                }
+            }
+            try self.b.append(allocator, range);
+        }
         /// 在构建过程中添加一整个CommitRange，并假定这个Range在所有已知当前Range之后
         pub fn appendRangeAssumeGreater(self: *Builder, allocator: std.mem.Allocator, range: CommitRange) !void {
             if (self.b.items.len > 0) {
@@ -172,4 +185,42 @@ pub fn intersection(allocator: std.mem.Allocator, c1: CommitCollection.View, c2:
         }
     }
     return .{ .ranges = try result.toOwnedSlice(allocator) };
+}
+
+pub fn unionCollections(
+    allocator: std.mem.Allocator,
+    collections: []const CommitCollection,
+) !CommitCollection {
+    if (collections.len == 0) std.debug.panic(
+        \\unionCollections assume the collections is not empty.
+        \\This is a programming error.
+    , .{});
+    if (collections.len == 1) return .{ .ranges = try allocator.dupe(CommitRange, collections[0].ranges) };
+    const all_ranges = try allocator.alloc(CommitRange, total_ranges: {
+        var total_ranges: usize = 0;
+        for (collections) |collection| {
+            // Collection的设计为不可能有长度为0的range。
+            std.debug.assert(collection.ranges.len > 0);
+            total_ranges += collection.ranges.len;
+        }
+        break :total_ranges total_ranges;
+    });
+    defer allocator.free(all_ranges);
+    {
+        var offset: usize = 0;
+        for (collections) |col| {
+            @memcpy(all_ranges[offset..][0..col.ranges.len], col.ranges);
+            offset += col.ranges.len;
+        }
+    }
+    std.sort.pdq(CommitRange, all_ranges, {}, struct {
+        fn lessThan(_: void, a: CommitRange, b: CommitRange) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+
+    var builder: CommitCollection.Builder = .init;
+    errdefer builder.b.deinit(allocator);
+    for (all_ranges) |range| try builder.appendRangeAssertStartGte(allocator, range);
+    return try builder.toOwnedCommitRanges(allocator);
 }

@@ -3,6 +3,11 @@ const vcaligner = @import("vcaligner");
 const c = vcaligner.c_helper.c;
 const analysis = @import("analysis.zig");
 
+pub const BlobAnalyserStation = struct {
+    _: void align(std.atomic.cache_line),
+    recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
+};
+
 pub const TopologyShapeKind = enum {
     integer_bitset,
     dynamic_bitset,
@@ -52,8 +57,6 @@ pub fn Topology(comptime kind: TopologyShapeKind) type {
 }
 
 pub const BlobTopologies = union(enum) {
-    // 没有repo path seq
-    none: void,
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
     single: vcaligner.commit_range.CommitCollection.View,
     integer_bitset: []Topology(.integer_bitset).Entry,
@@ -66,18 +69,22 @@ pub const BlobAnalysisResult = struct {
     // 以下堆上内容均通过其所属analyser的result_recycling_arena分配。
     // 发生错误不需要标记哪些需要释放哪些不需要释放，统一由result_recycling_arena集体释放。
     repo_path_seqs: []vcaligner.rocksdb_custom.PathSeq,
-    commit_collections_per_repo_path: [*]vcaligner.commit_range.CommitCollection,
-    topologies: union(TopologyDecision) {
-        // 不需要tag，因为如果分析了，实际类别与repo_path_seqs的数量挂钩。
-        proceed: vcaligner.BareUnion(BlobTopologies),
-        // 跳过分析，表现形式为把所有repo path seqs的CommitCollection做并集。
-        skip: vcaligner.commit_range.CommitCollection,
+    details: union {
+        // repo_path_seqs.len == 0
+        empty: void,
+        // repo_path_seqs.len > 0
+        active: struct {
+            commit_collections_per_repo_path: [*]vcaligner.commit_range.CommitCollection,
+            topologies: BlobTopologiesResolution,
+        },
     },
 };
-pub const BlobAnalyserStation = struct {
-    _: void align(std.atomic.cache_line),
-    result_recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
-    scratch_recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
+
+pub const BlobTopologiesResolution = union(TopologyDecision) {
+    // 不需要tag，因为如果分析了，实际类别与repo_path_seqs的数量挂钩。
+    proceed: vcaligner.bare_union.BareUnion(BlobTopologies),
+    // 跳过分析，表现形式为把所有repo path seqs的CommitCollection做并集。
+    skip: vcaligner.commit_range.CommitCollection,
 };
 
 pub fn analyseBlobTopology(
@@ -129,11 +136,8 @@ pub fn analyseBlobTopologySub(
     analyser_ctxs: []BlobAnalyserStation,
     gpac: vcaligner.gpa.Concurrent,
 ) !void {
-    var scratch_handle = analyser_ctxs[thrd_id].scratch_recycling_arena_state.handle(gpac.allocator);
-    defer scratch_handle.reset();
-    const scratch_allocator = scratch_handle.allocator();
-    var result_handle = analyser_ctxs[thrd_id].result_recycling_arena_state.handle(gpac.allocator);
-    const result_allocator = result_handle.allocator();
+    var recycling_arena_handle = analyser_ctxs[thrd_id].recycling_arena_state.handle(gpac.allocator);
+    const allocator = recycling_arena_handle.allocator();
     const repo_path_seqs, const commit_collections_per_repo_path = commit_collections_per_repo_path: {
         const prefix_scan_roptions = blk: {
             const roptions = c.rocksdb_readoptions_create().?;
@@ -143,9 +147,9 @@ pub fn analyseBlobTopologySub(
         defer c.rocksdb_readoptions_destroy(prefix_scan_roptions);
         const repo_path_seqs: []vcaligner.rocksdb_custom.PathSeq, const blob_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.BlobPathSeq) = repo_path_seqs: {
             var repo_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.PathSeq) = .empty;
-            errdefer repo_path_seqs.deinit(result_allocator);
+            errdefer repo_path_seqs.deinit(allocator);
             var blob_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.BlobPathSeq) = .empty;
-            errdefer blob_path_seqs.deinit(scratch_allocator);
+            errdefer blob_path_seqs.deinit(allocator);
             const iter = c.rocksdb_create_iterator_cf(
                 storage.db,
                 prefix_scan_roptions,
@@ -166,24 +170,32 @@ pub fn analyseBlobTopologySub(
                     const value_ptr = c.rocksdb_iter_value(iter, &vlen);
                     break :blk std.mem.bytesToValue(vcaligner.rocksdb_custom.BlobPathSeq, value_ptr[0..vlen]);
                 };
-                try repo_path_seqs.append(result_allocator, repo_path_seq);
-                try blob_path_seqs.append(scratch_allocator, blob_path_seq);
+                try repo_path_seqs.append(allocator, repo_path_seq);
+                try blob_path_seqs.append(allocator, blob_path_seq);
             }
             break :repo_path_seqs .{
-                try repo_path_seqs.toOwnedSlice(result_allocator),
+                try repo_path_seqs.toOwnedSlice(allocator),
                 blob_path_seqs,
             };
         };
-        errdefer result_allocator.free(repo_path_seqs);
-        defer blob_path_seqs.deinit(scratch_allocator);
+        errdefer allocator.free(repo_path_seqs);
+        if (repo_path_seqs.len == 0) {
+            blob_info_out.* = .{
+                .analyser_id = thrd_id,
+                .repo_path_seqs = repo_path_seqs,
+                .details = .empty,
+            };
+            return;
+        }
+        defer blob_path_seqs.deinit(allocator);
         const len = repo_path_seqs.len;
         std.debug.assert(len == blob_path_seqs.items.len);
-        var commit_collections_per_repo_path: std.ArrayListUnmanaged(vcaligner.commit_range.CommitCollection) = try .initCapacity(result_allocator, len);
+        var commit_collections_per_repo_path: std.ArrayListUnmanaged(vcaligner.commit_range.CommitCollection) = try .initCapacity(allocator, len);
         errdefer {
             for (commit_collections_per_repo_path.items) |commit_collection| {
-                commit_collection.deinit(result_allocator);
+                commit_collection.deinit(allocator);
             }
-            commit_collections_per_repo_path.deinit(result_allocator);
+            commit_collections_per_repo_path.deinit(allocator);
         }
         const iter = c.rocksdb_create_iterator_cf(
             storage.db,
@@ -194,7 +206,7 @@ pub fn analyseBlobTopologySub(
         for (blob_path_seqs.items) |blob_path_seq| {
             const commit_collection = commit_collection: {
                 var builder: vcaligner.commit_range.CommitCollection.Builder = .init;
-                errdefer builder.b.deinit(result_allocator);
+                errdefer builder.b.deinit(allocator);
                 c.rocksdb_iter_seek(iter, @ptrCast(&blob_path_seq), @sizeOf(vcaligner.rocksdb_custom.BlobPathSeq));
                 while (c.rocksdb_iter_valid(iter) != 0) : (c.rocksdb_iter_next(iter)) {
                     const ci_native: vcaligner.rocksdb_custom.CommitSeqNative = blk: {
@@ -205,46 +217,85 @@ pub fn analyseBlobTopologySub(
                         const ci: vcaligner.rocksdb_custom.CommitSeq = key.commit_seq;
                         break :blk ci.toNative();
                     };
-                    try builder.appendNativeAssumeGreater(result_allocator, ci_native);
+                    try builder.appendNativeAssumeGreater(allocator, ci_native);
                 }
-                break :commit_collection try builder.toOwnedCommitRanges(result_allocator);
+                break :commit_collection try builder.toOwnedCommitRanges(allocator);
             };
             commit_collections_per_repo_path.appendAssumeCapacity(commit_collection);
         }
         break :commit_collections_per_repo_path .{
             repo_path_seqs,
-            try commit_collections_per_repo_path.toOwnedSlice(result_allocator),
+            try commit_collections_per_repo_path.toOwnedSlice(allocator),
         };
     };
     errdefer {
-        result_allocator.free(repo_path_seqs);
-        result_allocator.free(commit_collections_per_repo_path);
+        allocator.free(repo_path_seqs);
+        allocator.free(commit_collections_per_repo_path);
     }
     std.debug.assert(commit_collections_per_repo_path.len == repo_path_seqs.len);
 
-    const topologies: @FieldType(BlobAnalysisResult, "topologies") = switch (decideTopologyAnalysis(blob_hash)) {
-        .proceed => {},
-        .skip => {
-            // TODO: 对所有commit collection做并集运算。
+    const topologies: BlobTopologiesResolution = sw: switch (decideTopologyAnalysis(blob_hash)) {
+        .proceed => topologyAnalysisAndThenDecideTopologyUsage(commit_collections_per_repo_path, allocator) catch |err| switch (err) {
+            TopologyDecision.Error.DecideSkipUseTopologies => continue :sw .skip,
+            else => return err,
+        },
+        .skip => .{ .skip = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path) },
+    };
+    blob_info_out.* = .{
+        .analyser_id = thrd_id,
+        .repo_path_seqs = repo_path_seqs,
+        .details = .{ .active = .{
+            .commit_collections_per_repo_path = commit_collections_per_repo_path.ptr,
+            .topologies = topologies,
+        } },
+    };
+}
+
+fn topologyAnalysisAndThenDecideTopologyUsage(
+    commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
+    allocator: std.mem.Allocator,
+) !BlobTopologiesResolution {
+    const proceed = try topologyAnalysis(commit_collections_per_repo_path, allocator);
+    errdefer switch (proceed) {
+        inline .integer_bitset, .dynamic_bitset => |entries| {
+            for (entries) |*entry| {
+                entry.shape.deinit(allocator);
+                entry.commits.deinit(allocator);
+            }
+            allocator.free(entries);
         },
     };
-    _ = topologies;
-    _ = blob_info_out;
+    switch (decideTopologyUsage(proceed)) {
+        .proceed => return .{ .proceed = vcaligner.bare_union.taggedToBare(proceed) },
+        .skip => return TopologyDecision.Error.DecideSkipUseTopologies,
+    }
 }
 
 fn topologyAnalysis(
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
-) vcaligner.BareUnion(BlobTopologies) {
-    if (commit_collections_per_repo_path.len == 0) return .none;
+    allocator: std.mem.Allocator,
+) !BlobTopologies {
+    std.debug.assert(commit_collections_per_repo_path.len > 0);
     if (commit_collections_per_repo_path.len == 1) return .{ .single = commit_collections_per_repo_path[0].view() };
-    if (commit_collections_per_repo_path.len < @bitSizeOf(usize)) {}
+    const kind: TopologyShapeKind = if (commit_collections_per_repo_path.len < @bitSizeOf(usize)) .integer_bitset else .dynamic_bitset;
+    const entries = switch (kind) {
+        inline else => |comptime_kind| try sweepLine(
+            comptime_kind,
+            commit_collections_per_repo_path,
+            allocator,
+        ),
+    };
+    return switch (kind) {
+        .integer_bitset => .{ .integer_bitset = entries },
+        .dynamic_bitset => .{ .dynamic_bitset = entries },
+    };
 }
 
 fn sweepLine(
     comptime kind: TopologyShapeKind,
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
     allocator: std.mem.Allocator,
-) []Topology(kind).Entry {
+) ![]Topology(kind).Entry {
     const num_repo_path = commit_collections_per_repo_path.len;
     std.debug.assert(num_repo_path > 0);
     var topologies: std.ArrayListUnmanaged(Topology(kind).Entry) = .empty;
@@ -338,6 +389,9 @@ fn commitToBuildingTopologies(
 pub const TopologyDecision = enum {
     proceed,
     skip,
+    pub const Error = error{
+        DecideSkipUseTopologies,
+    };
 };
 
 // 事前过滤，通过看一眼blob hash决定是否分析拓扑
@@ -355,9 +409,9 @@ pub fn decideTopologyUsage(
     topologies: BlobTopologies,
 ) TopologyDecision {
     const topologies_num = switch (topologies) {
-        .none, .single => return .proceed,
-        .integer_bitset => |t| t.shapes.len,
-        .dynamic_bitset => |t| t.shapes.len,
+        .single => 1,
+        .integer_bitset => |t| t.len,
+        .dynamic_bitset => |t| t.len,
     };
     _ = topologies_num;
     return .proceed;
