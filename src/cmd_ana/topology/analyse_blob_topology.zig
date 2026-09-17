@@ -6,14 +6,44 @@ const analysis = @import("analysis.zig");
 pub const BlobAnalyserStation = struct {
     _: void align(std.atomic.cache_line),
     recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
+    agenda_unit_count_statistics: usize,
+};
+
+pub const BlobAnalyserHub = struct {
+    stations: []BlobAnalyserStation,
+    pub fn init(n_jobs: usize, gpa: vcaligner.gpa.Concurrent) !BlobAnalyserHub {
+        const stations = try gpa.allocator.alloc(BlobAnalyserStation, n_jobs);
+        defer gpa.allocator.free(stations);
+        @memset(stations, .{ ._ = {}, .recycling_arena_state = .{}, .agenda_unit_count_statistics = 0 });
+        return .{ .stations = stations };
+    }
+    pub fn deinit(self: BlobAnalyserHub, gpa: vcaligner.gpa.Concurrent) void {
+        for (self.stations) |*station| {
+            const handle = station.recycling_arena_state.handle(gpa.allocator);
+            handle.deinit();
+        }
+        gpa.allocator.free(self.stations);
+    }
 };
 
 pub const TopologyShapeKind = enum {
+    single,
     integer_bitset,
     dynamic_bitset,
+    pub fn fromRepoPathSeqsNum(repo_paths_seqs_num: usize) TopologyShapeKind {
+        std.debug.assert(repo_paths_seqs_num > 0);
+        if (repo_paths_seqs_num == 1) return .single;
+        if (repo_paths_seqs_num <= @bitSizeOf(usize)) return .integer_bitset;
+        return .dynamic_bitset;
+    }
 };
 
-pub fn Topology(comptime kind: TopologyShapeKind) type {
+pub const TopologyBitSetShapeKind: type = vcaligner.sub_enum.SubEnum(TopologyShapeKind, &[_]TopologyShapeKind{
+    .integer_bitset,
+    .dynamic_bitset,
+});
+
+pub fn Topology(comptime kind: TopologyBitSetShapeKind) type {
     return struct {
         pub const Shape = struct {
             raw: switch (kind) {
@@ -56,7 +86,7 @@ pub fn Topology(comptime kind: TopologyShapeKind) type {
     };
 }
 
-pub const BlobTopologies = union(enum) {
+pub const BlobTopologies = union(TopologyShapeKind) {
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
     single: vcaligner.commit_range.CommitCollection.View,
     integer_bitset: []Topology(.integer_bitset).Entry,
@@ -88,24 +118,26 @@ pub const BlobTopologiesResolution = union(TopologyDecision) {
 };
 
 pub fn analyseBlobTopology(
-    blob_hashes_entry: []const analysis.ReleaseArtifactBlobManifest.Entry,
-    blobs_info_out: [*]BlobAnalysisResult,
+    blob_hash_entries: []const analysis.ReleaseArtifactBlobManifest.Entry,
     pool: *vcaligner.Pool,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
-    gpac: vcaligner.gpa.Concurrent,
-) void {
-    var wait_group = .{};
+    gpa: vcaligner.gpa.Concurrent,
+) ![]BlobAnalysisResult {
+    const results = try gpa.allocator.alloc(BlobAnalysisResult, blob_hash_entries.len);
+    errdefer comptime unreachable;
+    var wait_group: std.Thread.WaitGroup = .{};
     defer pool.waitAndWork(&wait_group);
-    for (blobs_info_out[0..blob_hashes_entry.len], 0..) |*per_blob_to_be_analysed, i| {
+    for (results, blob_hash_entries) |*blob_info_out, *blob_hash_entry| {
         pool.spawnWgId(&wait_group, analyseBlobTopologySubTask, .{
-            blob_hashes_entry[i].blob_hash,
-            per_blob_to_be_analysed,
+            blob_hash_entry.blob_hash,
+            blob_info_out,
             storage,
             analyser_ctxs,
-            gpac,
+            gpa,
         });
     }
+    return results;
 }
 
 pub fn analyseBlobTopologySubTask(
@@ -114,7 +146,7 @@ pub fn analyseBlobTopologySubTask(
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
-    gpac: vcaligner.gpa.Concurrent,
+    gpa: vcaligner.gpa.Concurrent,
 ) void {
     analyseBlobTopologySub(
         thrd_id,
@@ -122,7 +154,7 @@ pub fn analyseBlobTopologySubTask(
         blob_info_out,
         storage,
         analyser_ctxs,
-        gpac,
+        gpa,
     ) catch {
         vcaligner.crash_dump.dumpAndCrash(@src());
     };
@@ -134,9 +166,9 @@ pub fn analyseBlobTopologySub(
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []BlobAnalyserStation,
-    gpac: vcaligner.gpa.Concurrent,
+    gpa: vcaligner.gpa.Concurrent,
 ) !void {
-    var recycling_arena_handle = analyser_ctxs[thrd_id].recycling_arena_state.handle(gpac.allocator);
+    var recycling_arena_handle = analyser_ctxs[thrd_id].recycling_arena_state.handle(gpa.allocator);
     const allocator = recycling_arena_handle.allocator();
     const repo_path_seqs, const commit_collections_per_repo_path = commit_collections_per_repo_path: {
         const prefix_scan_roptions = blk: {
@@ -145,7 +177,7 @@ pub fn analyseBlobTopologySub(
             break :blk roptions;
         };
         defer c.rocksdb_readoptions_destroy(prefix_scan_roptions);
-        const repo_path_seqs: []vcaligner.rocksdb_custom.PathSeq, const blob_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.BlobPathSeq) = repo_path_seqs: {
+        const repo_path_seqs: []vcaligner.rocksdb_custom.PathSeq, var blob_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.BlobPathSeq) = repo_path_seqs: {
             var repo_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.PathSeq) = .empty;
             errdefer repo_path_seqs.deinit(allocator);
             var blob_path_seqs: std.ArrayListUnmanaged(vcaligner.rocksdb_custom.BlobPathSeq) = .empty;
@@ -162,7 +194,7 @@ pub fn analyseBlobTopologySub(
                     var klen: usize = undefined;
                     const key_ptr = c.rocksdb_iter_key(iter, &klen);
                     const blob_path_key = std.mem.bytesAsValue(vcaligner.rocksdb_custom.BlobPathKey, key_ptr[0..klen]);
-                    std.debug.assert(blob_path_key.blob_hash == blob_hash);
+                    std.debug.assert(std.mem.eql(u8, &blob_path_key.blob_hash.id, &blob_hash.id));
                     break :blk blob_path_key.path_seq;
                 };
                 const blob_path_seq: vcaligner.rocksdb_custom.BlobPathSeq = blk: {
@@ -181,9 +213,10 @@ pub fn analyseBlobTopologySub(
         errdefer allocator.free(repo_path_seqs);
         if (repo_path_seqs.len == 0) {
             blob_info_out.* = .{
+                ._ = {},
                 .analyser_id = thrd_id,
                 .repo_path_seqs = repo_path_seqs,
-                .details = .empty,
+                .details = .{ .empty = {} },
             };
             return;
         }
@@ -241,7 +274,16 @@ pub fn analyseBlobTopologySub(
         },
         .skip => .{ .skip = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path) },
     };
+    analyser_ctxs[thrd_id].agenda_unit_count_statistics += switch (topologies) {
+        .skip => 1,
+        .proceed => switch (TopologyShapeKind.fromRepoPathSeqsNum(repo_path_seqs.len)) {
+            .single => 1,
+            .integer_bitset => topologies.proceed.integer_bitset.len,
+            .dynamic_bitset => topologies.proceed.dynamic_bitset.len,
+        },
+    };
     blob_info_out.* = .{
+        ._ = {},
         .analyser_id = thrd_id,
         .repo_path_seqs = repo_path_seqs,
         .details = .{ .active = .{
@@ -264,6 +306,7 @@ fn topologyAnalysisAndThenDecideTopologyUsage(
             }
             allocator.free(entries);
         },
+        .single => {},
     };
     switch (decideTopologyUsage(proceed)) {
         .proceed => return .{ .proceed = vcaligner.bare_union.taggedToBare(proceed) },
@@ -276,23 +319,23 @@ fn topologyAnalysis(
     allocator: std.mem.Allocator,
 ) !BlobTopologies {
     std.debug.assert(commit_collections_per_repo_path.len > 0);
-    if (commit_collections_per_repo_path.len == 1) return .{ .single = commit_collections_per_repo_path[0].view() };
-    const kind: TopologyShapeKind = if (commit_collections_per_repo_path.len < @bitSizeOf(usize)) .integer_bitset else .dynamic_bitset;
-    const entries = switch (kind) {
-        inline else => |comptime_kind| try sweepLine(
-            comptime_kind,
-            commit_collections_per_repo_path,
-            allocator,
-        ),
-    };
-    return switch (kind) {
-        .integer_bitset => .{ .integer_bitset = entries },
-        .dynamic_bitset => .{ .dynamic_bitset = entries },
-    };
+    const kind: TopologyShapeKind = .fromRepoPathSeqsNum(commit_collections_per_repo_path.len);
+    switch (kind) {
+        .single => return .{ .single = commit_collections_per_repo_path[0].view() },
+        inline else => |comptime_kind| {
+            const bitset_kind: TopologyBitSetShapeKind = @enumFromInt(@intFromEnum(comptime_kind));
+            const entries = try sweepLine(
+                bitset_kind,
+                commit_collections_per_repo_path,
+                allocator,
+            );
+            return @unionInit(BlobTopologies, @tagName(comptime_kind), entries);
+        },
+    }
 }
 
 fn sweepLine(
-    comptime kind: TopologyShapeKind,
+    comptime kind: TopologyBitSetShapeKind,
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
     allocator: std.mem.Allocator,
 ) ![]Topology(kind).Entry {
@@ -364,7 +407,7 @@ fn sweepLine(
 }
 
 fn commitToBuildingTopologies(
-    comptime kind: TopologyShapeKind,
+    comptime kind: TopologyBitSetShapeKind,
     allocator: std.mem.Allocator,
     building_topologies: *std.ArrayListUnmanaged(Topology(kind).Entry.Building),
     shape: *const Topology(kind).Shape,
@@ -399,7 +442,7 @@ pub const TopologyDecision = enum {
 pub fn decideTopologyAnalysis(
     blob_hash: c.git_oid,
 ) TopologyDecision {
-    if (blob_hash == vcaligner.cli.ana_runner.empty_git_blob_sha1_hash) return .skip;
+    if (std.mem.eql(u8, &blob_hash.id, &vcaligner.cli.ana_runner.empty_git_blob_sha1_hash.id)) return .skip;
     return .proceed;
 }
 

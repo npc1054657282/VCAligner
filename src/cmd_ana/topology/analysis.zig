@@ -4,38 +4,52 @@ const vcaligner = @import("vcaligner");
 const diag = vcaligner.diag;
 const c = vcaligner.c_helper.c;
 const AnaRunner = @import("AnaRunner.zig");
+const analyse_blob_topology = @import("analyse_blob_topology.zig");
 
 pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     var gpae_instance: mainWorkerManagedGpa.Instance = .{ .instance = .init() };
     const gpae = gpae_instance.gpa();
     // 仅前半部分需要并行解析的部分需要频繁复用pool，此为其生存期。
-    var release_artifact_paths_depot: release_artifact.PathDepot, var blob_agendas: ReleaseArtifactBlobManifest = pool_lifetime: {
+    const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest, const blob_analyser_hub: analyse_blob_topology.BlobAnalyserHub, const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = pool_lifetime: {
         var pool: vcaligner.Pool = undefined;
-        try pool.init(.{ .allocator = gpac.allocator, .n_jobs = runconf.n_jobs - 1 });
+        try pool.init(.{ .allocator = gpac.allocator, .n_jobs = runconf.n_jobs - 1, .track_ids = true });
         defer pool.deinit();
-        var release_artifact_paths_depot: release_artifact.PathDepot, var blob_agendas: ReleaseArtifactBlobManifest = collect_artifacts_blob: {
-            const paths_depot, var node_depot, var blob_agendas_building = try @import("collect_artifacts_blob.zig").collectArtifactsBlob(
+        const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest = collect_artifacts_blob: {
+            const paths_depot, var node_depot, var blob_manifest_building = try @import("collect_artifacts_blob.zig").collectArtifactsBlob(
                 &pool,
                 runconf.release_path,
                 gpae,
             );
             errdefer paths_depot.deinit(gpae);
             defer node_depot.deinit(gpae);
-            break :collect_artifacts_blob .{ paths_depot, try blob_agendas_building.toBlobManifest(gpae, &node_depot) };
+            break :collect_artifacts_blob .{ paths_depot, try blob_manifest_building.toBlobManifest(gpae, &node_depot) };
         };
-        blob_topology: {
-            break :blob_topology;
+        errdefer {
+            release_artifact_paths_depot.deinit(gpae);
+            blob_manifest.deinit(gpae);
         }
-        _ = &release_artifact_paths_depot;
-        _ = &blob_agendas;
-        break :pool_lifetime .{ release_artifact_paths_depot, blob_agendas };
+        const blob_analyser_hub: analyse_blob_topology.BlobAnalyserHub = try .init(runconf.n_jobs, gpac);
+        errdefer blob_analyser_hub.deinit(gpac);
+        const storage: vcaligner.cli.ana_runner.Storage = try .init(runconf.point_lookup_cache_mb, runconf.rocksdb_path, last_diag);
+        errdefer storage.deinit();
+        const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = try analyse_blob_topology.analyseBlobTopology(
+            blob_manifest.entrys,
+            &pool,
+            storage,
+            blob_analyser_hub.stations,
+            gpac,
+        );
+        errdefer comptime unreachable;
+        break :pool_lifetime .{ release_artifact_paths_depot, blob_manifest, blob_analyser_hub, blob_analysis_results };
     };
     defer {
-        blob_agendas.deinit(gpae);
+        // 各结果内容由blob_analyser_hub里的可回收arena一并释放，无需分别释放。
+        gpac.allocator.free(blob_analysis_results);
+        blob_analyser_hub.deinit(gpac);
+        blob_manifest.deinit(gpae);
         release_artifact_paths_depot.deinit(gpae);
     }
-
-    _ = last_diag;
+    // 主线程归并分析所有的分析结果，构造解析单元
 }
 
 pub const mainWorkerManagedGpa = struct {
@@ -128,7 +142,7 @@ pub const release_artifact = struct {
 pub const ReleaseArtifactBlobManifest = struct {
     entrys: []Entry,
     release_artifact_paths: ReleaseArtifactPathKeysBacking,
-    pub fn deinit(self: *ReleaseArtifactBlobManifest, gpa: mainWorkerManagedGpa) void {
+    pub fn deinit(self: ReleaseArtifactBlobManifest, gpa: mainWorkerManagedGpa) void {
         gpa.allocator().free(self.entrys);
         self.release_artifact_paths.deinit(gpa);
     }

@@ -49,10 +49,11 @@ pub fn init(
         @ptrCast(&vcaligner.rocksdb_custom.CollumFamily.names.values),
         &all_cf_options.values,
         &cfs.values,
+        0,
         @ptrCast(&err_cstr),
     );
     try c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
-    return .{ .db = db, .cfs = cfs };
+    return .{ .db = db.?, .cfs = cfs };
 }
 
 pub fn deinit(self: Storage) void {
