@@ -297,3 +297,10 @@ pub const AgendaUnit = struct {
         dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
     };
 };
+
+pub const CandidateAnalysis = struct {
+    commits: vcaligner.commit_range.CommitCollection,
+    created_by_agenda: usize,
+    refined_by_agendas: std.ArrayListUnmanaged(usize),
+    compatible_agendas: std.ArrayListUnmanaged(usize),
+};
