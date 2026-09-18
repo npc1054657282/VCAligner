@@ -37,6 +37,11 @@ pub const CommitCollection = struct {
         pub fn dupe(self: View, allocator: std.mem.Allocator) !CommitCollection {
             return .{ .ranges = try allocator.dupe(CommitRange, self.ranges) };
         }
+        pub fn commitCount(self: View) usize {
+            var total: usize = 0;
+            for (self.ranges) |range| total += range.end - range.start + 1;
+            return total;
+        }
     };
     pub const Builder = struct {
         b: std.ArrayListUnmanaged(CommitRange),

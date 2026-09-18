@@ -30,20 +30,20 @@ pub const TopologyShapeKind = enum {
     single,
     integer_bitset,
     dynamic_bitset,
-    pub fn fromRepoPathSeqsNum(repo_paths_seqs_num: usize) TopologyShapeKind {
-        std.debug.assert(repo_paths_seqs_num > 0);
-        if (repo_paths_seqs_num == 1) return .single;
-        if (repo_paths_seqs_num <= @bitSizeOf(usize)) return .integer_bitset;
+    pub fn fromRepoPathSeqsNum(repo_paths_seqs_count: usize) TopologyShapeKind {
+        std.debug.assert(repo_paths_seqs_count > 0);
+        if (repo_paths_seqs_count == 1) return .single;
+        if (repo_paths_seqs_count <= @bitSizeOf(usize)) return .integer_bitset;
         return .dynamic_bitset;
     }
 };
 
-pub const TopologyBitSetShapeKind: type = vcaligner.sub_enum.SubEnum(TopologyShapeKind, &[_]TopologyShapeKind{
+pub const BitTopologySetShapeKind: type = vcaligner.sub_enum.SubEnum(TopologyShapeKind, &[_]TopologyShapeKind{
     .integer_bitset,
     .dynamic_bitset,
 });
 
-pub fn Topology(comptime kind: TopologyBitSetShapeKind) type {
+pub fn BitSetTopology(comptime kind: BitTopologySetShapeKind) type {
     return struct {
         pub const Shape = struct {
             raw: switch (kind) {
@@ -74,6 +74,18 @@ pub fn Topology(comptime kind: TopologyBitSetShapeKind) type {
                     .dynamic_bitset => self.raw.unsetAll(),
                 }
             }
+            pub fn view(self: Shape) View {
+                return switch (kind) {
+                    .integer_bitset => .{ .raw = self.raw },
+                    .dynamic_bitset => .{ .raw = self.raw },
+                };
+            }
+            pub const View = struct {
+                raw: switch (kind) {
+                    .integer_bitset => std.bit_set.IntegerBitSet(@bitSizeOf(usize)),
+                    .dynamic_bitset => std.bit_set.DynamicBitSetUnmanaged,
+                },
+            };
         };
         pub const Entry = struct {
             shape: Shape,
@@ -89,8 +101,8 @@ pub fn Topology(comptime kind: TopologyBitSetShapeKind) type {
 pub const BlobTopologies = union(TopologyShapeKind) {
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
     single: vcaligner.commit_range.CommitCollection.View,
-    integer_bitset: []Topology(.integer_bitset).Entry,
-    dynamic_bitset: []Topology(.dynamic_bitset).Entry,
+    integer_bitset: []BitSetTopology(.integer_bitset).Entry,
+    dynamic_bitset: []BitSetTopology(.dynamic_bitset).Entry,
 };
 
 pub const BlobAnalysisResult = struct {
@@ -323,7 +335,7 @@ fn topologyAnalysis(
     switch (kind) {
         .single => return .{ .single = commit_collections_per_repo_path[0].view() },
         inline else => |comptime_kind| {
-            const bitset_kind: TopologyBitSetShapeKind = @enumFromInt(@intFromEnum(comptime_kind));
+            const bitset_kind: BitTopologySetShapeKind = @enumFromInt(@intFromEnum(comptime_kind));
             const entries = try sweepLine(
                 bitset_kind,
                 commit_collections_per_repo_path,
@@ -335,15 +347,15 @@ fn topologyAnalysis(
 }
 
 fn sweepLine(
-    comptime kind: TopologyBitSetShapeKind,
+    comptime kind: BitTopologySetShapeKind,
     commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
     allocator: std.mem.Allocator,
-) ![]Topology(kind).Entry {
+) ![]BitSetTopology(kind).Entry {
     const num_repo_path = commit_collections_per_repo_path.len;
     std.debug.assert(num_repo_path > 0);
-    var topologies: std.ArrayListUnmanaged(Topology(kind).Entry) = .empty;
+    var topologies: std.ArrayListUnmanaged(BitSetTopology(kind).Entry) = .empty;
     errdefer topologies.deinit(allocator);
-    var building_topologies: std.ArrayListUnmanaged(Topology(kind).Entry.Building) = .empty;
+    var building_topologies: std.ArrayListUnmanaged(BitSetTopology(kind).Entry.Building) = .empty;
     defer building_topologies.deinit(allocator);
     errdefer {
         for (topologies.items) |*entry| {
@@ -358,9 +370,9 @@ fn sweepLine(
     const cursors = try allocator.alloc(usize, num_repo_path);
     @memset(cursors, 0);
     defer allocator.free(cursors);
-    var active_repo_paths: Topology(kind).Shape = try .initEmpty(allocator, num_repo_path);
+    var active_repo_paths: BitSetTopology(kind).Shape = try .initEmpty(allocator, num_repo_path);
     defer active_repo_paths.deinit(allocator);
-    var repos_triggering_at_min: Topology(kind).Shape = try .initEmpty(allocator, num_repo_path);
+    var repos_triggering_at_min: BitSetTopology(kind).Shape = try .initEmpty(allocator, num_repo_path);
     defer repos_triggering_at_min.deinit(allocator);
     var current_time: vcaligner.rocksdb_custom.CommitSeqNative = 0;
     // 每个range被认为是发送开始事件和结束时间，时间向前跑，不断翻转在range内和不在range内的状态。
@@ -407,10 +419,10 @@ fn sweepLine(
 }
 
 fn commitToBuildingTopologies(
-    comptime kind: TopologyBitSetShapeKind,
+    comptime kind: BitTopologySetShapeKind,
     allocator: std.mem.Allocator,
-    building_topologies: *std.ArrayListUnmanaged(Topology(kind).Entry.Building),
-    shape: *const Topology(kind).Shape,
+    building_topologies: *std.ArrayListUnmanaged(BitSetTopology(kind).Entry.Building),
+    shape: *const BitSetTopology(kind).Shape,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
     for (building_topologies.items) |*entry| {
@@ -419,7 +431,7 @@ fn commitToBuildingTopologies(
             break;
         }
     } else {
-        var new_entry: Topology(kind).Entry.Building = .{ .shape = try shape.clone(allocator), .commits = .init };
+        var new_entry: BitSetTopology(kind).Entry.Building = .{ .shape = try shape.clone(allocator), .commits = .init };
         errdefer {
             new_entry.shape.deinit(allocator);
             new_entry.commits.b.deinit(allocator);
