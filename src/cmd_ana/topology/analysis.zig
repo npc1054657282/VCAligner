@@ -96,6 +96,19 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
         break :merge_agenda_units try agendas.toOwnedSlice(gpac.allocator);
     };
     defer gpac.allocator.free(agendas);
+    std.sort.pdq(AgendaUnit, agendas, {}, struct {
+        fn lessThan(_: void, a: AgendaUnit, b: AgendaUnit) bool {
+            const a_has_shape = a.maybe_topology_shape != null;
+            const b_has_shape = b.maybe_topology_shape != null;
+            if (a_has_shape != b_has_shape) {
+                return a_has_shape;
+            }
+            if (a.commit_count != b.commit_count) {
+                return a.commit_count < b.commit_count;
+            }
+            return a.artifact_blob_id < b.artifact_blob_id;
+        }
+    }.lessThan);
 }
 
 pub const mainWorkerManagedGpa = struct {
@@ -185,18 +198,6 @@ pub const release_artifact = struct {
     };
 };
 
-pub const AgendaUnit = struct {
-    artifact_blob_id: usize,
-    maybe_topology_shape: ?Shape,
-    commit_collection: vcaligner.commit_range.CommitCollection.View,
-    commit_count: usize,
-    pub const Shape = union(analyse_blob_topology.TopologyShapeKind) {
-        single: void,
-        integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,
-        dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
-    };
-};
-
 pub const ReleaseArtifactBlobManifest = struct {
     entrys: []Entry,
     release_artifact_paths: ReleaseArtifactPathKeysBacking,
@@ -282,5 +283,17 @@ pub const ReleaseArtifactBlobManifest = struct {
         pub fn slicedView(self: ReleaseArtifactPathKeysBacking, slicer: Slicer) SlicedView {
             return .{ .slice = self.backing[slicer.start..][0..slicer.len] };
         }
+    };
+};
+
+pub const AgendaUnit = struct {
+    artifact_blob_id: usize,
+    maybe_topology_shape: ?Shape,
+    commit_collection: vcaligner.commit_range.CommitCollection.View,
+    commit_count: usize,
+    pub const Shape = union(analyse_blob_topology.TopologyShapeKind) {
+        single: void,
+        integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,
+        dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
     };
 };
