@@ -46,6 +46,17 @@ pub const CommitCollection = struct {
     pub const Builder = struct {
         b: std.ArrayListUnmanaged(CommitRange),
         pub const init: Builder = .{ .b = .empty };
+        pub fn toOwnedCommitRanges(self: *Builder, allocator: std.mem.Allocator) !CommitCollection {
+            if (self.b.items.len == 0) {
+                std.log.err(
+                    \\Builded CommitCollection is empty.
+                    \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
+                    \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
+                , .{});
+                return error.EmptyCommitRanges;
+            }
+            return .{ .ranges = try self.b.toOwnedSlice(allocator) };
+        }
         // 在构建过程中添加一整个CommitRange，并断言这个Range的start不小于当前最新Range的start
         pub fn appendRangeAssertStartGte(self: *Builder, allocator: std.mem.Allocator, range: CommitRange) !void {
             if (self.b.items.len > 0) {
@@ -80,17 +91,6 @@ pub const CommitCollection = struct {
         }
         pub fn appendNativeAssumeGreater(self: *Builder, allocator: std.mem.Allocator, ci_native: CommitSeqNative) !void {
             try self.appendRangeAssumeGreater(allocator, .packStartEnd(ci_native, ci_native));
-        }
-        pub fn toOwnedCommitRanges(self: *Builder, allocator: std.mem.Allocator) !CommitCollection {
-            if (self.b.items.len == 0) {
-                std.log.err(
-                    \\Builded CommitCollection is empty.
-                    \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
-                    \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
-                , .{});
-                return error.EmptyCommitRanges;
-            }
-            return .{ .ranges = try self.b.toOwnedSlice(allocator) };
         }
         pub const Error = error{ EmptyCommitRanges, AppendAssumptionViolation };
     };
@@ -153,8 +153,9 @@ pub const CommitCollection = struct {
             intersection_builder.deinit(allocator);
             return .empty;
         } else {
+            const ranges = try intersection_builder.toOwnedSlice(allocator);
             self.deinit(allocator);
-            self.* = .{ .ranges = try intersection_builder.toOwnedSlice(allocator) };
+            self.* = .{ .ranges = ranges };
             return .restricted;
         }
     }
@@ -228,4 +229,83 @@ pub fn unionCollections(
     errdefer builder.b.deinit(allocator);
     for (all_ranges) |range| try builder.appendRangeAssertStartGte(allocator, range);
     return try builder.toOwnedCommitRanges(allocator);
+}
+
+fn testIntersectInPlace(
+    ranges_self: []const CommitRange,
+    ranges_other: []const CommitRange,
+    expect_result: anytype,
+    expect_intersection: []const CommitRange,
+) !void {
+    const allocator = std.testing.allocator;
+    var self: CommitCollection = .{ .ranges = try allocator.dupe(CommitRange, ranges_self) };
+    defer self.deinit(allocator);
+    const other: CommitCollection.View = .{ .ranges = ranges_other };
+    const result = try self.intersectInPlace(allocator, other);
+    try std.testing.expectEqual(expect_result, result);
+    try std.testing.expectEqualSlices(CommitRange, expect_intersection, self.ranges);
+}
+test "IntersectInPlace" {
+    try testIntersectInPlace(
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+        .unchanged,
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+    );
+    try testIntersectInPlace(
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+        &.{.packStartEnd(15, 35)},
+        .restricted,
+        &.{ .packStartEnd(15, 20), .packStartEnd(30, 35) },
+    );
+    try testIntersectInPlace(
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+        &.{ .packStartEnd(50, 60), .packStartEnd(70, 80) },
+        .empty,
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+    );
+    try testIntersectInPlace(
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+        &.{ .packStartEnd(0, 50), .packStartEnd(100, 200) },
+        .unchanged,
+        &.{ .packStartEnd(10, 20), .packStartEnd(30, 40) },
+    );
+    try testIntersectInPlace(
+        &.{.packStartEnd(10, 20)},
+        &.{.packStartEnd(21, 30)},
+        .empty,
+        &.{.packStartEnd(10, 20)},
+    );
+    try testIntersectInPlace(
+        &.{.packStartEnd(10, 20)},
+        &.{.packStartEnd(20, 30)},
+        .restricted,
+        &.{.packStartEnd(20, 20)},
+    );
+    try testIntersectInPlace(
+        &.{
+            .packStartEnd(10, 20),
+            .packStartEnd(30, 40),
+            .packStartEnd(50, 60),
+            .packStartEnd(70, 80),
+        },
+        &.{
+            .packStartEnd(0, 15),
+            .packStartEnd(35, 55),
+            .packStartEnd(75, 100),
+        },
+        .restricted,
+        &.{
+            .packStartEnd(10, 15),
+            .packStartEnd(35, 40),
+            .packStartEnd(50, 55),
+            .packStartEnd(75, 80),
+        },
+    );
+    try testIntersectInPlace(
+        &.{.packStartEnd(10, 30)},
+        &.{ .packStartEnd(0, 15), .packStartEnd(20, 40) },
+        .restricted,
+        &.{ .packStartEnd(10, 15), .packStartEnd(20, 30) },
+    );
 }

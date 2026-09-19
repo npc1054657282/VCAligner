@@ -5,12 +5,36 @@ const diag = vcaligner.diag;
 const c = vcaligner.c_helper.c;
 const AnaRunner = @import("AnaRunner.zig");
 const analyse_blob_topology = @import("analyse_blob_topology.zig");
+const analyse_candidates = @import("analyse_candidates.zig");
+
+pub const SubAnalyserStation = struct {
+    _: void align(std.atomic.cache_line),
+    recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
+    agenda_unit_count_statistics: usize,
+};
+
+pub const SubAnalysersHub = struct {
+    stations: []SubAnalyserStation,
+    pub fn init(n_jobs: usize, gpa: vcaligner.gpa.Concurrent) !SubAnalysersHub {
+        const stations = try gpa.allocator.alloc(SubAnalyserStation, n_jobs);
+        defer gpa.allocator.free(stations);
+        @memset(stations, .{ ._ = {}, .recycling_arena_state = .{}, .agenda_unit_count_statistics = 0 });
+        return .{ .stations = stations };
+    }
+    pub fn deinit(self: SubAnalysersHub, gpa: vcaligner.gpa.Concurrent) void {
+        for (self.stations) |*station| {
+            const handle = station.recycling_arena_state.handle(gpa.allocator);
+            handle.deinit();
+        }
+        gpa.allocator.free(self.stations);
+    }
+};
 
 pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     var gpae_instance: mainWorkerManagedGpa.Instance = .{ .instance = .init() };
     const gpae = gpae_instance.gpa();
     // 仅前半部分需要并行解析的部分需要频繁复用pool，此为其生存期。
-    const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest, const blob_analyser_hub: analyse_blob_topology.BlobAnalyserHub, const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = pool_lifetime: {
+    const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest, const blob_analyser_hub: SubAnalysersHub, const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = pool_lifetime: {
         var pool: vcaligner.Pool = undefined;
         try pool.init(.{ .allocator = gpac.allocator, .n_jobs = runconf.n_jobs - 1, .track_ids = true });
         defer pool.deinit();
@@ -28,12 +52,12 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
             release_artifact_paths_depot.deinit(gpae);
             blob_manifest.deinit(gpae);
         }
-        const blob_analyser_hub: analyse_blob_topology.BlobAnalyserHub = try .init(runconf.n_jobs, gpac);
+        const blob_analyser_hub: SubAnalysersHub = try .init(runconf.n_jobs, gpac);
         errdefer blob_analyser_hub.deinit(gpac);
         const storage: vcaligner.cli.ana_runner.Storage = try .init(runconf.point_lookup_cache_mb, runconf.rocksdb_path, last_diag);
         errdefer storage.deinit();
         const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = try analyse_blob_topology.analyseBlobTopology(
-            blob_manifest.entrys,
+            blob_manifest.entries,
             &pool,
             storage,
             blob_analyser_hub.stations,
@@ -109,6 +133,8 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
             return a.artifact_blob_id < b.artifact_blob_id;
         }
     }.lessThan);
+    const candidate_set = try @import("analyse_candidates.zig").analyseCandidates(agendas, gpae.allocator());
+    defer candidate_set.deinit(gpae.allocator());
 }
 
 pub const mainWorkerManagedGpa = struct {
@@ -199,10 +225,10 @@ pub const release_artifact = struct {
 };
 
 pub const ReleaseArtifactBlobManifest = struct {
-    entrys: []Entry,
+    entries: []Entry,
     release_artifact_paths: ReleaseArtifactPathKeysBacking,
     pub fn deinit(self: ReleaseArtifactBlobManifest, gpa: mainWorkerManagedGpa) void {
-        gpa.allocator().free(self.entrys);
+        gpa.allocator().free(self.entries);
         self.release_artifact_paths.deinit(gpa);
     }
     pub const Entry = struct {
@@ -229,9 +255,9 @@ pub const ReleaseArtifactBlobManifest = struct {
                 }
             };
             std.sort.pdq(ReleaseArtifactPathKeysBacking.Unit, self.list.items, @as(SortContext, .{ .node_depot = node_depot }), SortContext.lessThan);
-            const agendas = blk: {
-                var agenda_list: std.ArrayListUnmanaged(Entry) = .empty;
-                errdefer agenda_list.deinit(gpa.allocator());
+            const entries = blk: {
+                var entry_list: std.ArrayListUnmanaged(Entry) = .empty;
+                errdefer entry_list.deinit(gpa.allocator());
                 var i: usize = 0;
                 while (i < self.list.items.len) {
                     const current_hash = node_depot.get(self.list.items[i].nk).blob_hash;
@@ -243,7 +269,7 @@ pub const ReleaseArtifactBlobManifest = struct {
                         const pi = node_depot.get(unit.nk).path_key;
                         unit.* = .{ .pk = pi };
                     }
-                    try agenda_list.append(gpa.allocator(), .{
+                    try entry_list.append(gpa.allocator(), .{
                         .blob_hash = current_hash,
                         .release_artifact_paths_slicer = .{
                             .start = i,
@@ -252,11 +278,11 @@ pub const ReleaseArtifactBlobManifest = struct {
                     });
                     i = j;
                 }
-                break :blk try agenda_list.toOwnedSlice(gpa.allocator());
+                break :blk try entry_list.toOwnedSlice(gpa.allocator());
             };
-            errdefer gpa.allocator().free(agendas);
+            errdefer gpa.allocator().free(entries);
             return .{
-                .entrys = agendas,
+                .entries = entries,
                 .release_artifact_paths = .{ .backing = try self.list.toOwnedSlice(gpa.allocator()) },
             };
         }
@@ -296,11 +322,4 @@ pub const AgendaUnit = struct {
         integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,
         dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
     };
-};
-
-pub const CandidateAnalysis = struct {
-    commits: vcaligner.commit_range.CommitCollection,
-    created_by_agenda: usize,
-    refined_by_agendas: std.ArrayListUnmanaged(usize),
-    compatible_agendas: std.ArrayListUnmanaged(usize),
 };

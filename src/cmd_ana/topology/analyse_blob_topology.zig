@@ -3,29 +3,6 @@ const vcaligner = @import("vcaligner");
 const c = vcaligner.c_helper.c;
 const analysis = @import("analysis.zig");
 
-pub const BlobAnalyserStation = struct {
-    _: void align(std.atomic.cache_line),
-    recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
-    agenda_unit_count_statistics: usize,
-};
-
-pub const BlobAnalyserHub = struct {
-    stations: []BlobAnalyserStation,
-    pub fn init(n_jobs: usize, gpa: vcaligner.gpa.Concurrent) !BlobAnalyserHub {
-        const stations = try gpa.allocator.alloc(BlobAnalyserStation, n_jobs);
-        defer gpa.allocator.free(stations);
-        @memset(stations, .{ ._ = {}, .recycling_arena_state = .{}, .agenda_unit_count_statistics = 0 });
-        return .{ .stations = stations };
-    }
-    pub fn deinit(self: BlobAnalyserHub, gpa: vcaligner.gpa.Concurrent) void {
-        for (self.stations) |*station| {
-            const handle = station.recycling_arena_state.handle(gpa.allocator);
-            handle.deinit();
-        }
-        gpa.allocator.free(self.stations);
-    }
-};
-
 pub const TopologyShapeKind = enum {
     single,
     integer_bitset,
@@ -133,7 +110,7 @@ pub fn analyseBlobTopology(
     blob_hash_entries: []const analysis.ReleaseArtifactBlobManifest.Entry,
     pool: *vcaligner.Pool,
     storage: vcaligner.cli.ana_runner.Storage,
-    analyser_ctxs: []BlobAnalyserStation,
+    analyser_ctxs: []analysis.SubAnalyserStation,
     gpa: vcaligner.gpa.Concurrent,
 ) ![]BlobAnalysisResult {
     const results = try gpa.allocator.alloc(BlobAnalysisResult, blob_hash_entries.len);
@@ -157,7 +134,7 @@ pub fn analyseBlobTopologySubTask(
     blob_hash: c.git_oid,
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
-    analyser_ctxs: []BlobAnalyserStation,
+    analyser_ctxs: []analysis.SubAnalyserStation,
     gpa: vcaligner.gpa.Concurrent,
 ) void {
     analyseBlobTopologySub(
@@ -177,7 +154,7 @@ pub fn analyseBlobTopologySub(
     blob_hash: c.git_oid,
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
-    analyser_ctxs: []BlobAnalyserStation,
+    analyser_ctxs: []analysis.SubAnalyserStation,
     gpa: vcaligner.gpa.Concurrent,
 ) !void {
     var recycling_arena_handle = analyser_ctxs[thrd_id].recycling_arena_state.handle(gpa.allocator);
