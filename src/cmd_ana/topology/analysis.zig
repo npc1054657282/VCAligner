@@ -17,7 +17,7 @@ pub const SubAnalysersHub = struct {
     stations: []SubAnalyserStation,
     pub fn init(n_jobs: usize, gpa: vcaligner.gpa.Concurrent) !SubAnalysersHub {
         const stations = try gpa.allocator.alloc(SubAnalyserStation, n_jobs);
-        defer gpa.allocator.free(stations);
+        errdefer gpa.allocator.free(stations);
         @memset(stations, .{ ._ = {}, .recycling_arena_state = .{}, .agenda_unit_count_statistics = 0 });
         return .{ .stations = stations };
     }
