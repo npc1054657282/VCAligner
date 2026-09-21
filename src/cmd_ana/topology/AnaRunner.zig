@@ -5,13 +5,15 @@ const diag = vcaligner.diag;
 const cli = vcaligner.cli;
 const AnaRunner = @This();
 
+pub const ReportOutputConf = union(enum) {
+    manual: [:0]u8,
+    none: void,
+};
+
 global: cli.Runner.Global,
 rocksdb_path: [:0]u8,
 release_path: [:0]u8,
-report_output: union(enum) {
-    manual: [:0]u8,
-    none: void,
-},
+report_output: ReportOutputConf,
 point_lookup_cache_mb: u64,
 n_jobs: usize,
 

@@ -42,6 +42,30 @@ pub const CommitCollection = struct {
             for (self.ranges) |range| total += range.end - range.start + 1;
             return total;
         }
+        pub fn iter(self: View) Iter {
+            return .{
+                .view = self,
+                .cursor = 0,
+                .current = if (self.ranges.len > 0) self.ranges[0].start else unreachable,
+            };
+        }
+        pub const Iter = struct {
+            view: View,
+            cursor: usize,
+            current: CommitSeqNative,
+            pub fn next(self: *Iter) ?CommitSeq {
+                if (self.cursor > self.view.ranges.len) unreachable;
+                if (self.cursor == self.view.ranges.len) return null;
+                const to_yield = self.current;
+                if (to_yield < self.view.ranges[self.cursor].end) {
+                    self.current += 1;
+                } else {
+                    self.cursor += 1;
+                    self.current = if (self.cursor < self.view.ranges.len) self.view.ranges[self.cursor].start else undefined;
+                }
+                return .fromNative(to_yield);
+            }
+        };
     };
     pub const Builder = struct {
         b: std.ArrayListUnmanaged(CommitRange),

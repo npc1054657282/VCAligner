@@ -34,7 +34,7 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
     var gpae_instance: mainWorkerManagedGpa.Instance = .{ .instance = .init() };
     const gpae = gpae_instance.gpa();
     // 仅前半部分需要并行解析的部分需要频繁复用pool，此为其生存期。
-    const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest, const blob_analyser_hub: SubAnalysersHub, const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = pool_lifetime: {
+    const release_artifact_paths_depot: release_artifact.PathDepot, const blob_manifest: ReleaseArtifactBlobManifest, const blob_analyser_hub: SubAnalysersHub, const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult, const storage: vcaligner.cli.ana_runner.Storage = pool_lifetime: {
         var pool: vcaligner.Pool = undefined;
         try pool.init(.{ .allocator = gpac.allocator, .n_jobs = runconf.n_jobs - 1, .track_ids = true });
         defer pool.deinit();
@@ -64,10 +64,17 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
             gpac,
         );
         errdefer comptime unreachable;
-        break :pool_lifetime .{ release_artifact_paths_depot, blob_manifest, blob_analyser_hub, blob_analysis_results };
+        break :pool_lifetime .{
+            release_artifact_paths_depot,
+            blob_manifest,
+            blob_analyser_hub,
+            blob_analysis_results,
+            storage,
+        };
     };
     defer {
         // 各结果内容由blob_analyser_hub里的可回收arena一并释放，无需分别释放。
+        storage.deinit();
         gpac.allocator.free(blob_analysis_results);
         blob_analyser_hub.deinit(gpac);
         blob_manifest.deinit(gpae);
@@ -135,6 +142,7 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
     }.lessThan);
     const candidate_set = try @import("analyse_candidates.zig").analyseCandidates(agendas, gpae.allocator());
     defer candidate_set.deinit(gpae.allocator());
+    try @import("report.zig").report(&runconf.report_output, candidate_set.candidates, storage, agendas, &blob_manifest, blob_analysis_results, &release_artifact_paths_depot, gpae, last_diag);
 }
 
 pub const mainWorkerManagedGpa = struct {
@@ -305,6 +313,29 @@ pub const ReleaseArtifactBlobManifest = struct {
             pub fn get(self: SlicedView, index: usize) release_artifact.PathDepot.Key {
                 return self.slice[index].pk;
             }
+            pub fn iter(
+                self: SlicedView,
+                path_depot: *const release_artifact.PathDepot,
+            ) Iter {
+                return .{
+                    .view = self,
+                    .current = 0,
+                    .path_depot = path_depot,
+                };
+            }
+            pub const Iter = struct {
+                view: SlicedView,
+                current: usize,
+                path_depot: *const release_artifact.PathDepot,
+                pub fn next(self: *Iter) ?[:0]const u8 {
+                    const to_yield_index = self.current;
+                    if (to_yield_index > self.view.slice.len) unreachable;
+                    if (to_yield_index == self.view.slice.len) return null;
+                    const to_yield = self.path_depot.get(self.view.get(to_yield_index));
+                    self.current += 1;
+                    return to_yield;
+                }
+            };
         };
         pub fn slicedView(self: ReleaseArtifactPathKeysBacking, slicer: Slicer) SlicedView {
             return .{ .slice = self.backing[slicer.start..][0..slicer.len] };
