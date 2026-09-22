@@ -149,6 +149,9 @@ pub fn report(
                 try stringifier.objectField("refined_by_agendas");
                 refined_by_agendas: {
                     try stringifier.beginArray();
+                    const old_ws = stringifier.options.whitespace;
+                    stringifier.options.whitespace = .minified;
+                    defer stringifier.options.whitespace = old_ws;
                     for (candidate.refined_by_agendas) |refined_by_agenda_idx| {
                         try stringifier.write(refined_by_agenda_idx);
                     }
@@ -158,6 +161,9 @@ pub fn report(
                 try stringifier.objectField("compatible_agendas");
                 compatible_agendas: {
                     try stringifier.beginArray();
+                    const old_ws = stringifier.options.whitespace;
+                    stringifier.options.whitespace = .minified;
+                    defer stringifier.options.whitespace = old_ws;
                     for (candidate.compatible_agendas) |compatible_agenda_idx| {
                         try stringifier.write(compatible_agenda_idx);
                     }
@@ -276,4 +282,5 @@ pub fn report(
         try stringifier.endObject();
         break :output;
     }
+    try report_writer.interface.flush();
 }
