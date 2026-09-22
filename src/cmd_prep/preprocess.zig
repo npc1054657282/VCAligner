@@ -24,7 +24,7 @@ pub const Parsed = struct {
     // XXX: 考虑到分配器采用c allocator，glibc的分配器不会跨线程共享缓存
     // 因此当前采用“生产线程分配arena，消费线程销毁arena”的设计可能会因此性能不佳。
     // 未来可能每个线程会有自己的可复用回收的arena池，此处的arena可能会改为线程id + arena池索引。
-    gpa_instance: vcaligner.gpa.Owned.Instance,
+    gpa_instance: vcaligner.gpa.Exclusive.Instance,
     arena_state: StArena.State,
     commit_seq: CommitSeq,
     // NOTE: `parsed_unints`的大小是预先分配好的，由flush阈值决定，并非动态增长
@@ -36,7 +36,7 @@ pub const Parsed = struct {
         path: []u8,
     };
     pub fn deinit(self: *Parsed) void {
-        self.arena_state.promote(self.gpa_instance.gpao().allocator).deinit();
+        self.arena_state.promote(self.gpa_instance.gpae().allocator).deinit();
         self.gpa_instance.deinit();
     }
 };
@@ -45,9 +45,9 @@ pub const CommitMeta = struct {
     commit_seq: CommitSeq,
     pub const Batch = struct {
         batch: std.ArrayList(CommitMeta),
-        gpa_instance: vcaligner.gpa.Owned.Instance,
+        gpa_instance: vcaligner.gpa.Exclusive.Instance,
         pub fn deinit(self: *Batch) void {
-            self.batch.deinit(self.gpa_instance.gpao().allocator);
+            self.batch.deinit(self.gpa_instance.gpae().allocator);
             self.gpa_instance.deinit();
         }
     };
@@ -226,12 +226,12 @@ pub const writer_bound_registries = struct {
         }
     };
     pub const ManagedGpaInstance = struct {
-        instance: vcaligner.gpa.Owned.Instance,
+        instance: vcaligner.gpa.Exclusive.Instance,
         pub fn allocator(self: *ManagedGpaInstance) std.mem.Allocator {
-            return self.instance.gpao().allocator;
+            return self.instance.gpae().allocator;
         }
         pub fn handle(self: *ManagedGpaInstance, path_registry: *PathRegistry, blob_path_registry: *BlobPathRegistry) Handle {
-            return .{ .allocator = self.instance.gpao().allocator, .path_registry = path_registry, .blob_path_registry = blob_path_registry };
+            return .{ .allocator = self.instance.gpae().allocator, .path_registry = path_registry, .blob_path_registry = blob_path_registry };
         }
     };
     pub const Handle = struct {
@@ -247,14 +247,14 @@ pub const CommitRegistryWithManagedGpaInstance = struct {
     // 增量模式下，需要在主解析线程启动前put它，并在主解析线程中继续put。
     // 因此这要求跨线程地保存其分配器。此处的实现采用了专有分配器实例，这样可以规避线程安全的要求。
     // 专有分配器实例也可以通过一个线程安全的全局分配器实现来模拟此处的专有分配器实例需求。
-    gpa_instance: vcaligner.gpa.Owned.Instance,
+    gpa_instance: vcaligner.gpa.Exclusive.Instance,
     pub fn deinit(self: *CommitRegistryWithManagedGpaInstance) void {
-        self.map.deinit(self.gpa_instance.gpao().allocator);
+        self.map.deinit(self.gpa_instance.gpae().allocator);
         self.gpa_instance.deinit();
         self.* = undefined;
     }
     pub fn allocator(self: *CommitRegistryWithManagedGpaInstance) std.mem.Allocator {
-        return self.gpa_instance.gpao().allocator;
+        return self.gpa_instance.gpae().allocator;
     }
     pub fn loadForIncremental(
         self: *CommitRegistryWithManagedGpaInstance,

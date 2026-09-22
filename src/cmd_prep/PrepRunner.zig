@@ -95,31 +95,32 @@ proc_stamp: struct {
 // 启动增量时，总是基于上一次的rocksdb结果继续补充数据，而不支持“另存为”操作；
 // 如果有此需求，进程调用者应该事先备份rocksdb数据库，然后使用备份后的数据库作为`rocksdb-ouput`参数。
 const cmd_config: cli.CommandConfig = cli.Runner.cmd_config;
+pub const sub_cmd_name = "prep";
 pub const cmd = blk: {
     @setEvalBranchQuota(4096);
-    break :blk cli.Runner.Global.sharedArgs(zargs.Command.new("prep"))
+    break :blk cli.Runner.Global.sharedArgs(zargs.Command.new(sub_cmd_name))
         // 待预处理的git仓库路径。要求此路径下包含一个`.git`目录。此选项与`bare-repo-path`至少需要提供一个。如果有`bare-repo-path`参数，此选项被无视。
         .arg(zargs.Arg.optArg("repo_path", ?[]const u8).long("repo-path").help(
             \\Path to the target Git repository (must contain a .git directory). 
-        ++ vcaligner.cli.helpNewLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\Ignored if --bare-repo-path is provided.
-        ++ vcaligner.cli.helpLastLine(cmd_config) ++
+        ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
         // 待预处理的git裸仓库路径。此选项与`repo-path`至少需要提供一个。覆盖`repo-path`。
         .arg(zargs.Arg.optArg("bare_repo_path", ?[]const u8).long("bare-repo-path").help(
             \\Path to the target bare Git repository.
-        ++ vcaligner.cli.helpNewLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\Overrides --repo-path.
-        ++ vcaligner.cli.helpLastLine(cmd_config) ++
+        ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
         // 启用增量模式（基于已经解析过的预处理rocksdb数据库进行增量解析）。不提供此选项，则启用全量模式。
         .arg(zargs.Arg.opt("increment", bool).short('i').long("increment").help(
             \\Enable incremental parsing mode. 
-        ++ vcaligner.cli.helpNewLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\Must be used with an existing database via --rocksdb-output.
-        ++ vcaligner.cli.helpLastLine(cmd_config) ++
+        ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
         // 指定git仓库被解析到的rocksdb仓库路径。对于增量模式，此选项必须，且必须是一个已经存在的与指定的git仓库匹配的rocksdb数据库。
@@ -207,7 +208,7 @@ pub const cmd = blk: {
             \\Sets the threshold for flushing pending records to RocksDB.
         ++ cli.helpNewLine(cmd_config) ++
             \\Higher values reduce lock contention and commit frequency,
-        ++ cli.helpLastLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\at the cost of slightly higher memory usage.
         ++ cli.helpLastLine(cmd_config) ++
             \\
@@ -218,7 +219,7 @@ pub const cmd = blk: {
             \\Disable recovery point creation when running in incremental mode. 
         ++ cli.helpNewLine(cmd_config) ++
             \\By default, a recovery point is created to protect the existing RocksDB database from corruption in case of errors.
-        ++ cli.helpLastLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\Only effective when --increment is provided.
         ++ cli.helpLastLine(cmd_config) ++
             \\
@@ -227,8 +228,10 @@ pub const cmd = blk: {
             \\Custom path for the recovery checkpoint in incremental mode.
         ++ cli.helpNewLine(cmd_config) ++
             \\If not specified, defaults to the RocksDB output path with '.recovery' appended.
-        ++ cli.helpLastLine(cmd_config) ++
+        ++ cli.helpNewLine(cmd_config) ++
             \\Only used when --increment is active and recovery is not disabled.
+        ++ cli.helpLastLine(cmd_config) ++
+            \\
         ))
         .config(cmd_config);
 };
@@ -237,7 +240,7 @@ pub fn run(noalias self: *const PrepRunner, gpa: vcaligner.gpa.Concurrent, last_
     try @import("preprocess.zig").preprocess(self, gpa, last_diag);
     return;
 }
-pub fn initFromArgs(args: PrepRunner.cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
+pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
     const bare_repo_path: [:0]u8 = blk: {
         if (args.bare_repo_path) |bare_repo_path| break :blk try allocator.dupeZ(u8, bare_repo_path);
         if (args.repo_path) |repo_path| break :blk try std.fmt.allocPrintSentinel(allocator, "{s}/.git", .{repo_path}, 0);

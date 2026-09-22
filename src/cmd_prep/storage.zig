@@ -202,13 +202,13 @@ pub const Handles = struct {
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
         var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_options_t) = .init(.{
-            .bpi2ci = undefined,
+            .bpi_ci = undefined,
             .pi2p = normal_cf_options,
             .b_pi2bpi = undefined,
             .ci2c = normal_cf_options,
             .pr_bc2pi = undefined,
         });
-        all_cf_options.set(.bpi2ci, blk: {
+        all_cf_options.set(.bpi_ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
             // 一定要小心，此处神坑！slicetransform和mergeoperator进入options时都会变成shared ptr并且移交所有权！
@@ -217,7 +217,7 @@ pub const Handles = struct {
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi2ci));
+        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
         all_cf_options.set(.b_pi2bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyHeavyWriteOptimizationsToCfOptions(cf_options, compression, compaction_strategy, cf_max_write_buffer_number);
@@ -272,19 +272,19 @@ pub const Handles = struct {
         };
         defer c.rocksdb_options_destroy(normal_cf_options);
         var all_cf_options: std.enums.EnumArray(vcaligner.rocksdb_custom.CollumFamily, ?*c.rocksdb_options_t) = .init(.{
-            .bpi2ci = undefined,
+            .bpi_ci = undefined,
             .pi2p = normal_cf_options,
             .b_pi2bpi = undefined,
             .ci2c = normal_cf_options,
             .pr_bc2pi = undefined,
         });
-        all_cf_options.set(.bpi2ci, blk: {
+        all_cf_options.set(.bpi_ci, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
             c.rocksdb_options_set_prefix_extractor(cf_options, c.rocksdb_slicetransform_create_fixed_prefix(@sizeOf(vcaligner.rocksdb_custom.BlobPathSeq)));
             break :blk cf_options;
         });
-        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi2ci));
+        defer c.rocksdb_options_destroy(all_cf_options.get(.bpi_ci));
         all_cf_options.set(.b_pi2bpi, blk: {
             const cf_options = c.rocksdb_options_create().?;
             applyFullCompactionOptimizationsToCfOptions(cf_options, compression);
@@ -332,7 +332,7 @@ pub const Handles = struct {
         ), ?*c.rocksdb_column_family_handle_t),
         pub fn fromFullStorage(noalias storage: *const Handles) Cumulative {
             return .{ .db = storage.db, .cfs = .init(.{
-                .bpi2ci = storage.cfs.get(.bpi2ci),
+                .bpi_ci = storage.cfs.get(.bpi_ci),
                 .pi2p = storage.cfs.get(.pi2p),
                 .b_pi2bpi = storage.cfs.get(.b_pi2bpi),
                 .ci2c = storage.cfs.get(.ci2c),

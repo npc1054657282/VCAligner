@@ -96,22 +96,16 @@ candidate_parser: struct {
     }
 } = undefined,
 
-pub const cmd = CliRunner.Global.sharedArgs(zargs.Command.new("ana"))
-    .arg(zargs.Arg.optArg("rocksdb_path", []const u8).long("rocksdb-path"))
-    .arg(zargs.Arg.optArg("release_path", []const u8).long("release-path"))
-    .arg(zargs.Arg.optArg("report_output", ?[]const u8).long("report-output").short('o'))
-    .arg(zargs.Arg.optArg("package_directory", ?[]const u8).long("package-directory"))
-    .arg(zargs.Arg.optArg("point_lookup_cache_mb", u64).long("point-lookup-cache-mb").default(512))
-    .arg(zargs.Arg.optArg("jobs", ?usize).short('j').long("jobs"));
+const cmd = vcaligner.cli.ana_runner.cmd;
 
 pub fn run(self: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     try @import("analysis.zig").analysis(self, gpa, last_diag);
     return;
 }
-pub fn initFromArgs(args: AnaRunner.cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
+pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !CliRunner {
     const n_jobs = if (args.jobs) |jobs| jobs else try std.Thread.getCpuCount();
     return .{
-        .ana = .{
+        .ana_strict = .{
             .global = .init(args),
             .rocksdb_path = try allocator.dupeZ(u8, args.rocksdb_path),
             .release_path = try allocator.dupeZ(u8, args.release_path),
