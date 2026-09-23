@@ -200,6 +200,7 @@ pub fn analyseBlobTopologySub(
             };
         };
         errdefer allocator.free(repo_path_seqs);
+
         if (repo_path_seqs.len == 0) {
             blob_info_out.* = .{
                 ._ = {},
@@ -384,7 +385,7 @@ fn sweepLine(
                 }
             }
             current_time = min_event_time;
-        }
+        } else break;
     }
     try topologies.ensureTotalCapacity(allocator, building_topologies.items.len);
     for (building_topologies.items) |*building_entry|
