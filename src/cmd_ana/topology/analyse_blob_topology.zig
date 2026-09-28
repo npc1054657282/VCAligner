@@ -373,7 +373,7 @@ fn sweepLine(
         }
         if (maybe_min_event_time) |min_event_time| {
             if (active_repo_paths.raw.count() > 0 and current_time < min_event_time) {
-                const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time);
+                const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
                 try commitToBuildingTopologies(kind, allocator, &building_topologies, &active_repo_paths, valid_range);
             }
             // 状态推进
