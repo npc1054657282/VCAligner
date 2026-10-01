@@ -13,7 +13,7 @@ pub const EventNode = struct {
         return std.math.order(a.time, b.time);
     }
 };
-pub fn analyseCandidatesHeapSweep(
+pub fn analyseCandidatesSweep(
     evidences: []const analysis.AgendaUnit,
     gpa: vcaligner.gpa.Exclusive,
 ) !Candidate.Set {
@@ -49,7 +49,7 @@ pub fn analyseCandidatesHeapSweep(
         const min_event_time = first_event.time;
         if (active_evidences_count > 0 and current_time < min_event_time) {
             const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
-            try commitToCache(gpa.allocator, &cache, &active_evidences, valid_range);
+            try commitToCache(gpa.allocator, &cache, &active_evidences, active_evidences_count, valid_range);
         }
         continuous_replace: while (pq.peek()) |event| {
             if (event.time != min_event_time) break :continuous_replace;
@@ -85,66 +85,7 @@ pub fn analyseCandidatesHeapSweep(
     if (active_evidences_count > 0) {
         const max_time = std.math.maxInt(vcaligner.rocksdb_custom.CommitSeqNative);
         const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, max_time);
-        try commitToCache(gpa.allocator, &cache, &active_evidences, valid_range);
-    }
-    return try cache.toOwnedCandidateSet(gpa.allocator, evidences.len);
-}
-
-pub fn analyseCandidatesSweep(
-    evidences: []const analysis.AgendaUnit,
-    gpa: vcaligner.gpa.Exclusive,
-) !Candidate.Set {
-    var cache: Cache = .{
-        .map = .empty,
-        .maximals = .empty,
-        .cells_depot = .init(gpa.allocator),
-    };
-    errdefer cache.deinit(gpa.allocator);
-    const cursors = try gpa.allocator.alloc(usize, evidences.len);
-    @memset(cursors, 0);
-    defer gpa.allocator.free(cursors);
-    var active_evidences: std.DynamicBitSetUnmanaged = try .initEmpty(gpa.allocator, evidences.len);
-    defer active_evidences.deinit(gpa.allocator);
-    var evidences_triggering_at_min: std.DynamicBitSetUnmanaged = try .initEmpty(gpa.allocator, evidences.len);
-    defer evidences_triggering_at_min.deinit(gpa.allocator);
-    var current_time: vcaligner.rocksdb_custom.CommitSeqNative = 0;
-    while (true) {
-        var maybe_min_event_time: ?vcaligner.rocksdb_custom.CommitSeqNative = null;
-        scan_min_event_time: for (evidences, 0..) |*evidence, r| {
-            const commit_collection = evidence.commit_collection;
-            if (cursors[r] >= commit_collection.ranges.len) continue :scan_min_event_time;
-            const range = commit_collection.ranges[cursors[r]];
-            const event_time = if (active_evidences.isSet(r)) std.math.add(range.end, 1) catch continue :scan_min_event_time else range.start;
-            reset_old_state: {
-                if (maybe_min_event_time) |min_event_time| {
-                    if (event_time > min_event_time) continue :scan_min_event_time;
-                    if (event_time == min_event_time) break :reset_old_state;
-                }
-                maybe_min_event_time = event_time;
-                evidences_triggering_at_min.unsetAll();
-            }
-            evidences_triggering_at_min.set(r);
-        }
-        if (maybe_min_event_time) |min_event_time| {
-            if (active_evidences.count() > 0 and current_time < min_event_time) {
-                const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
-                try commitToCache(gpa.allocator, &cache, &active_evidences, valid_range);
-            }
-            // 状态推进
-            var it = evidences_triggering_at_min.iterator(.{});
-            while (it.next()) |r| {
-                active_evidences.toggle(r);
-                if (!active_evidences.isSet(r)) {
-                    cursors[r] += 1;
-                }
-            }
-            current_time = min_event_time;
-        } else break;
-    }
-    if (active_evidences.count() > 0) {
-        const max_time = std.math.maxInt(vcaligner.rocksdb_custom.CommitSeqNative);
-        const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, max_time);
-        try commitToCache(gpa.allocator, &cache, &active_evidences, valid_range);
+        try commitToCache(gpa.allocator, &cache, &active_evidences, active_evidences_count, valid_range);
     }
     return try cache.toOwnedCandidateSet(gpa.allocator, evidences.len);
 }
@@ -153,14 +94,15 @@ fn commitToCache(
     allocator: std.mem.Allocator,
     cache: *Cache,
     evidences: *const std.DynamicBitSetUnmanaged,
+    evidences_count: u32,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
     const hash_context: Signature.Context = .{ .bit_length = evidences.bit_length };
     if (cache.map.getKeyContext(.{ .raw = evidences.masks }, hash_context)) |signature| {
         const cell: Cache.Cell = .fromSignature(signature);
         switch (cell.heap_ptr.*) {
-            .maximal => |maximal_id| {
-                try cache.maximals.items[maximal_id].commit_collection.appendRangeAssumeGreater(allocator, valid_range);
+            .maximal => |maximal_info| {
+                try cache.maximals.items[maximal_info.slot_idx].commit_collection.appendRangeAssumeGreater(allocator, valid_range);
             },
             .dominated => {},
         }
@@ -177,28 +119,41 @@ fn commitToCache(
         errdefer commit_collection.b.deinit(allocator);
         maximal: while (true) {
             if (current_maximal_index == cache.maximals.items.len) break :maximal;
-            const current_signature_bit_set = cache.maximals.items[current_maximal_index].cell.heap_ptr.signature().promote(evidences.bit_length);
-            if (current_signature_bit_set.supersetOf(evidences)) {
-                cell.heap_ptr.* = .dominated;
-                commit_collection.b.deinit(allocator);
-                break :dominated;
-            }
-            if (current_signature_bit_set.subsetOf(evidences)) {
-                if (commit_collection.b.items.len == 0)
-                    try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
-                const removed = cache.maximals.swapRemove(current_maximal_index);
-                removed.cell.heap_ptr.* = .dominated;
-                removed.commit_collection.b.deinit(allocator);
-                if (current_maximal_index < cache.maximals.items.len) {
-                    cache.maximals.items[current_maximal_index].cell.heap_ptr.maximal = current_maximal_index;
-                }
-                continue :maximal;
+            const current_cell = cache.maximals.items[current_maximal_index].cell;
+            const current_evidence_count = current_cell.heap_ptr.maximal.evidence_count;
+            switch (std.math.order(current_evidence_count, evidences_count)) {
+                .gt => {
+                    const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_length);
+                    if (current_signature_bit_set.supersetOf(evidences)) {
+                        cell.heap_ptr.* = .dominated;
+                        commit_collection.b.deinit(allocator);
+                        break :dominated;
+                    }
+                },
+                .lt => {
+                    const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_length);
+                    if (current_signature_bit_set.subsetOf(evidences)) {
+                        if (commit_collection.b.items.len == 0)
+                            try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
+                        const removed = cache.maximals.swapRemove(current_maximal_index);
+                        removed.cell.heap_ptr.* = .dominated;
+                        removed.commit_collection.b.deinit(allocator);
+                        if (current_maximal_index < cache.maximals.items.len) {
+                            cache.maximals.items[current_maximal_index].cell.heap_ptr.maximal.slot_idx = @intCast(current_maximal_index);
+                        }
+                        continue :maximal;
+                    }
+                },
+                .eq => {},
             }
             current_maximal_index += 1;
         }
         if (commit_collection.b.items.len == 0)
             try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
-        cell.heap_ptr.* = .{ .maximal = cache.maximals.items.len };
+        cell.heap_ptr.* = .{ .maximal = .{
+            .slot_idx = @intCast(cache.maximals.items.len),
+            .evidence_count = evidences_count,
+        } };
         cache.maximals.appendAssumeCapacity(.{
             .commit_collection = commit_collection,
             .cell = cell,
@@ -247,7 +202,10 @@ pub const Cache = struct {
     pub const Cell = struct {
         pub const signature_offset = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(std.DynamicBitSetUnmanaged.MaskInt));
         pub const Header = union(enum) {
-            maximal: usize,
+            maximal: struct {
+                slot_idx: u32,
+                evidence_count: u32,
+            },
             dominated: void,
             pub inline fn signature(self: *Header) Signature {
                 // see https://codeberg.org/ziglang/zig/pulls/30823#issuecomment-9818066
