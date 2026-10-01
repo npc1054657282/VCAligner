@@ -17,6 +17,7 @@ pub const bare_union = @import("bare_union.zig");
 // 虽然当前代码仍然基于0.15.2版本，但出于向前兼容考虑，定义`StArena`为线程不安全的Arena，将尽可能替代源代码里标准库的Arena。
 pub const StArena = @import("thread_unsafe_arena.zig").ArenaAllocator;
 pub const ExclusiveRecyclingArena = @import("exclusive_recycling_arena.zig").ExclusiveRecyclingArena;
+pub const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 
 pub const runtime_safety = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,
