@@ -26,10 +26,24 @@ pub fn analyseCandidatesSweep(
     const cursors = try gpa.allocator.alloc(usize, evidences.len);
     @memset(cursors, 0);
     defer gpa.allocator.free(cursors);
-    var active_evidences: std.DynamicBitSetUnmanaged = try .initEmpty(gpa.allocator, evidences.len);
+    const zobrist_table = blk: {
+        const zobrist_table = try gpa.allocator.alloc(u64, evidences.len);
+        errdefer comptime unreachable;
+        var prng = std.Random.DefaultPrng.init(0);
+        for (zobrist_table) |*r| {
+            r.* = prng.random().int(u64);
+        }
+        break :blk zobrist_table;
+    };
+    defer gpa.allocator.free(zobrist_table);
+    var active_evidences: Signature.Pseudo = .{
+        .bit_set = try .initEmpty(gpa.allocator, evidences.len),
+        .hash = 0,
+    };
+    defer active_evidences.bit_set.deinit(gpa.allocator);
     // 缓存evidence数量，避免动态bitset每次执行`active_evidences.count()`时重复扫描的开销。
     var active_evidences_count: u32 = 0;
-    defer active_evidences.deinit(gpa.allocator);
+
     var pq: vcaligner.PriorityQueue(EventNode, void, EventNode.compare) = blk: {
         const init_events: []EventNode = try gpa.allocator.alloc(EventNode, evidences.len);
         errdefer comptime unreachable;
@@ -49,15 +63,23 @@ pub fn analyseCandidatesSweep(
         const min_event_time = first_event.time;
         if (active_evidences_count > 0 and current_time < min_event_time) {
             const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
-            try commitToCache(gpa.allocator, &cache, &active_evidences, active_evidences_count, valid_range);
+            try commitToCache(
+                gpa.allocator,
+                &cache,
+                &active_evidences,
+                active_evidences_count,
+                zobrist_table,
+                valid_range,
+            );
         }
         continuous_replace: while (pq.peek()) |event| {
             if (event.time != min_event_time) break :continuous_replace;
             const r = event.evidence_idx;
             const commit_collection = evidences[r].commit_collection;
-            active_evidences.toggle(r);
+            active_evidences.bit_set.toggle(r);
+            active_evidences.hash ^= zobrist_table[r];
             const new_event: ?EventNode = blk: {
-                if (active_evidences.isSet(r)) {
+                if (active_evidences.bit_set.isSet(r)) {
                     active_evidences_count += 1;
                     const end_time = commit_collection.ranges[cursors[r]].end;
                     const time = std.math.add(end_time, 1) catch break :blk null;
@@ -85,7 +107,14 @@ pub fn analyseCandidatesSweep(
     if (active_evidences_count > 0) {
         const max_time = std.math.maxInt(vcaligner.rocksdb_custom.CommitSeqNative);
         const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, max_time);
-        try commitToCache(gpa.allocator, &cache, &active_evidences, active_evidences_count, valid_range);
+        try commitToCache(
+            gpa.allocator,
+            &cache,
+            &active_evidences,
+            active_evidences_count,
+            zobrist_table,
+            valid_range,
+        );
     }
     return try cache.toOwnedCandidateSet(gpa.allocator, evidences.len);
 }
@@ -93,12 +122,13 @@ pub fn analyseCandidatesSweep(
 fn commitToCache(
     allocator: std.mem.Allocator,
     cache: *Cache,
-    evidences: *const std.DynamicBitSetUnmanaged,
+    evidences: *const Signature.Pseudo,
     evidences_count: u32,
+    zobrist_table: []const u64,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
-    const hash_context: Signature.Context = .{ .bit_length = evidences.bit_length };
-    if (cache.map.getKeyContext(.{ .raw = evidences.masks }, hash_context)) |signature| {
+    const pseudo_context: Signature.Pseudo.Context = .{};
+    if (cache.map.getKeyAdapted(evidences.*, pseudo_context)) |signature| {
         const cell: Cache.Cell = .fromSignature(signature);
         switch (cell.heap_ptr.*) {
             .maximal => |maximal_info| {
@@ -108,11 +138,13 @@ fn commitToCache(
         }
         return;
     }
+    std.debug.assert(zobrist_table.len == evidences.bit_set.bit_length);
+    const hash_context: Signature.Context = .{ .zobrist_table = zobrist_table };
     try cache.map.ensureUnusedCapacityContext(allocator, 1, hash_context);
     try cache.maximals.ensureUnusedCapacity(allocator, 1);
-    const cell: Cache.Cell = try .initUndefined(cache.cells_depot.allocator(), evidences.bit_length);
-    @memcpy(cell.heap_ptr.signature().raw, evidences.masks[0..numMasks(evidences.bit_length)]);
-    errdefer cell.deinit(cache.cells_depot.allocator(), evidences.bit_length);
+    const cell: Cache.Cell = try .initUndefined(cache.cells_depot.allocator(), evidences.bit_set.bit_length);
+    @memcpy(cell.heap_ptr.signature().raw, evidences.bit_set.masks[0..numMasks(evidences.bit_set.bit_length)]);
+    errdefer cell.deinit(cache.cells_depot.allocator(), evidences.bit_set.bit_length);
     var current_maximal_index: usize = 0;
     dominated: {
         var commit_collection: vcaligner.commit_range.CommitCollection.Builder = .init;
@@ -124,7 +156,7 @@ fn commitToCache(
             switch (std.math.order(current_evidence_count, evidences_count)) {
                 .gt => {
                     const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_length);
-                    if (current_signature_bit_set.supersetOf(evidences)) {
+                    if (current_signature_bit_set.supersetOf(evidences.bit_set)) {
                         cell.heap_ptr.* = .dominated;
                         commit_collection.b.deinit(allocator);
                         break :dominated;
@@ -132,7 +164,7 @@ fn commitToCache(
                 },
                 .lt => {
                     const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_length);
-                    if (current_signature_bit_set.subsetOf(evidences)) {
+                    if (current_signature_bit_set.subsetOf(evidences.bit_set)) {
                         if (commit_collection.b.items.len == 0)
                             try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
                         const removed = cache.maximals.swapRemove(current_maximal_index);
@@ -246,16 +278,35 @@ pub const Signature = struct {
         };
     }
     pub const Context = struct {
-        bit_length: usize,
+        zobrist_table: []const u64,
         pub fn hash(self: Context, c: Signature) u64 {
-            const masks = c.raw[0..numMasks(self.bit_length)];
-            var hasher = std.hash.Wyhash.init(0);
-            std.hash.autoHashStrat(&hasher, masks, .Deep);
-            return hasher.final();
+            var h: u64 = 0;
+            const bit_length = self.zobrist_table.len;
+            const bit_set = c.promote(bit_length);
+            var it = bit_set.iterator(.{});
+            while (it.next()) |idx| {
+                h ^= self.zobrist_table[idx];
+            }
+            return h;
         }
         pub fn eql(self: Context, a: Signature, b: Signature) bool {
-            return a.promote(self.bit_length).eql(b.promote(self.bit_length));
+            const bit_length = self.zobrist_table.len;
+            return a.promote(bit_length).eql(b.promote(bit_length));
         }
+    };
+    pub const Pseudo = struct {
+        bit_set: std.DynamicBitSetUnmanaged,
+        hash: u64,
+        pub const Context = struct {
+            pub fn hash(self: Pseudo.Context, c: Pseudo) u64 {
+                _ = self;
+                return c.hash;
+            }
+            pub fn eql(self: Pseudo.Context, a: Pseudo, b: Signature) bool {
+                _ = self;
+                return a.bit_set.eql(b.promote(a.bit_set.bit_length));
+            }
+        };
     };
 };
 pub const Candidate = struct {
