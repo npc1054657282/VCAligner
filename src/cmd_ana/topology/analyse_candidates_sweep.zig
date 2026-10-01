@@ -36,7 +36,7 @@ pub fn analyseCandidatesSweep(
         break :blk zobrist_table;
     };
     defer gpa.allocator.free(zobrist_table);
-    var active_evidences: Signature.Pseudo = .{
+    var active_evidences: Cache.PseudoKey = .{
         .bit_set = try .initEmpty(gpa.allocator, evidences.len),
         .hash = 0,
     };
@@ -68,7 +68,6 @@ pub fn analyseCandidatesSweep(
                 &cache,
                 &active_evidences,
                 active_evidences_count,
-                zobrist_table,
                 valid_range,
             );
         }
@@ -112,7 +111,6 @@ pub fn analyseCandidatesSweep(
             &cache,
             &active_evidences,
             active_evidences_count,
-            zobrist_table,
             valid_range,
         );
     }
@@ -122,15 +120,14 @@ pub fn analyseCandidatesSweep(
 fn commitToCache(
     allocator: std.mem.Allocator,
     cache: *Cache,
-    evidences: *const Signature.Pseudo,
+    evidences: *const Cache.PseudoKey,
     evidences_count: u32,
-    zobrist_table: []const u64,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
-    const pseudo_context: Signature.Pseudo.Context = .{};
+    const pseudo_context: Cache.PseudoKey.Context = .{};
     if (cache.map.getKeyAdapted(evidences.*, pseudo_context)) |signature| {
         const cell: Cache.Cell = .fromSignature(signature);
-        switch (cell.heap_ptr.*) {
+        switch (cell.heap_ptr.state) {
             .maximal => |maximal_info| {
                 try cache.maximals.items[maximal_info.slot_idx].commit_collection.appendRangeAssumeGreater(allocator, valid_range);
             },
@@ -138,8 +135,7 @@ fn commitToCache(
         }
         return;
     }
-    std.debug.assert(zobrist_table.len == evidences.bit_set.bit_length);
-    const hash_context: Signature.Context = .{ .zobrist_table = zobrist_table };
+    const hash_context: Cache.MapContext = .{ .bit_length = evidences.bit_set.bit_length };
     try cache.map.ensureUnusedCapacityContext(allocator, 1, hash_context);
     try cache.maximals.ensureUnusedCapacity(allocator, 1);
     const cell: Cache.Cell = try .initUndefined(cache.cells_depot.allocator(), evidences.bit_set.bit_length);
@@ -152,12 +148,15 @@ fn commitToCache(
         maximal: while (true) {
             if (current_maximal_index == cache.maximals.items.len) break :maximal;
             const current_cell = cache.maximals.items[current_maximal_index].cell;
-            const current_evidence_count = current_cell.heap_ptr.maximal.evidence_count;
+            const current_evidence_count = current_cell.heap_ptr.state.maximal.evidence_count;
             switch (std.math.order(current_evidence_count, evidences_count)) {
                 .gt => {
                     const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_length);
                     if (current_signature_bit_set.supersetOf(evidences.bit_set)) {
-                        cell.heap_ptr.* = .dominated;
+                        cell.heap_ptr.* = .{
+                            .state = .dominated,
+                            .hash = evidences.hash,
+                        };
                         commit_collection.b.deinit(allocator);
                         break :dominated;
                     }
@@ -168,10 +167,10 @@ fn commitToCache(
                         if (commit_collection.b.items.len == 0)
                             try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
                         const removed = cache.maximals.swapRemove(current_maximal_index);
-                        removed.cell.heap_ptr.* = .dominated;
+                        removed.cell.heap_ptr.state = .dominated;
                         removed.commit_collection.b.deinit(allocator);
                         if (current_maximal_index < cache.maximals.items.len) {
-                            cache.maximals.items[current_maximal_index].cell.heap_ptr.maximal.slot_idx = @intCast(current_maximal_index);
+                            cache.maximals.items[current_maximal_index].cell.heap_ptr.state.maximal.slot_idx = @intCast(current_maximal_index);
                         }
                         continue :maximal;
                     }
@@ -182,10 +181,15 @@ fn commitToCache(
         }
         if (commit_collection.b.items.len == 0)
             try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
-        cell.heap_ptr.* = .{ .maximal = .{
-            .slot_idx = @intCast(cache.maximals.items.len),
-            .evidence_count = evidences_count,
-        } };
+        cell.heap_ptr.* = .{
+            .state = .{
+                .maximal = .{
+                    .slot_idx = @intCast(cache.maximals.items.len),
+                    .evidence_count = evidences_count,
+                },
+            },
+            .hash = evidences.hash,
+        };
         cache.maximals.appendAssumeCapacity(.{
             .commit_collection = commit_collection,
             .cell = cell,
@@ -195,7 +199,7 @@ fn commitToCache(
 }
 
 pub const Cache = struct {
-    map: std.HashMapUnmanaged(Signature, void, Signature.Context, std.hash_map.default_max_load_percentage),
+    map: std.HashMapUnmanaged(Signature, void, MapContext, std.hash_map.default_max_load_percentage),
     maximals: std.ArrayListUnmanaged(Maximal),
     cells_depot: vcaligner.StArena,
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
@@ -233,12 +237,15 @@ pub const Cache = struct {
     }
     pub const Cell = struct {
         pub const signature_offset = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(std.DynamicBitSetUnmanaged.MaskInt));
-        pub const Header = union(enum) {
-            maximal: struct {
-                slot_idx: u32,
-                evidence_count: u32,
+        pub const Header = struct {
+            state: union(enum) {
+                maximal: struct {
+                    slot_idx: u32,
+                    evidence_count: u32,
+                },
+                dominated: void,
             },
-            dominated: void,
+            hash: u64,
             pub inline fn signature(self: *Header) Signature {
                 // see https://codeberg.org/ziglang/zig/pulls/30823#issuecomment-9818066
                 return .{ .raw = @ptrCast(@alignCast(@as([*]u8, @ptrCast(self)) + signature_offset)) };
@@ -267,6 +274,31 @@ pub const Cache = struct {
         cell: Cell,
         commit_collection: vcaligner.commit_range.CommitCollection.Builder,
     };
+    pub const MapContext = struct {
+        bit_length: usize,
+        pub fn hash(self: MapContext, c: Signature) u64 {
+            _ = self;
+            const cell: Cache.Cell = .fromSignature(c);
+            return cell.heap_ptr.hash;
+        }
+        pub fn eql(self: MapContext, a: Signature, b: Signature) bool {
+            return a.promote(self.bit_length).eql(b.promote(self.bit_length));
+        }
+    };
+    pub const PseudoKey = struct {
+        bit_set: std.DynamicBitSetUnmanaged,
+        hash: u64,
+        pub const Context = struct {
+            pub fn hash(self: PseudoKey.Context, c: PseudoKey) u64 {
+                _ = self;
+                return c.hash;
+            }
+            pub fn eql(self: PseudoKey.Context, a: PseudoKey, b: Signature) bool {
+                _ = self;
+                return a.bit_set.eql(b.promote(a.bit_set.bit_length));
+            }
+        };
+    };
 };
 
 pub const Signature = struct {
@@ -277,37 +309,6 @@ pub const Signature = struct {
             .masks = self.raw,
         };
     }
-    pub const Context = struct {
-        zobrist_table: []const u64,
-        pub fn hash(self: Context, c: Signature) u64 {
-            var h: u64 = 0;
-            const bit_length = self.zobrist_table.len;
-            const bit_set = c.promote(bit_length);
-            var it = bit_set.iterator(.{});
-            while (it.next()) |idx| {
-                h ^= self.zobrist_table[idx];
-            }
-            return h;
-        }
-        pub fn eql(self: Context, a: Signature, b: Signature) bool {
-            const bit_length = self.zobrist_table.len;
-            return a.promote(bit_length).eql(b.promote(bit_length));
-        }
-    };
-    pub const Pseudo = struct {
-        bit_set: std.DynamicBitSetUnmanaged,
-        hash: u64,
-        pub const Context = struct {
-            pub fn hash(self: Pseudo.Context, c: Pseudo) u64 {
-                _ = self;
-                return c.hash;
-            }
-            pub fn eql(self: Pseudo.Context, a: Pseudo, b: Signature) bool {
-                _ = self;
-                return a.bit_set.eql(b.promote(a.bit_set.bit_length));
-            }
-        };
-    };
 };
 pub const Candidate = struct {
     commits: vcaligner.commit_range.CommitCollection,
