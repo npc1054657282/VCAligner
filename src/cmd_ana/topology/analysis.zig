@@ -354,3 +354,157 @@ pub const AgendaUnit = struct {
         dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
     };
 };
+
+pub const Evidences = struct {
+    pub const Unit = struct {
+        blob_priority_idx: usize,
+        maybe_topology_shape: ?Shape,
+        commit_collection: vcaligner.commit_range.CommitCollection.View,
+        pub const Shape = union(analyse_blob_topology.TopologyShapeKind) {
+            single: void,
+            integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,
+            dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
+        };
+    };
+    units: []Unit,
+    pub fn init(
+        total_evidence_count: usize,
+        blob_priority_entries: []const BlobEvidencePriorityTable.Entry,
+        blob_analysis_results: []const analyse_blob_topology.BlobAnalysisResult,
+        allocator: std.mem.Allocator,
+    ) !Evidences {
+        std.debug.assert(blob_priority_entries.len == blob_analysis_results.len);
+        var units: std.ArrayListUnmanaged(Unit) = try .initCapacity(allocator, total_evidence_count);
+        errdefer units.deinit(allocator);
+        loop: for (blob_priority_entries, 0..) |*entry, blob_priority_idx| {
+            switch (entry.evidence_strength) {
+                .unambiguous, .ambiguous => {
+                    const blob_analysis_result = &blob_analysis_results[entry.artifact_blob_id];
+                    const repo_path_seqs_count = blob_analysis_result.repo_path_seqs.len;
+                    const topologies = &blob_analysis_result.details.active.topologies.proceed;
+                    const kind: analyse_blob_topology.TopologyShapeKind = .fromRepoPathSeqsNum(repo_path_seqs_count);
+                    switch (kind) {
+                        .single => units.appendAssumeCapacity(.{
+                            .blob_priority_idx = blob_priority_idx,
+                            .maybe_topology_shape = .single,
+                            .commit_collection = topologies.single,
+                        }),
+                        inline .integer_bitset, .dynamic_bitset => |comptime_kind| {
+                            const shape_entries = @field(topologies, @tagName(comptime_kind));
+                            for (shape_entries) |*shape_entry| {
+                                units.appendAssumeCapacity(.{
+                                    .blob_priority_idx = blob_priority_idx,
+                                    .maybe_topology_shape = @unionInit(Unit.Shape, @tagName(comptime_kind), shape_entry.shape.view()),
+                                    .commit_collection = shape_entry.commits.view(),
+                                });
+                            }
+                        },
+                    }
+                },
+                .coarse => units.appendAssumeCapacity(.{
+                    .blob_priority_idx = blob_priority_idx,
+                    .maybe_topology_shape = null,
+                    .commit_collection = blob_analysis_results[entry.artifact_blob_id].details.active.topologies.skip.view(),
+                }),
+                // 由于blob_priority_entries经过排序，none一定为优先级最低，后面都是none
+                .none => break :loop,
+            }
+        }
+        std.debug.assert(units.items.len == total_evidence_count);
+        return .{ .units = try units.toOwnedSlice(allocator) };
+    }
+    pub fn deinit(self: Evidences, allocator: std.mem.Allocator) void {
+        allocator.free(self.units);
+    }
+};
+
+// blob会被按照EvidenceStrength和对应的commit数量进行排序。会影响最终报告的顺序。
+pub const BlobEvidencePriorityTable = struct {
+    entries: []Entry,
+    total_evidence_count: usize,
+    pub fn init(
+        blob_analysis_results: []const analyse_blob_topology.BlobAnalysisResult,
+        allocator: std.mem.Allocator,
+    ) !BlobEvidencePriorityTable {
+        const entries, const total_evidence_count = blk: {
+            var total_evidence_count: usize = 0;
+            var entries: std.ArrayListUnmanaged(Entry) = try .initCapacity(allocator, blob_analysis_results.len);
+            errdefer entries.deinit(allocator);
+            for (blob_analysis_results, 0..) |*blob_analysis_result, artifact_blob_id| {
+                const repo_path_seqs_count = blob_analysis_result.repo_path_seqs.len;
+                if (repo_path_seqs_count == 0) {
+                    entries.appendAssumeCapacity(.{
+                        .artifact_blob_id = artifact_blob_id,
+                        .evidence_strength = .none,
+                        .blob_commit_count = 0,
+                    });
+                    continue;
+                }
+                switch (blob_analysis_result.details.active.topologies) {
+                    .skip => {
+                        entries.appendAssumeCapacity(.{
+                            .artifact_blob_id = artifact_blob_id,
+                            .evidence_strength = .coarse,
+                            .blob_commit_count = blob_analysis_result.details.active.commit_count,
+                        });
+                        total_evidence_count += 1;
+                    },
+                    .proceed => |*topologies| {
+                        const kind: analyse_blob_topology.TopologyShapeKind = .fromRepoPathSeqsNum(repo_path_seqs_count);
+                        switch (kind) {
+                            .single => {
+                                entries.appendAssumeCapacity(.{
+                                    .artifact_blob_id = artifact_blob_id,
+                                    .evidence_strength = .unambiguous,
+                                    .blob_commit_count = blob_analysis_result.details.active.commit_count,
+                                });
+                                total_evidence_count += 1;
+                            },
+                            inline .integer_bitset, .dynamic_bitset => |comptime_kind| {
+                                const shape_entries = @field(topologies, @tagName(comptime_kind));
+                                entries.appendAssumeCapacity(.{
+                                    .artifact_blob_id = artifact_blob_id,
+                                    .evidence_strength = if (shape_entries.len == 1) .unambiguous else .ambiguous,
+                                    .blob_commit_count = blob_analysis_result.details.active.commit_count,
+                                });
+                                total_evidence_count += shape_entries.len;
+                            },
+                        }
+                    },
+                }
+            }
+            break :blk .{ try entries.toOwnedSlice(allocator), total_evidence_count };
+        };
+        std.sort.pdq(Entry, entries, {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                if (a.evidence_strength != b.evidence_strength) {
+                    return @intFromEnum(a.evidence_strength) > @intFromEnum(b.evidence_strength);
+                }
+                if (a.blob_commit_count != b.blob_commit_count) {
+                    return a.blob_commit_count < b.blob_commit_count;
+                }
+                return a.artifact_blob_id < b.artifact_blob_id;
+            }
+        }.lessThan);
+        return .{ .entries = entries, .total_evidence_count = total_evidence_count };
+    }
+    pub fn deinit(self: BlobEvidencePriorityTable, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+    }
+    pub const Entry = struct {
+        artifact_blob_id: usize,
+        evidence_strength: EvidenceStrength,
+        blob_commit_count: usize,
+    };
+    // 基于各blob构造的证据强度不同
+    pub const EvidenceStrength = enum(u2) {
+        // 基于这个blob构造不出证据
+        none = 0,
+        // 这个blob的证据被认为价值不高，没有精炼到topology level。
+        coarse = 1,
+        // 这个blob的证据被精炼，存在多个topology evidence，因此其各个证据是否有效存在模糊性。
+        ambiguous = 2,
+        // 这个blob的证据被精炼，仅一个topology，有效性高。
+        unambiguous = 3,
+    };
+};

@@ -16,6 +16,7 @@ pub const EventNode = struct {
 pub fn analyseCandidatesSweep(
     evidences: []const analysis.AgendaUnit,
     gpa: vcaligner.gpa.Exclusive,
+    seed: u64,
 ) !Candidate.Set {
     var cache: Cache = .{
         .map = .empty,
@@ -29,7 +30,7 @@ pub fn analyseCandidatesSweep(
     const zobrist_table = blk: {
         const zobrist_table = try gpa.allocator.alloc(u64, evidences.len);
         errdefer comptime unreachable;
-        var prng = std.Random.DefaultPrng.init(0);
+        var prng = std.Random.DefaultPrng.init(seed);
         for (zobrist_table) |*r| {
             r.* = prng.random().int(u64);
         }

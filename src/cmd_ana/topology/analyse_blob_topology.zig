@@ -95,6 +95,8 @@ pub const BlobAnalysisResult = struct {
         active: struct {
             commit_collections_per_repo_path: [*]vcaligner.commit_range.CommitCollection,
             topologies: BlobTopologiesResolution,
+            // 趁热即时计算blob总commit count的缓存
+            commit_count: usize,
         },
     },
 };
@@ -272,6 +274,20 @@ pub fn analyseBlobTopologySub(
             .dynamic_bitset => topologies.proceed.dynamic_bitset.len,
         },
     };
+    const commit_count = switch (topologies) {
+        .skip => |*commit_collection| commit_collection.view().commitCount(),
+        .proceed => |*proceed| switch (TopologyShapeKind.fromRepoPathSeqsNum(repo_path_seqs.len)) {
+            .single => proceed.single.commitCount(),
+            inline .integer_bitset, .dynamic_bitset => |comptime_kind| blk: {
+                const shape_entries = @field(proceed, @tagName(comptime_kind));
+                var commit_count: usize = 0;
+                for (shape_entries) |*entry| {
+                    commit_count += entry.commits.view().commitCount();
+                }
+                break :blk commit_count;
+            },
+        },
+    };
     blob_info_out.* = .{
         ._ = {},
         .analyser_id = thrd_id,
@@ -279,6 +295,7 @@ pub fn analyseBlobTopologySub(
         .details = .{ .active = .{
             .commit_collections_per_repo_path = commit_collections_per_repo_path.ptr,
             .topologies = topologies,
+            .commit_count = commit_count,
         } },
     };
 }
