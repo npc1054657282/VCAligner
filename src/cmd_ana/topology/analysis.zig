@@ -5,7 +5,6 @@ const diag = vcaligner.diag;
 const c = vcaligner.c_helper.c;
 const AnaRunner = @import("AnaRunner.zig");
 const analyse_blob_topology = @import("analyse_blob_topology.zig");
-const analyse_candidates = @import("analyse_candidates.zig");
 
 pub const SubAnalyserStation = struct {
     _: void align(std.atomic.cache_line),
@@ -81,68 +80,36 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
         release_artifact_paths_depot.deinit(gpae);
     }
     // 主线程归并分析所有的分析结果，构造解析单元
-    const agendas = merge_agenda_units: {
-        const agenda_unit_count = blk: {
-            var count: usize = 0;
-            for (blob_analyser_hub.stations) |*station| count += station.agenda_unit_count_statistics;
-            break :blk count;
-        };
-        var agendas: std.ArrayListUnmanaged(AgendaUnit) = try .initCapacity(gpac.allocator, agenda_unit_count);
-        errdefer agendas.deinit(gpac.allocator);
-        for (blob_analysis_results, 0..) |*blob_analysis_result, artifact_blob_id| {
-            const repo_path_seqs_count = blob_analysis_result.repo_path_seqs.len;
-            if (repo_path_seqs_count == 0) continue;
-            switch (blob_analysis_result.details.active.topologies) {
-                .skip => |*commit_collection| agendas.appendAssumeCapacity(.{
-                    .artifact_blob_id = artifact_blob_id,
-                    .maybe_topology_shape = null,
-                    .commit_collection = commit_collection.view(),
-                    .commit_count = commit_collection.view().commitCount(),
-                }),
-                .proceed => |*topologies| {
-                    const kind: analyse_blob_topology.TopologyShapeKind = .fromRepoPathSeqsNum(repo_path_seqs_count);
-                    switch (kind) {
-                        .single => agendas.appendAssumeCapacity(.{
-                            .artifact_blob_id = artifact_blob_id,
-                            .maybe_topology_shape = .single,
-                            .commit_collection = topologies.single,
-                            .commit_count = topologies.single.commitCount(),
-                        }),
-                        inline .integer_bitset, .dynamic_bitset => |comptime_kind| {
-                            const entries = @field(topologies, @tagName(comptime_kind));
-                            for (entries) |*entry| {
-                                const commit_collection = entry.commits.view();
-                                agendas.appendAssumeCapacity(.{
-                                    .artifact_blob_id = artifact_blob_id,
-                                    .maybe_topology_shape = @unionInit(AgendaUnit.Shape, @tagName(comptime_kind), entry.shape.view()),
-                                    .commit_collection = commit_collection,
-                                    .commit_count = commit_collection.commitCount(),
-                                });
-                            }
-                        },
-                    }
-                },
-            }
-        }
-        break :merge_agenda_units try agendas.toOwnedSlice(gpac.allocator);
-    };
-    defer gpac.allocator.free(agendas);
-    std.sort.pdq(AgendaUnit, agendas, {}, struct {
-        fn lessThan(_: void, a: AgendaUnit, b: AgendaUnit) bool {
-            const a_has_shape = a.maybe_topology_shape != null;
-            const b_has_shape = b.maybe_topology_shape != null;
-            if (a_has_shape != b_has_shape) {
-                return a_has_shape;
-            }
-            if (a.commit_count != b.commit_count) {
-                return a.commit_count < b.commit_count;
-            }
-            return a.artifact_blob_id < b.artifact_blob_id;
-        }
-    }.lessThan);
-    const candidate_set = try @import("analyse_candidates.zig").analyseCandidates(agendas, gpae.allocator());
-    defer candidate_set.deinit(gpae.allocator());
-    try @import("report.zig").report(&runconf.report_output, candidate_set.candidates, storage, agendas, &blob_manifest, blob_analysis_results, &release_artifact_paths_depot, gpae, last_diag);
+    const blob_evidence_priority_table: BlobEvidencePriorityTable = try .init(
+        blob_analysis_results,
+        gpae.allocator(),
+    );
+    defer blob_evidence_priority_table.deinit(gpae.allocator());
+    const evidences: Evidences = try .init(
+        blob_evidence_priority_table.total_evidence_count,
+        blob_evidence_priority_table.entries,
+        blob_analysis_results,
+        gpae.allocator(),
+    );
+    defer evidences.deinit(gpae.allocator());
+    const candidate_set = try @import("analyse_candidates.zig").analyseCandidates(
+        evidences.units,
+        gpae.gpa,
+        0,
+    );
+    defer candidate_set.deinit(gpae.allocator(), evidences.units.len);
+    try @import("report.zig").report(
+        &runconf.report_output,
+        candidate_set.candidates,
+        storage,
+        evidences.units,
+        blob_evidence_priority_table.entries,
+        &blob_manifest,
+        blob_analysis_results,
+        &release_artifact_paths_depot,
+        gpae,
+        last_diag,
+    );
 }
 
 pub const mainWorkerManagedGpa = struct {

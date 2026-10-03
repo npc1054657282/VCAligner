@@ -17,7 +17,8 @@ pub fn report(
     report_output: *const AnaRunner.ReportOutputConf,
     candidates: []const analyse_candidates.Candidate,
     storage: vcaligner.cli.ana_runner.Storage,
-    agendas: []const analysis.AgendaUnit,
+    evidences: []const analysis.Evidences.Unit,
+    blob_priorities: []analysis.BlobEvidencePriorityTable.Entry,
     release_artifact_blob_manifest: *const analysis.ReleaseArtifactBlobManifest,
     blob_analysis_results: []const analyse_blob_topology.BlobAnalysisResult,
     release_path_depot: *const analysis.release_artifact.PathDepot,
@@ -67,7 +68,6 @@ pub fn report(
         }
         break :repo_paths_map_build;
     }
-
     const report_file = switch (report_output.*) {
         .manual => |path| try std.fs.cwd().createFileZ(path, .{}),
         .none => std.fs.File.stdout(),
@@ -144,57 +144,46 @@ pub fn report(
                     try stringifier.endArray();
                     break :commits;
                 }
-                try stringifier.objectField("created_by_agenda");
-                try stringifier.write(candidate.created_by_agenda);
-                try stringifier.objectField("refined_by_agendas");
-                refined_by_agendas: {
+                try stringifier.objectField("compatible_evidences");
+                compatible_evidences: {
                     try stringifier.beginArray();
                     const old_ws = stringifier.options.whitespace;
                     stringifier.options.whitespace = .minified;
                     defer stringifier.options.whitespace = old_ws;
-                    for (candidate.refined_by_agendas) |refined_by_agenda_idx| {
-                        try stringifier.write(refined_by_agenda_idx);
+                    const evidences_bit_map = candidate.signature.promote(evidences.len);
+                    var it = evidences_bit_map.iterator(.{});
+                    while (it.next()) |evidence_idx| {
+                        try stringifier.write(evidence_idx);
                     }
                     try stringifier.endArray();
-                    break :refined_by_agendas;
-                }
-                try stringifier.objectField("compatible_agendas");
-                compatible_agendas: {
-                    try stringifier.beginArray();
-                    const old_ws = stringifier.options.whitespace;
-                    stringifier.options.whitespace = .minified;
-                    defer stringifier.options.whitespace = old_ws;
-                    for (candidate.compatible_agendas) |compatible_agenda_idx| {
-                        try stringifier.write(compatible_agenda_idx);
-                    }
-                    try stringifier.endArray();
-                    break :compatible_agendas;
+                    break :compatible_evidences;
                 }
                 try stringifier.endObject();
             }
             try stringifier.endArray();
             break :candidates;
         }
-        try stringifier.objectField("agendas");
-        agendas: {
+        try stringifier.objectField("evidences");
+        evidences: {
             try stringifier.beginArray();
-            for (agendas, 0..) |*agenda_unit, agenda_idx| {
+            for (evidences, 0..) |*evidence, evidence_idx| {
+                const artifact_blob_id = blob_priorities[evidence.blob_priority_idx].artifact_blob_id;
                 try stringifier.beginObject();
                 try stringifier.objectField("idx");
-                try stringifier.write(agenda_idx);
+                try stringifier.write(evidence_idx);
                 try stringifier.objectField("blob");
                 try stringifier.write(std.fmt.bytesToHex(
-                    release_artifact_blob_manifest.entries[agenda_unit.artifact_blob_id].blob_hash.id,
+                    release_artifact_blob_manifest.entries[artifact_blob_id].blob_hash.id,
                     .lower,
                 ));
                 try stringifier.objectField("is_topologically_refined");
-                try stringifier.write(agenda_unit.maybe_topology_shape != null);
+                try stringifier.write(evidence.maybe_topology_shape != null);
                 try stringifier.objectField("repo_paths");
                 repo_paths: {
                     try stringifier.beginArray();
                     render_shape: {
-                        const repo_path_seqs: []const vcaligner.rocksdb_custom.PathSeq = blob_analysis_results[agenda_unit.artifact_blob_id].repo_path_seqs;
-                        if (agenda_unit.maybe_topology_shape) |shape| {
+                        const repo_path_seqs: []const vcaligner.rocksdb_custom.PathSeq = blob_analysis_results[artifact_blob_id].repo_path_seqs;
+                        if (evidence.maybe_topology_shape) |shape| {
                             switch (shape) {
                                 .single => {
                                     std.debug.assert(repo_path_seqs.len == 1);
@@ -223,13 +212,47 @@ pub fn report(
                 try stringifier.endObject();
             }
             try stringifier.endArray();
-            break :agendas;
+            break :evidences;
         }
         try stringifier.objectField("match_blobs");
-        match_blobs: {
+        const phantom_start_blob_priority_idx = match_blobs: {
             try stringifier.beginArray();
-            for (blob_analysis_results, 0..) |*blob_analysis_result, artifact_blob_idx| {
-                if (blob_analysis_result.repo_path_seqs.len == 0) continue;
+            const phantom_start_blob_priority_idx = loop: for (blob_priorities, 0..) |*blob_priority_entry, blob_priority_idx| {
+                switch (blob_priority_entry.evidence_strength) {
+                    .none => break :loop blob_priority_idx,
+                    else => {},
+                }
+                const artifact_blob_idx = blob_priority_entry.artifact_blob_id;
+                const entry = &release_artifact_blob_manifest.entries[artifact_blob_idx];
+                try stringifier.beginObject();
+                try stringifier.objectField("blob");
+                try stringifier.write(std.fmt.bytesToHex(
+                    entry.blob_hash.id,
+                    .lower,
+                ));
+                try stringifier.objectField("release_artifact_paths");
+                release_artifact_paths: {
+                    try stringifier.beginArray();
+                    var iter = release_artifact_blob_manifest.release_artifact_paths.slicedView(entry.release_artifact_paths_slicer).iter(release_path_depot);
+                    while (iter.next()) |release_artifact_path| {
+                        try stringifier.write(release_artifact_path);
+                    }
+                    try stringifier.endArray();
+                    break :release_artifact_paths;
+                }
+                try stringifier.objectField("evidence_strength");
+                try stringifier.write(blob_priority_entry.evidence_strength);
+                try stringifier.endObject();
+            } else blob_priorities.len;
+            try stringifier.endArray();
+            break :match_blobs phantom_start_blob_priority_idx;
+        };
+        try stringifier.objectField("phantom_blobs");
+        phantom_blobs: {
+            try stringifier.beginArray();
+            for (blob_priorities[phantom_start_blob_priority_idx..]) |*blob_priority_entry| {
+                const artifact_blob_idx = blob_priority_entry.artifact_blob_id;
+                std.debug.assert(blob_priority_entry.evidence_strength == .none);
                 const entry = &release_artifact_blob_manifest.entries[artifact_blob_idx];
                 try stringifier.beginObject();
                 try stringifier.objectField("blob");
@@ -250,34 +273,7 @@ pub fn report(
                 try stringifier.endObject();
             }
             try stringifier.endArray();
-            break :match_blobs;
-        }
-        try stringifier.objectField("phatom_blobs");
-        phatom_blobs: {
-            try stringifier.beginArray();
-            for (blob_analysis_results, 0..) |*blob_analysis_result, artifact_blob_idx| {
-                if (blob_analysis_result.repo_path_seqs.len != 0) continue;
-                const entry = &release_artifact_blob_manifest.entries[artifact_blob_idx];
-                try stringifier.beginObject();
-                try stringifier.objectField("blob");
-                try stringifier.write(std.fmt.bytesToHex(
-                    entry.blob_hash.id,
-                    .lower,
-                ));
-                try stringifier.objectField("release_artifact_paths");
-                release_artifact_paths: {
-                    try stringifier.beginArray();
-                    var iter = release_artifact_blob_manifest.release_artifact_paths.slicedView(entry.release_artifact_paths_slicer).iter(release_path_depot);
-                    while (iter.next()) |release_artifact_path| {
-                        try stringifier.write(release_artifact_path);
-                    }
-                    try stringifier.endArray();
-                    break :release_artifact_paths;
-                }
-                try stringifier.endObject();
-            }
-            try stringifier.endArray();
-            break :phatom_blobs;
+            break :phantom_blobs;
         }
         try stringifier.endObject();
         break :output;
