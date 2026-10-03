@@ -9,7 +9,6 @@ const analyse_blob_topology = @import("analyse_blob_topology.zig");
 pub const SubAnalyserStation = struct {
     _: void align(std.atomic.cache_line),
     recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
-    agenda_unit_count_statistics: usize,
 };
 
 pub const SubAnalysersHub = struct {
@@ -17,7 +16,7 @@ pub const SubAnalysersHub = struct {
     pub fn init(n_jobs: usize, gpa: vcaligner.gpa.Concurrent) !SubAnalysersHub {
         const stations = try gpa.allocator.alloc(SubAnalyserStation, n_jobs);
         errdefer gpa.allocator.free(stations);
-        @memset(stations, .{ ._ = {}, .recycling_arena_state = .{}, .agenda_unit_count_statistics = 0 });
+        @memset(stations, .{ ._ = {}, .recycling_arena_state = .{} });
         return .{ .stations = stations };
     }
     pub fn deinit(self: SubAnalysersHub, gpa: vcaligner.gpa.Concurrent) void {
@@ -307,18 +306,6 @@ pub const ReleaseArtifactBlobManifest = struct {
         pub fn slicedView(self: ReleaseArtifactPathKeysBacking, slicer: Slicer) SlicedView {
             return .{ .slice = self.backing[slicer.start..][0..slicer.len] };
         }
-    };
-};
-
-pub const AgendaUnit = struct {
-    artifact_blob_id: usize,
-    maybe_topology_shape: ?Shape,
-    commit_collection: vcaligner.commit_range.CommitCollection.View,
-    commit_count: usize,
-    pub const Shape = union(analyse_blob_topology.TopologyShapeKind) {
-        single: void,
-        integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,
-        dynamic_bitset: analyse_blob_topology.BitSetTopology(.dynamic_bitset).Shape.View,
     };
 };
 

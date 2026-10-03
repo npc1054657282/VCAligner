@@ -226,7 +226,7 @@ pub const Cache = struct {
                     if (evidence_count_a != evidence_count_b) return evidence_count_a > evidence_count_b;
                     const mask_a = ctx.maximals[a].cell.heap_ptr.signature().raw;
                     const mask_b = ctx.maximals[b].cell.heap_ptr.signature().raw;
-                    for (0..numMasks(ctx.num_masks)) |mask_idx| {
+                    for (0..ctx.num_masks) |mask_idx| {
                         const diff = mask_a[mask_idx] ^ mask_b[mask_idx];
                         if (diff == 0) continue;
                         const first_diff_mask = diff & (0 -% diff);

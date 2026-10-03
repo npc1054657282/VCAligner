@@ -266,14 +266,6 @@ pub fn analyseBlobTopologySub(
         },
         .skip => .{ .skip = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path) },
     };
-    analyser_ctxs[thrd_id].agenda_unit_count_statistics += switch (topologies) {
-        .skip => 1,
-        .proceed => switch (TopologyShapeKind.fromRepoPathSeqsNum(repo_path_seqs.len)) {
-            .single => 1,
-            .integer_bitset => topologies.proceed.integer_bitset.len,
-            .dynamic_bitset => topologies.proceed.dynamic_bitset.len,
-        },
-    };
     const commit_count = switch (topologies) {
         .skip => |*commit_collection| commit_collection.view().commitCount(),
         .proceed => |*proceed| switch (TopologyShapeKind.fromRepoPathSeqsNum(repo_path_seqs.len)) {
