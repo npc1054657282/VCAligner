@@ -114,6 +114,7 @@ pub const BlobTopologiesResolution = union(TopologyDecision) {
 
 pub fn analyseBlobTopology(
     blob_hash_entries: []const analysis.ReleaseArtifactBlobManifest.Entry,
+    policy: vcaligner.cli.ana_runner.TopologyAnalysisPolicy,
     pool: *vcaligner.Pool,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []analysis.SubAnalyserStation,
@@ -126,6 +127,7 @@ pub fn analyseBlobTopology(
     for (results, blob_hash_entries) |*blob_info_out, *blob_hash_entry| {
         pool.spawnWgId(&wait_group, analyseBlobTopologySubTask, .{
             blob_hash_entry.blob_hash,
+            policy,
             blob_info_out,
             storage,
             analyser_ctxs,
@@ -138,6 +140,7 @@ pub fn analyseBlobTopology(
 pub fn analyseBlobTopologySubTask(
     thrd_id: usize,
     blob_hash: c.git_oid,
+    policy: vcaligner.cli.ana_runner.TopologyAnalysisPolicy,
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []analysis.SubAnalyserStation,
@@ -146,6 +149,7 @@ pub fn analyseBlobTopologySubTask(
     analyseBlobTopologySub(
         thrd_id,
         blob_hash,
+        policy,
         blob_info_out,
         storage,
         analyser_ctxs,
@@ -158,6 +162,7 @@ pub fn analyseBlobTopologySubTask(
 pub fn analyseBlobTopologySub(
     thrd_id: usize,
     blob_hash: c.git_oid,
+    policy: vcaligner.cli.ana_runner.TopologyAnalysisPolicy,
     blob_info_out: *BlobAnalysisResult,
     storage: vcaligner.cli.ana_runner.Storage,
     analyser_ctxs: []analysis.SubAnalyserStation,
@@ -263,7 +268,7 @@ pub fn analyseBlobTopologySub(
     }
     std.debug.assert(commit_collections_per_repo_path.len == repo_path_seqs.len);
 
-    const topologies: BlobTopologiesResolution = sw: switch (decideTopologyAnalysis(blob_hash)) {
+    const topologies: BlobTopologiesResolution = sw: switch (decideTopologyAnalysis(policy, blob_hash)) {
         .proceed => topologyAnalysisAndThenDecideTopologyUsage(commit_collections_per_repo_path, allocator) catch |err| switch (err) {
             TopologyDecision.Error.DecideSkipUseTopologiesDiscriminative => continue :sw .skip_discriminative,
             TopologyDecision.Error.DecideSkipUseTopologiesNonDiscriminative => continue :sw .skip_non_discriminative,
@@ -452,11 +457,17 @@ pub const TopologyDecision = enum {
 };
 
 // 事前过滤，通过看一眼blob hash决定是否分析拓扑
-// XXX: 当前只将确定无来源判别力的空内容、LF和CRLF blob标为non-discriminative。
+// XXX: topology策略当前只将确定无来源判别力的空内容、LF和CRLF blob标为non-discriminative。
 // 将来可以在不改变下游candidate语义的前提下扩展这一分类策略。更进一步的此策略可能提前至artifact blob分析阶段。
+// blob_only策略不进行topology refinement，并保留所有匹配blob作为具有判别力的Blob-level evidence。
 pub fn decideTopologyAnalysis(
+    policy: vcaligner.cli.ana_runner.TopologyAnalysisPolicy,
     blob_hash: c.git_oid,
 ) TopologyDecision {
+    switch (policy) {
+        .blob_only => return .skip_discriminative,
+        .topology => {},
+    }
     const ana_runner = vcaligner.cli.ana_runner;
     if (std.mem.eql(u8, &blob_hash.id, &ana_runner.empty_git_blob_sha1_hash.id) or
         std.mem.eql(u8, &blob_hash.id, &ana_runner.lf_git_blob_sha1_hash.id) or

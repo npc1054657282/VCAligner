@@ -56,6 +56,7 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
         errdefer storage.deinit();
         const blob_analysis_results: []analyse_blob_topology.BlobAnalysisResult = try analyse_blob_topology.analyseBlobTopology(
             blob_manifest.entries,
+            runconf.topology_analysis_policy,
             &pool,
             storage,
             blob_analyser_hub.stations,

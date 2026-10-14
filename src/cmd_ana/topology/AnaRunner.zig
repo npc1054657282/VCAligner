@@ -16,6 +16,7 @@ release_path: [:0]u8,
 report_output: ReportOutputConf,
 point_lookup_cache_mb: u64,
 n_jobs: usize,
+topology_analysis_policy: cli.ana_runner.TopologyAnalysisPolicy,
 
 const cmd = cli.ana_runner.cmd;
 
@@ -36,6 +37,11 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
             } else .none,
             .point_lookup_cache_mb = args.point_lookup_cache_mb,
             .n_jobs = n_jobs,
+            .topology_analysis_policy = switch (args.strategy) {
+                .topology => .topology,
+                .blob_only => .blob_only,
+                .strict => unreachable,
+            },
         },
     };
 }

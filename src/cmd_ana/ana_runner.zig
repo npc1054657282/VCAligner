@@ -7,6 +7,18 @@ const c = vcaligner.c_helper.c;
 
 const cmd_config: cli.CommandConfig = cli.Runner.cmd_config;
 pub const sub_cmd_name = "ana";
+
+pub const Strategy = enum {
+    strict,
+    topology,
+    blob_only,
+};
+
+pub const TopologyAnalysisPolicy = enum {
+    topology,
+    blob_only,
+};
+
 pub const cmd = blk: {
     @setEvalBranchQuota(4096);
     break :blk cli.Runner.Global.sharedArgs(zargs.Command.new(sub_cmd_name))
@@ -37,7 +49,7 @@ pub const cmd = blk: {
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
-        .arg(zargs.Arg.optArg("strategy", enum { strict, topology }).long("strategy").default(.strict).help(
+        .arg(zargs.Arg.optArg("strategy", Strategy).long("strategy").default(.strict).help(
             \\Set the alignment resolution strategy for mapping release
         ++ cli.helpNewLine(cmd_config) ++
             \\artifacts to historical commits.
@@ -55,6 +67,12 @@ pub const cmd = blk: {
             \\complex directory refactorings or monorepo structural shifts,
         ++ cli.helpNewLine(cmd_config) ++
             \\but incurs higher computational and memory overhead.
+        ++ cli.helpNewLine(cmd_config) ++
+            \\blob_only:
+        ++ cli.helpNewLine(cmd_config) ++
+            \\Content-only baseline. Skips topology refinement for every matched Blob
+        ++ cli.helpNewLine(cmd_config) ++
+            \\and treats all matched Blobs as discriminative Blob-level evidence.
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
@@ -63,7 +81,7 @@ pub const cmd = blk: {
         ++ cli.helpNewLine(cmd_config) ++
             \\when using the 'strict' strategy. Essential for aligning monorepo artifacts.
         ++ cli.helpNewLine(cmd_config) ++
-            \\Completely IGNORED when using '--strategy topology'.
+            \\Completely IGNORED when using '--strategy topology' or '--strategy blob_only'.
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
@@ -73,7 +91,7 @@ pub const cmd = blk: {
 pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
     return switch (args.strategy) {
         .strict => Strict.initFromArgs(args, allocator),
-        .topology => Topology.initFromArgs(args, allocator),
+        .topology, .blob_only => Topology.initFromArgs(args, allocator),
     };
 }
 
