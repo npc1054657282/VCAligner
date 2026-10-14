@@ -11,7 +11,7 @@ pub const sub_cmd_name = "ana";
 pub const Strategy = enum {
     strict,
     topology,
-    blob_only,
+    @"blob-only",
 };
 
 pub const TopologyAnalysisPolicy = enum {
@@ -68,7 +68,7 @@ pub const cmd = blk: {
         ++ cli.helpNewLine(cmd_config) ++
             \\but incurs higher computational and memory overhead.
         ++ cli.helpNewLine(cmd_config) ++
-            \\blob_only:
+            \\blob-only:
         ++ cli.helpNewLine(cmd_config) ++
             \\Content-only baseline. Skips topology refinement for every matched Blob
         ++ cli.helpNewLine(cmd_config) ++
@@ -81,7 +81,7 @@ pub const cmd = blk: {
         ++ cli.helpNewLine(cmd_config) ++
             \\when using the 'strict' strategy. Essential for aligning monorepo artifacts.
         ++ cli.helpNewLine(cmd_config) ++
-            \\Completely IGNORED when using '--strategy topology' or '--strategy blob_only'.
+            \\Completely IGNORED when using '--strategy topology' or '--strategy blob-only'.
         ++ cli.helpLastLine(cmd_config) ++
             \\
         ))
@@ -91,7 +91,7 @@ pub const cmd = blk: {
 pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
     return switch (args.strategy) {
         .strict => Strict.initFromArgs(args, allocator),
-        .topology, .blob_only => Topology.initFromArgs(args, allocator),
+        .topology, .@"blob-only" => Topology.initFromArgs(args, allocator),
     };
 }
 

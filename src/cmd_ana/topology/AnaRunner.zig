@@ -39,7 +39,7 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
             .n_jobs = n_jobs,
             .topology_analysis_policy = switch (args.strategy) {
                 .topology => .topology,
-                .blob_only => .blob_only,
+                .@"blob-only" => .blob_only,
                 .strict => unreachable,
             },
         },
