@@ -5,6 +5,36 @@ fn numMasks(bit_length: usize) usize {
     return (bit_length + (@bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt) - 1)) / @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
 }
 
+// 比较两个完整signature的判别性前缀。
+// non-discriminative evidences按EvidenceStrength排序后位于该前缀之后，
+// 因而无需构造第二份bitset，也无需在dominance时分配临时内存。
+fn bitSetPrefixSubsetOf(
+    lhs: [*]const std.DynamicBitSetUnmanaged.MaskInt,
+    rhs: [*]const std.DynamicBitSetUnmanaged.MaskInt,
+    bit_length: u32,
+) bool {
+    const bit_length_usize: usize = @intCast(bit_length);
+    const MaskInt = std.DynamicBitSetUnmanaged.MaskInt;
+    const mask_bit_length = @bitSizeOf(MaskInt);
+    const whole_masks = bit_length_usize / mask_bit_length;
+    for (0..whole_masks) |i| {
+        if ((lhs[i] & ~rhs[i]) != 0) return false;
+    }
+    const remaining_bits = bit_length_usize % mask_bit_length;
+    if (remaining_bits == 0) return true;
+    const ShiftInt = std.math.Log2Int(MaskInt);
+    const valid_mask = (@as(MaskInt, 1) << @as(ShiftInt, @intCast(remaining_bits))) - 1;
+    return ((lhs[whole_masks] & ~rhs[whole_masks]) & valid_mask) == 0;
+}
+
+fn bitSetPrefixSupersetOf(
+    lhs: [*]const std.DynamicBitSetUnmanaged.MaskInt,
+    rhs: [*]const std.DynamicBitSetUnmanaged.MaskInt,
+    bit_length: u32,
+) bool {
+    return bitSetPrefixSubsetOf(rhs, lhs, bit_length);
+}
+
 pub const EventNode = struct {
     time: vcaligner.rocksdb_custom.CommitSeqNative,
     evidence_idx: u32,
@@ -15,9 +45,12 @@ pub const EventNode = struct {
 };
 pub fn analyseCandidates(
     evidences: []const analysis.Evidences.Unit,
+    discriminative_evidence_count: u32,
     gpa: vcaligner.gpa.Exclusive,
     seed: u64,
 ) !Candidate.Set {
+    std.debug.assert(evidences.len <= std.math.maxInt(u32));
+    std.debug.assert(discriminative_evidence_count <= @as(u32, @intCast(evidences.len)));
     var cache: Cache = .{
         .map = .empty,
         .maximals = .empty,
@@ -42,8 +75,10 @@ pub fn analyseCandidates(
         .hash = 0,
     };
     defer active_evidences.bit_set.deinit(gpa.allocator);
-    // 缓存evidence数量，避免动态bitset每次执行`active_evidences.count()`时重复扫描的开销。
-    var active_evidences_count: u32 = 0;
+    // 两个count均为缓存值，避免反复扫描动态bitset。
+    // dominance只使用discriminative count；total count保留用于完整signature排序。
+    var active_total_evidence_count: u32 = 0;
+    var active_discriminative_evidence_count: u32 = 0;
 
     var pq: vcaligner.PriorityQueue(EventNode, void, EventNode.compare) = blk: {
         const init_events: []EventNode = try gpa.allocator.alloc(EventNode, evidences.len);
@@ -62,13 +97,15 @@ pub fn analyseCandidates(
     var current_time: vcaligner.rocksdb_custom.CommitSeqNative = 0;
     while (pq.peek()) |first_event| {
         const min_event_time = first_event.time;
-        if (active_evidences_count > 0 and current_time < min_event_time) {
+        if (active_total_evidence_count > 0 and current_time < min_event_time) {
             const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
             try commitToCache(
                 gpa.allocator,
                 &cache,
                 &active_evidences,
-                active_evidences_count,
+                active_total_evidence_count,
+                active_discriminative_evidence_count,
+                discriminative_evidence_count,
                 valid_range,
             );
         }
@@ -76,16 +113,19 @@ pub fn analyseCandidates(
             if (event.time != min_event_time) break :continuous_replace;
             const r = event.evidence_idx;
             const commit_collection = evidences[r].commit_collection;
+            const is_discriminative = r < discriminative_evidence_count;
             active_evidences.bit_set.toggle(r);
             active_evidences.hash ^= zobrist_table[r];
             const new_event: ?EventNode = blk: {
                 if (active_evidences.bit_set.isSet(r)) {
-                    active_evidences_count += 1;
+                    active_total_evidence_count += 1;
+                    if (is_discriminative) active_discriminative_evidence_count += 1;
                     const end_time = commit_collection.ranges[cursors[r]].end;
                     const time = std.math.add(u32, end_time, 1) catch break :blk null;
                     break :blk .{ .time = time, .evidence_idx = r };
                 }
-                active_evidences_count -= 1;
+                active_total_evidence_count -= 1;
+                if (is_discriminative) active_discriminative_evidence_count -= 1;
                 cursors[r] += 1;
                 if (cursors[r] >= commit_collection.ranges.len) {
                     break :blk null;
@@ -104,14 +144,16 @@ pub fn analyseCandidates(
         }
         current_time = min_event_time;
     }
-    if (active_evidences_count > 0) {
+    if (active_total_evidence_count > 0) {
         const max_time = std.math.maxInt(vcaligner.rocksdb_custom.CommitSeqNative);
         const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, max_time);
         try commitToCache(
             gpa.allocator,
             &cache,
             &active_evidences,
-            active_evidences_count,
+            active_total_evidence_count,
+            active_discriminative_evidence_count,
+            discriminative_evidence_count,
             valid_range,
         );
     }
@@ -122,7 +164,9 @@ fn commitToCache(
     allocator: std.mem.Allocator,
     cache: *Cache,
     evidences: *const Cache.PseudoKey,
-    evidences_count: u32,
+    total_evidence_count: u32,
+    discriminative_evidence_count: u32,
+    discriminative_bit_length: u32,
     valid_range: vcaligner.commit_range.CommitRange,
 ) !void {
     const pseudo_context: Cache.PseudoKey.Context = .{};
@@ -149,11 +193,14 @@ fn commitToCache(
         maximal: while (true) {
             if (current_maximal_index == cache.maximals.items.len) break :maximal;
             const current_cell = cache.maximals.items[current_maximal_index].cell;
-            const current_evidence_count = current_cell.heap_ptr.state.maximal.evidence_count;
-            switch (std.math.order(current_evidence_count, evidences_count)) {
+            const current_discriminative_evidence_count = current_cell.heap_ptr.state.maximal.discriminative_evidence_count;
+            switch (std.math.order(current_discriminative_evidence_count, discriminative_evidence_count)) {
                 .gt => {
-                    const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_set.bit_length);
-                    if (current_signature_bit_set.supersetOf(evidences.bit_set)) {
+                    if (bitSetPrefixSupersetOf(
+                        current_cell.heap_ptr.signature().raw,
+                        evidences.bit_set.masks,
+                        discriminative_bit_length,
+                    )) {
                         cell.heap_ptr.* = .{
                             .state = .dominated,
                             .hash = evidences.hash,
@@ -163,8 +210,11 @@ fn commitToCache(
                     }
                 },
                 .lt => {
-                    const current_signature_bit_set = current_cell.heap_ptr.signature().promote(evidences.bit_set.bit_length);
-                    if (current_signature_bit_set.subsetOf(evidences.bit_set)) {
+                    if (bitSetPrefixSubsetOf(
+                        current_cell.heap_ptr.signature().raw,
+                        evidences.bit_set.masks,
+                        discriminative_bit_length,
+                    )) {
                         if (commit_collection.b.items.len == 0)
                             try commit_collection.appendRangeAssumeGreater(allocator, valid_range);
                         var removed = cache.maximals.swapRemove(current_maximal_index);
@@ -186,7 +236,8 @@ fn commitToCache(
             .state = .{
                 .maximal = .{
                     .slot_idx = @intCast(cache.maximals.items.len),
-                    .evidence_count = evidences_count,
+                    .total_evidence_count = total_evidence_count,
+                    .discriminative_evidence_count = discriminative_evidence_count,
                 },
             },
             .hash = evidences.hash,
@@ -221,9 +272,12 @@ pub const Cache = struct {
                 maximals: []Cache.Maximal,
                 num_masks: usize,
                 fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-                    const evidence_count_a = ctx.maximals[a].cell.heap_ptr.state.maximal.evidence_count;
-                    const evidence_count_b = ctx.maximals[b].cell.heap_ptr.state.maximal.evidence_count;
-                    if (evidence_count_a != evidence_count_b) return evidence_count_a > evidence_count_b;
+                    const maximal_a = ctx.maximals[a].cell.heap_ptr.state.maximal;
+                    const maximal_b = ctx.maximals[b].cell.heap_ptr.state.maximal;
+                    if (maximal_a.discriminative_evidence_count != maximal_b.discriminative_evidence_count)
+                        return maximal_a.discriminative_evidence_count > maximal_b.discriminative_evidence_count;
+                    if (maximal_a.total_evidence_count != maximal_b.total_evidence_count)
+                        return maximal_a.total_evidence_count > maximal_b.total_evidence_count;
                     const mask_a = ctx.maximals[a].cell.heap_ptr.signature().raw;
                     const mask_b = ctx.maximals[b].cell.heap_ptr.signature().raw;
                     for (0..ctx.num_masks) |mask_idx| {
@@ -276,7 +330,8 @@ pub const Cache = struct {
             state: union(enum) {
                 maximal: struct {
                     slot_idx: u32,
-                    evidence_count: u32,
+                    total_evidence_count: u32,
+                    discriminative_evidence_count: u32,
                 },
                 dominated: void,
             },
@@ -363,3 +418,16 @@ pub const Candidate = struct {
         }
     };
 };
+
+test "dominance prefix ignores non-discriminative tail bits" {
+    var lhs = [_]std.DynamicBitSetUnmanaged.MaskInt{0b101};
+    var rhs = [_]std.DynamicBitSetUnmanaged.MaskInt{0b001};
+
+    // bit 2 is outside the discriminative prefix.
+    try std.testing.expect(bitSetPrefixSubsetOf(lhs[0..].ptr, rhs[0..].ptr, 2));
+    try std.testing.expect(bitSetPrefixSubsetOf(rhs[0..].ptr, lhs[0..].ptr, 2));
+
+    // Once bit 2 becomes discriminative, lhs is no longer a subset of rhs.
+    try std.testing.expect(!bitSetPrefixSubsetOf(lhs[0..].ptr, rhs[0..].ptr, 3));
+    try std.testing.expect(bitSetPrefixSupersetOf(lhs[0..].ptr, rhs[0..].ptr, 3));
+}

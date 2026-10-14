@@ -82,11 +82,25 @@ pub const Topology = @import("topology/AnaRunner.zig");
 
 // 空文件的git blob sha1哈希总是一个确定值。
 pub const empty_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xe6, 0x9d, 0xe2, 0x9b, 0xb2, 0xd1, 0xd6, 0x43, 0x4b, 0x8b, 0x29, 0xae, 0x77, 0x5a, 0xd8, 0xc2, 0xe4, 0x8c, 0x53, 0x91 } };
+pub const lf_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0x8b, 0x13, 0x78, 0x91, 0x79, 0x1f, 0xe9, 0x69, 0x27, 0xad, 0x78, 0xe6, 0x4b, 0x0a, 0xad, 0x7b, 0xde, 0xd0, 0x8b, 0xdc } };
+pub const crlf_git_blob_sha1_hash: c.git_oid = .{ .id = .{ 0xd3, 0xf5, 0xa1, 0x2f, 0xaa, 0x99, 0x75, 0x81, 0x92, 0xec, 0xc4, 0xed, 0x3f, 0xc2, 0x2c, 0x92, 0x49, 0x23, 0x2e, 0x86 } };
 
 test empty_git_blob_sha1_hash {
     var hasher: std.crypto.hash.Sha1 = .init(.{});
     hasher.update("blob 0\x00");
     try std.testing.expectEqual(empty_git_blob_sha1_hash.id, hasher.finalResult());
+}
+
+test lf_git_blob_sha1_hash {
+    var hasher: std.crypto.hash.Sha1 = .init(.{});
+    hasher.update("blob 1\x00\n");
+    try std.testing.expectEqual(lf_git_blob_sha1_hash.id, hasher.finalResult());
+}
+
+test crlf_git_blob_sha1_hash {
+    var hasher: std.crypto.hash.Sha1 = .init(.{});
+    hasher.update("blob 2\x00\r\n");
+    try std.testing.expectEqual(crlf_git_blob_sha1_hash.id, hasher.finalResult());
 }
 
 pub const Storage = @import("Storage.zig");

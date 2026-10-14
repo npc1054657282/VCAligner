@@ -176,8 +176,6 @@ pub fn report(
                     release_artifact_blob_manifest.entries[artifact_blob_id].blob_hash.id,
                     .lower,
                 ));
-                try stringifier.objectField("is_topologically_refined");
-                try stringifier.write(evidence.maybe_topology_shape != null);
                 try stringifier.objectField("repo_paths");
                 repo_paths: {
                     try stringifier.beginArray();

@@ -104,8 +104,12 @@ pub const BlobAnalysisResult = struct {
 pub const BlobTopologiesResolution = union(TopologyDecision) {
     // 不需要tag，因为如果分析了，实际类别与repo_path_seqs的数量挂钩。
     proceed: vcaligner.bare_union.BareUnion(BlobTopologies),
-    // 跳过分析，表现形式为把所有repo path seqs的CommitCollection做并集。
-    skip: vcaligner.commit_range.CommitCollection,
+    // 跳过topology refinement，但该blob仍然作为具有判别力的Blob-level evidence。
+    // 表现形式为把所有repo path seqs的CommitCollection做并集。
+    skip_discriminative: vcaligner.commit_range.CommitCollection,
+    // 跳过topology refinement，且该blob不参与candidate dominance。
+    // 仍保留其CommitCollection，以便完整signature记录其是否命中。
+    skip_non_discriminative: vcaligner.commit_range.CommitCollection,
 };
 
 pub fn analyseBlobTopology(
@@ -261,13 +265,19 @@ pub fn analyseBlobTopologySub(
 
     const topologies: BlobTopologiesResolution = sw: switch (decideTopologyAnalysis(blob_hash)) {
         .proceed => topologyAnalysisAndThenDecideTopologyUsage(commit_collections_per_repo_path, allocator) catch |err| switch (err) {
-            TopologyDecision.Error.DecideSkipUseTopologies => continue :sw .skip,
+            TopologyDecision.Error.DecideSkipUseTopologiesDiscriminative => continue :sw .skip_discriminative,
+            TopologyDecision.Error.DecideSkipUseTopologiesNonDiscriminative => continue :sw .skip_non_discriminative,
             else => return err,
         },
-        .skip => .{ .skip = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path) },
+        .skip_discriminative => .{
+            .skip_discriminative = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path),
+        },
+        .skip_non_discriminative => .{
+            .skip_non_discriminative = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path),
+        },
     };
     const commit_count = switch (topologies) {
-        .skip => |*commit_collection| commit_collection.view().commitCount(),
+        inline .skip_discriminative, .skip_non_discriminative => |*commit_collection| commit_collection.view().commitCount(),
         .proceed => |*proceed| switch (TopologyShapeKind.fromRepoPathSeqsNum(repo_path_seqs.len)) {
             .single => proceed.single.commitCount(),
             inline .integer_bitset, .dynamic_bitset => |comptime_kind| blk: {
@@ -309,7 +319,8 @@ fn topologyAnalysisAndThenDecideTopologyUsage(
     };
     switch (decideTopologyUsage(proceed)) {
         .proceed => return .{ .proceed = vcaligner.bare_union.taggedToBare(proceed) },
-        .skip => return TopologyDecision.Error.DecideSkipUseTopologies,
+        .skip_discriminative => return TopologyDecision.Error.DecideSkipUseTopologiesDiscriminative,
+        .skip_non_discriminative => return TopologyDecision.Error.DecideSkipUseTopologiesNonDiscriminative,
     }
 }
 
@@ -430,23 +441,35 @@ fn commitToBuildingTopologies(
 
 pub const TopologyDecision = enum {
     proceed,
-    skip,
+    // 不进行topology refinement，但仍然允许该blob参与来源判别。
+    skip_discriminative,
+    // 不进行topology refinement，且该blob不参与candidate dominance。
+    skip_non_discriminative,
     pub const Error = error{
-        DecideSkipUseTopologies,
+        DecideSkipUseTopologiesDiscriminative,
+        DecideSkipUseTopologiesNonDiscriminative,
     };
 };
 
 // 事前过滤，通过看一眼blob hash决定是否分析拓扑
-// XXX: 当前的设计是空文件过滤。将来可能允许自定义配置
+// XXX: 当前只将确定无来源判别力的空内容、LF和CRLF blob标为non-discriminative。
+// 将来可以在不改变下游candidate语义的前提下扩展这一分类策略。更进一步的此策略可能提前至artifact blob分析阶段。
 pub fn decideTopologyAnalysis(
     blob_hash: c.git_oid,
 ) TopologyDecision {
-    if (std.mem.eql(u8, &blob_hash.id, &vcaligner.cli.ana_runner.empty_git_blob_sha1_hash.id)) return .skip;
+    const ana_runner = vcaligner.cli.ana_runner;
+    if (std.mem.eql(u8, &blob_hash.id, &ana_runner.empty_git_blob_sha1_hash.id) or
+        std.mem.eql(u8, &blob_hash.id, &ana_runner.lf_git_blob_sha1_hash.id) or
+        std.mem.eql(u8, &blob_hash.id, &ana_runner.crlf_git_blob_sha1_hash.id))
+    {
+        return .skip_non_discriminative;
+    }
     return .proceed;
 }
 
 // 事后过滤，看了拓扑分析结果决定是否使用拓扑
-// XXX: 当前的设计仅考虑拓扑数量，且实际上并不真的投入使用。将来可能允许自定义配置尤其是拓扑数量阈值
+// XXX: 该阶段目前仅考虑因为拓扑数量过高而放弃topology refinement，且evidence仍然是discriminative的，以作为Blob-level evidence。
+// XXX: 并且，当前实际上并未真的投入使用。
 pub fn decideTopologyUsage(
     topologies: BlobTopologies,
 ) TopologyDecision {

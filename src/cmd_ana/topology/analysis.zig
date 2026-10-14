@@ -93,6 +93,7 @@ pub fn analysis(noalias runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurren
     defer evidences.deinit(gpae.allocator());
     const candidate_set = try @import("analyse_candidates.zig").analyseCandidates(
         evidences.units,
+        blob_evidence_priority_table.discriminative_evidence_count,
         gpae.gpa,
         0,
     );
@@ -355,10 +356,15 @@ pub const Evidences = struct {
                         },
                     }
                 },
-                .coarse => units.appendAssumeCapacity(.{
+                .blob_level => units.appendAssumeCapacity(.{
                     .blob_priority_idx = blob_priority_idx,
                     .maybe_topology_shape = null,
-                    .commit_collection = blob_analysis_results[entry.artifact_blob_id].details.active.topologies.skip.view(),
+                    .commit_collection = blob_analysis_results[entry.artifact_blob_id].details.active.topologies.skip_discriminative.view(),
+                }),
+                .non_discriminative => units.appendAssumeCapacity(.{
+                    .blob_priority_idx = blob_priority_idx,
+                    .maybe_topology_shape = null,
+                    .commit_collection = blob_analysis_results[entry.artifact_blob_id].details.active.topologies.skip_non_discriminative.view(),
                 }),
                 // 由于blob_priority_entries经过排序，none一定为优先级最低，后面都是none
                 .none => break :loop,
@@ -376,12 +382,15 @@ pub const Evidences = struct {
 pub const BlobEvidencePriorityTable = struct {
     entries: []Entry,
     total_evidence_count: usize,
+    // evidences中的前缀[0..discriminative_evidence_count)全部具有来源判别力。
+    discriminative_evidence_count: u32,
     pub fn init(
         blob_analysis_results: []const analyse_blob_topology.BlobAnalysisResult,
         allocator: std.mem.Allocator,
     ) !BlobEvidencePriorityTable {
-        const entries, const total_evidence_count = blk: {
+        const entries, const total_evidence_count, const discriminative_evidence_count = blk: {
             var total_evidence_count: usize = 0;
+            var discriminative_evidence_count: u32 = 0;
             var entries: std.ArrayListUnmanaged(Entry) = try .initCapacity(allocator, blob_analysis_results.len);
             errdefer entries.deinit(allocator);
             for (blob_analysis_results, 0..) |*blob_analysis_result, artifact_blob_id| {
@@ -395,10 +404,19 @@ pub const BlobEvidencePriorityTable = struct {
                     continue;
                 }
                 switch (blob_analysis_result.details.active.topologies) {
-                    .skip => {
+                    .skip_discriminative => {
                         entries.appendAssumeCapacity(.{
                             .artifact_blob_id = artifact_blob_id,
-                            .evidence_strength = .coarse,
+                            .evidence_strength = .blob_level,
+                            .blob_commit_count = blob_analysis_result.details.active.commit_count,
+                        });
+                        total_evidence_count += 1;
+                        discriminative_evidence_count += 1;
+                    },
+                    .skip_non_discriminative => {
+                        entries.appendAssumeCapacity(.{
+                            .artifact_blob_id = artifact_blob_id,
+                            .evidence_strength = .non_discriminative,
                             .blob_commit_count = blob_analysis_result.details.active.commit_count,
                         });
                         total_evidence_count += 1;
@@ -413,6 +431,7 @@ pub const BlobEvidencePriorityTable = struct {
                                     .blob_commit_count = blob_analysis_result.details.active.commit_count,
                                 });
                                 total_evidence_count += 1;
+                                discriminative_evidence_count += 1;
                             },
                             inline .integer_bitset, .dynamic_bitset => |comptime_kind| {
                                 const shape_entries = @field(topologies, @tagName(comptime_kind));
@@ -422,12 +441,13 @@ pub const BlobEvidencePriorityTable = struct {
                                     .blob_commit_count = blob_analysis_result.details.active.commit_count,
                                 });
                                 total_evidence_count += shape_entries.len;
+                                discriminative_evidence_count += @intCast(shape_entries.len);
                             },
                         }
                     },
                 }
             }
-            break :blk .{ try entries.toOwnedSlice(allocator), total_evidence_count };
+            break :blk .{ try entries.toOwnedSlice(allocator), total_evidence_count, discriminative_evidence_count };
         };
         std.sort.pdq(Entry, entries, {}, struct {
             fn lessThan(_: void, a: Entry, b: Entry) bool {
@@ -440,7 +460,11 @@ pub const BlobEvidencePriorityTable = struct {
                 return a.artifact_blob_id < b.artifact_blob_id;
             }
         }.lessThan);
-        return .{ .entries = entries, .total_evidence_count = total_evidence_count };
+        return .{
+            .entries = entries,
+            .total_evidence_count = total_evidence_count,
+            .discriminative_evidence_count = discriminative_evidence_count,
+        };
     }
     pub fn deinit(self: BlobEvidencePriorityTable, allocator: std.mem.Allocator) void {
         allocator.free(self.entries);
@@ -451,14 +475,18 @@ pub const BlobEvidencePriorityTable = struct {
         blob_commit_count: usize,
     };
     // 基于各blob构造的证据强度不同
-    pub const EvidenceStrength = enum(u2) {
+    pub const EvidenceStrength = enum(u3) {
         // 基于这个blob构造不出证据
         none = 0,
-        // 这个blob的证据被认为价值不高，没有精炼到topology level。
-        coarse = 1,
+        // 该blob可以作为历史观察保留，但不允许参与来源候选之间的dominance。
+        // non-discriminative evidence一定不进行topology refinement。
+        non_discriminative = 1,
         // 这个blob的证据被精炼，存在多个topology evidence，因此其各个证据是否有效存在模糊性。
         ambiguous = 2,
+        // 该blob具有来源判别力，但不进行topology refinement。
+        // Blob-level evidence本身确定有效，因此优先级高于单个ambiguous topology evidence。
+        blob_level = 3,
         // 这个blob的证据被精炼，仅一个topology，有效性高。
-        unambiguous = 3,
+        unambiguous = 4,
     };
 };
