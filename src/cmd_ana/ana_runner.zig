@@ -10,6 +10,7 @@ pub const sub_cmd_name = "ana";
 
 pub const Strategy = enum {
     strict,
+    @"strict-no-greedy",
     topology,
     @"blob-only",
 };
@@ -60,6 +61,10 @@ pub const cmd = blk: {
         ++ cli.helpNewLine(cmd_config) ++
             \\perfectly mirrors the repository (or the specified --package-directory).
         ++ cli.helpNewLine(cmd_config) ++
+            \\strict-no-greedy:
+        ++ cli.helpNewLine(cmd_config) ++
+            \\Exact-path evidence with signature-based construction; accepts --package-directory.
+        ++ cli.helpNewLine(cmd_config) ++
             \\topology:
         ++ cli.helpNewLine(cmd_config) ++
             \\Advanced, content-first topology inference. Dynamically resolves
@@ -79,7 +84,7 @@ pub const cmd = blk: {
         .arg(zargs.Arg.optArg("package_directory", ?[]const u8).long("package-directory").help(
             \\Specify the base directory of the package within the repository
         ++ cli.helpNewLine(cmd_config) ++
-            \\when using the 'strict' strategy. Essential for aligning monorepo artifacts.
+            \\when using the 'strict' or 'strict-no-greedy' strategy. Essential for aligning monorepo artifacts.
         ++ cli.helpNewLine(cmd_config) ++
             \\Completely IGNORED when using '--strategy topology' or '--strategy blob-only'.
         ++ cli.helpLastLine(cmd_config) ++
@@ -91,11 +96,13 @@ pub const cmd = blk: {
 pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runner {
     return switch (args.strategy) {
         .strict => Strict.initFromArgs(args, allocator),
+        .@"strict-no-greedy" => StrictNoGreedy.initFromArgs(args, allocator),
         .topology, .@"blob-only" => Topology.initFromArgs(args, allocator),
     };
 }
 
 pub const Strict = @import("strict/AnaRunner.zig");
+pub const StrictNoGreedy = @import("strict_no_greedy/AnaRunner.zig");
 pub const Topology = @import("topology/AnaRunner.zig");
 
 // 空文件的git blob sha1哈希总是一个确定值。

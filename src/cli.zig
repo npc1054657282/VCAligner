@@ -28,6 +28,7 @@ pub const Runner = union(enum) {
     prep: PrepRunner,
     ana_topology: ana_runner.Topology,
     ana_strict: ana_runner.Strict,
+    ana_strict_no_greedy: ana_runner.StrictNoGreedy,
     pub const cmd_config: CommandConfig = .{};
     const cmd = blk: {
         var building_cmd = zargs.Command.new("vcaligner").requireSub("sub")
