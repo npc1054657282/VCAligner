@@ -94,7 +94,9 @@ pub fn applyFullScanOfOrderPreservingTypedKeyToReadOptions(
     c.rocksdb_readoptions_set_auto_readahead_size(roptions, 1);
     // 为了让`readahead`实际生效，配置`iterate_upper_bound`为usize最大值。
     // [参见](https://github.com/facebook/rocksdb/blob/6a202c5570d9aca11a23c5b1a78019f8be245463/include/rocksdb/options.h#L2111-L2135)
-    const key_upper_bound: [@sizeOf(K) + 1]u8 = @as([@sizeOf(K)]u8, @splat(0xff)) ++ [1]u8{0};
+    const key_upper_bound: [@sizeOf(K) + 1]u8 = comptime (@as([@sizeOf(K)]u8, @splat(0xff)) ++ [1]u8{0});
+    // NOTE: iterate_upper_bound的内存必须在RocksDB迭代器存活期间保持有效。
+    // 但key_upper_bound为编译时值，生命周期无限。
     c.rocksdb_readoptions_set_iterate_upper_bound(roptions, &key_upper_bound, key_upper_bound.len);
 }
 

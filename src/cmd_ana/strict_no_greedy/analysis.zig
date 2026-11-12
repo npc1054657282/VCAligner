@@ -174,9 +174,6 @@ fn associateRepoPaths(
     const ro_full = c.rocksdb_readoptions_create().?;
     defer c.rocksdb_readoptions_destroy(ro_full);
     vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(ro_full, PathSeq);
-    // NOTE: RocksDB 持有 iterate_upper_bound 的引用，必须保证缓冲区活到迭代器析构后。
-    const upper_bound: [@sizeOf(PathSeq) + 1]u8 = @as([@sizeOf(PathSeq)]u8, @splat(0xff)) ++ [1]u8{0};
-    c.rocksdb_readoptions_set_iterate_upper_bound(ro_full, &upper_bound, upper_bound.len);
     const iter = c.rocksdb_create_iterator_cf(storage.db, ro_full, storage.cfs.get(.pi2p)).?;
     defer c.rocksdb_iter_destroy(iter);
     c.rocksdb_iter_seek_to_first(iter);
