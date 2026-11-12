@@ -31,9 +31,12 @@ pub fn report(
     var buffer: [1024]u8 = undefined;
     var writer = file.writer(&buffer);
     var json: std.json.Stringify = .{ .writer = &writer.interface, .options = .{ .whitespace = .indent_4 } };
-    const once_get_roptions = c.rocksdb_readoptions_create().?;
+    const once_get_roptions = blk: {
+        const roptions = c.rocksdb_readoptions_create().?;
+        c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+        break :blk roptions;
+    };
     defer c.rocksdb_readoptions_destroy(once_get_roptions);
-    c.rocksdb_readoptions_set_fill_cache(once_get_roptions, 0);
 
     try json.beginObject();
     try json.objectField("candidates");
@@ -137,9 +140,12 @@ fn writeRepoOnlyFiles(
     package_directory: ?[:0]const u8,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
-    const full_scan_roptions = c.rocksdb_readoptions_create().?;
+    const full_scan_roptions = blk: {
+        const roptions = c.rocksdb_readoptions_create().?;
+        vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathRankBlobCountKey);
+        break :blk roptions;
+    };
     defer c.rocksdb_readoptions_destroy(full_scan_roptions);
-    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(full_scan_roptions, PathRankBlobCountKey);
     const iter = c.rocksdb_create_iterator_cf(storage.db, full_scan_roptions, storage.cfs.get(.pr_bc2pi)).?;
     defer c.rocksdb_iter_destroy(iter);
     c.rocksdb_iter_seek_to_first(iter);

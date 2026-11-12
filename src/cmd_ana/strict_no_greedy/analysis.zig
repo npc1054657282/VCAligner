@@ -171,10 +171,13 @@ fn associateRepoPaths(
     files: []ReleaseFile,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
-    const ro_full = c.rocksdb_readoptions_create().?;
-    defer c.rocksdb_readoptions_destroy(ro_full);
-    vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(ro_full, PathSeq);
-    const iter = c.rocksdb_create_iterator_cf(storage.db, ro_full, storage.cfs.get(.pi2p)).?;
+    const roptions = blk: {
+        const roptions = c.rocksdb_readoptions_create().?;
+        vcaligner.rocksdb_custom.applyFullScanOfOrderPreservingTypedKeyToReadOptions(roptions, PathSeq);
+        break :blk roptions;
+    };
+    defer c.rocksdb_readoptions_destroy(roptions);
+    const iter = c.rocksdb_create_iterator_cf(storage.db, roptions, storage.cfs.get(.pi2p)).?;
     defer c.rocksdb_iter_destroy(iter);
     c.rocksdb_iter_seek_to_first(iter);
     while (c.rocksdb_iter_valid(iter) != 0) : (c.rocksdb_iter_next(iter)) {
@@ -200,13 +203,19 @@ fn collectEvidences(
     allocator: std.mem.Allocator,
     last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
-    const ro_get = c.rocksdb_readoptions_create().?;
-    defer c.rocksdb_readoptions_destroy(ro_get);
-    c.rocksdb_readoptions_set_fill_cache(ro_get, 0);
-    const ro_prefix = c.rocksdb_readoptions_create().?;
-    defer c.rocksdb_readoptions_destroy(ro_prefix);
-    vcaligner.rocksdb_custom.applyPrefixScanToReadOptions(ro_prefix);
-    const iter = c.rocksdb_create_iterator_cf(storage.db, ro_prefix, storage.cfs.get(.bpi_ci)).?;
+    const once_get_roptions = blk: {
+        const roptions = c.rocksdb_readoptions_create().?;
+        c.rocksdb_readoptions_set_fill_cache(roptions, 0);
+        break :blk roptions;
+    };
+    defer c.rocksdb_readoptions_destroy(once_get_roptions);
+    const prefix_scan_roptions = blk: {
+        const roptions = c.rocksdb_readoptions_create().?;
+        vcaligner.rocksdb_custom.applyPrefixScanToReadOptions(roptions);
+        break :blk roptions;
+    };
+    defer c.rocksdb_readoptions_destroy(prefix_scan_roptions);
+    const iter = c.rocksdb_create_iterator_cf(storage.db, prefix_scan_roptions, storage.cfs.get(.bpi_ci)).?;
     defer c.rocksdb_iter_destroy(iter);
 
     for (files, 0..) |*file, release_file_idx| {
@@ -216,7 +225,7 @@ fn collectEvidences(
         var blob_path_seq_len: usize = undefined;
         const ptr = c.rocksdb_get_cf(
             storage.db,
-            ro_get,
+            once_get_roptions,
             storage.cfs.get(.b_pi2bpi),
             @ptrCast(&blob_path_key),
             @sizeOf(BlobPathKey),
