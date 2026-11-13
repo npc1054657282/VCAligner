@@ -38,97 +38,127 @@ pub fn report(
     };
     defer c.rocksdb_readoptions_destroy(once_get_roptions);
 
-    try json.beginObject();
-    try json.objectField("candidates");
-    try json.beginArray();
-    for (candidates, 0..) |*candidate, candidate_idx| {
+    output: {
         try json.beginObject();
-        try json.objectField("idx");
-        try json.write(candidate_idx);
-        try json.objectField("commits");
-        try json.beginArray();
-        var iter = candidate.commits.view().iter();
-        while (iter.next()) |ci| {
-            var err_cstr: ?[*:0]u8 = null;
-            var len: usize = undefined;
-            const ptr = c.rocksdb_get_cf(
-                storage.db,
-                once_get_roptions,
-                storage.cfs.get(.ci2c),
-                @ptrCast(&ci),
-                @sizeOf(vcaligner.rocksdb_custom.CommitSeq),
-                &len,
-                @ptrCast(&err_cstr),
-            );
-            try vcaligner.c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
-            if (ptr == null) return Error.DanglingCommitSeq;
-            defer c.rocksdb_free(ptr);
-            if (len != @sizeOf(@FieldType(c.git_oid, "id"))) return Error.InvalidCommitHashLength;
-            const hash = std.mem.bytesToValue(@FieldType(c.git_oid, "id"), ptr[0..len]);
-            try json.write(std.fmt.bytesToHex(hash, .lower));
+        try json.objectField("candidates");
+        candidates: {
+            try json.beginArray();
+            for (candidates, 0..) |*candidate, candidate_idx| {
+                try json.beginObject();
+                try json.objectField("idx");
+                try json.write(candidate_idx);
+                try json.objectField("commits");
+                commits: {
+                    try json.beginArray();
+                    var iter = candidate.commits.view().iter();
+                    while (iter.next()) |ci| {
+                        var err_cstr: ?[*:0]u8 = null;
+                        var len: usize = undefined;
+                        const ptr = c.rocksdb_get_cf(
+                            storage.db,
+                            once_get_roptions,
+                            storage.cfs.get(.ci2c),
+                            @ptrCast(&ci),
+                            @sizeOf(vcaligner.rocksdb_custom.CommitSeq),
+                            &len,
+                            @ptrCast(&err_cstr),
+                        );
+                        try vcaligner.c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                        if (ptr == null) return Error.DanglingCommitSeq;
+                        defer c.rocksdb_free(ptr);
+                        if (len != @sizeOf(@FieldType(c.git_oid, "id"))) return Error.InvalidCommitHashLength;
+                        const hash = std.mem.bytesToValue(@FieldType(c.git_oid, "id"), ptr[0..len]);
+                        try json.write(std.fmt.bytesToHex(hash, .lower));
+                    }
+                    try json.endArray();
+                    break :commits;
+                }
+                try json.objectField("compatible_evidences");
+                compatible_evidences: {
+                    try json.beginArray();
+                    const old_ws = json.options.whitespace;
+                    json.options.whitespace = .minified;
+                    defer json.options.whitespace = old_ws;
+                    const signature = candidate.signature.promote(evidences.len);
+                    var matches = signature.iterator(.{});
+                    while (matches.next()) |evidence_idx| try json.write(evidence_idx);
+                    try json.endArray();
+                    break :compatible_evidences;
+                }
+                try json.endObject();
+            }
+            try json.endArray();
+            break :candidates;
         }
-        try json.endArray();
-        try json.objectField("compatible_evidences");
-        try json.beginArray();
-        const signature = candidate.signature.promote(evidences.len);
-        var matches = signature.iterator(.{});
-        while (matches.next()) |evidence_idx| try json.write(evidence_idx);
-        try json.endArray();
+
+        try json.objectField("evidences");
+        evidences: {
+            try json.beginArray();
+            for (evidences, 0..) |*evidence, idx| {
+                const release_file = release_files[evidence.release_file_idx];
+                try json.beginObject();
+                try json.objectField("idx");
+                try json.write(idx);
+                try json.objectField("path");
+                try json.write(release_file.path);
+                try json.objectField("blob");
+                try json.write(std.fmt.bytesToHex(release_file.blob_hash.id, .lower));
+                try json.objectField("discriminative");
+                try json.write(evidence.discriminative);
+                try json.objectField("commit_count");
+                try json.write(evidence.commit_count);
+                try json.endObject();
+            }
+            try json.endArray();
+            break :evidences;
+        }
+
+        try json.objectField("match_files");
+        match_files: {
+            try json.beginArray();
+            for (release_files) |release_file| {
+                if (release_file.status != .matched) continue;
+                try json.beginObject();
+                try json.objectField("path");
+                try json.write(release_file.path);
+                try json.objectField("evidence_idx");
+                try json.write(release_file.evidence_idx.?);
+                try json.endObject();
+            }
+            try json.endArray();
+            break :match_files;
+        }
+
+        try json.objectField("release_phantom_files");
+        release_phantom_files: {
+            try json.beginArray();
+            for (release_files) |release_file| {
+                if (release_file.status == .path_phantom) try json.write(release_file.path);
+            }
+            try json.endArray();
+            break :release_phantom_files;
+        }
+
+        try json.objectField("dismatch_phantom_files");
+        dismatch_phantom_files: {
+            try json.beginArray();
+            for (release_files) |release_file| {
+                if (release_file.status == .blob_phantom) try json.write(release_file.path);
+            }
+            try json.endArray();
+            break :dismatch_phantom_files;
+        }
+
+        try json.objectField("repo_only_files");
+        repo_only_files: {
+            try json.beginArray();
+            try writeRepoOnlyFiles(&json, storage, once_get_roptions, release_by_path, package_directory, last_diag);
+            try json.endArray();
+            break :repo_only_files;
+        }
         try json.endObject();
+        break :output;
     }
-    try json.endArray();
-
-    try json.objectField("evidences");
-    try json.beginArray();
-    for (evidences, 0..) |*evidence, idx| {
-        const release_file = release_files[evidence.release_file_idx];
-        try json.beginObject();
-        try json.objectField("idx");
-        try json.write(idx);
-        try json.objectField("path");
-        try json.write(release_file.path);
-        try json.objectField("blob");
-        try json.write(std.fmt.bytesToHex(release_file.blob_hash.id, .lower));
-        try json.objectField("discriminative");
-        try json.write(evidence.discriminative);
-        try json.objectField("commit_count");
-        try json.write(evidence.commit_count);
-        try json.endObject();
-    }
-    try json.endArray();
-
-    try json.objectField("match_files");
-    try json.beginArray();
-    for (release_files) |release_file| {
-        if (release_file.status != .matched) continue;
-        try json.beginObject();
-        try json.objectField("path");
-        try json.write(release_file.path);
-        try json.objectField("evidence_idx");
-        try json.write(release_file.evidence_idx.?);
-        try json.endObject();
-    }
-    try json.endArray();
-
-    try json.objectField("release_phatom_files");
-    try json.beginArray();
-    for (release_files) |release_file| {
-        if (release_file.status == .path_phantom) try json.write(release_file.path);
-    }
-    try json.endArray();
-
-    try json.objectField("dismatch_phatom_files");
-    try json.beginArray();
-    for (release_files) |release_file| {
-        if (release_file.status == .blob_phantom) try json.write(release_file.path);
-    }
-    try json.endArray();
-
-    try json.objectField("repo_only_files");
-    try json.beginArray();
-    try writeRepoOnlyFiles(&json, storage, once_get_roptions, release_by_path, package_directory, last_diag);
-    try json.endArray();
-    try json.endObject();
     try writer.interface.flush();
 }
 
