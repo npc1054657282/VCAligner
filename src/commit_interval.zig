@@ -8,6 +8,7 @@ pub const CommitInterval = packed struct(CommitIntervalBacking) {
     max: CommitSeqNative,
     min: CommitSeqNative,
     pub fn packMinMax(min: CommitSeqNative, max: CommitSeqNative) CommitInterval {
+        std.debug.assert(min <= max);
         return .{ .min = min, .max = max };
     }
 };
@@ -87,7 +88,7 @@ pub const CommitCollection = struct {
                 const previous_interval: *CommitInterval = &self.b.items[self.b.items.len - 1];
                 std.debug.assert(interval.min >= previous_interval.min);
                 const current_max = previous_interval.max;
-                // NOTE: 此判断条件即表达`interval.min <= current_max or interval.min - current_max == 1`
+                // NOTE: 此判断的意图表达等价于`interval.min <= current_max or interval.min - current_max == 1`
                 if (interval.min -| current_max <= 1) {
                     previous_interval.max = @max(current_max, interval.max);
                     return;
