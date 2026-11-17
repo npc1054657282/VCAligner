@@ -87,7 +87,7 @@ pub const CommitCollection = struct {
                 const previous_interval: *CommitInterval = &self.b.items[self.b.items.len - 1];
                 std.debug.assert(interval.min >= previous_interval.min);
                 const current_max = previous_interval.max;
-                if (interval.min <= current_max + 1) {
+                if (interval.min - current_max <= 1) {
                     previous_interval.max = @max(current_max, interval.max);
                     return;
                 }
@@ -106,7 +106,7 @@ pub const CommitCollection = struct {
                     , .{ interval.min, previous_interval.max });
                     return Error.AppendAssumptionViolation;
                 }
-                if (interval.min == previous_interval.max + 1) {
+                if (interval.min - previous_interval.max == 1) {
                     previous_interval.max = interval.max;
                     return;
                 }
