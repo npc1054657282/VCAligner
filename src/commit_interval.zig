@@ -27,8 +27,8 @@ pub const CommitCollection = struct {
         // 调试时使用，目前未使用
         pub fn eql(c1: CommitCollection.View, c2: CommitCollection.View) bool {
             if (c1.intervals.len != c2.intervals.len) return false;
-            for (c1.intervals, 0..) |r, i| {
-                if (r != c2.intervals[i]) {
+            for (c1.intervals, 0..) |interval, i| {
+                if (interval != c2.intervals[i]) {
                     return false;
                 }
             }
@@ -87,7 +87,8 @@ pub const CommitCollection = struct {
                 const previous_interval: *CommitInterval = &self.b.items[self.b.items.len - 1];
                 std.debug.assert(interval.min >= previous_interval.min);
                 const current_max = previous_interval.max;
-                if (interval.min - current_max <= 1) {
+                // NOTE: 此判断条件即表达`interval.min <= current_max or interval.min - current_max == 1`
+                if (interval.min -| current_max <= 1) {
                     previous_interval.max = @max(current_max, interval.max);
                     return;
                 }

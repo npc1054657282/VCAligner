@@ -120,8 +120,7 @@ pub fn analyseCandidates(
                 if (active_evidences.bit_set.isSet(r)) {
                     active_total_evidence_count += 1;
                     if (is_discriminative) active_discriminative_evidence_count += 1;
-                    const end_time = commit_collection.intervals[cursors[r]].max;
-                    const time = std.math.add(u32, end_time, 1) catch break :blk null;
+                    const time = std.math.add(u32, commit_collection.intervals[cursors[r]].max, 1) catch break :blk null;
                     break :blk .{ .time = time, .evidence_idx = r };
                 }
                 active_total_evidence_count -= 1;
