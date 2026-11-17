@@ -9,7 +9,7 @@ const Storage = vcaligner.cli.ana_runner.Storage;
 const PathSeq = vcaligner.rocksdb_custom.PathSeq;
 const BlobPathSeq = vcaligner.rocksdb_custom.BlobPathSeq;
 const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
-const CommitCollection = vcaligner.commit_range.CommitCollection;
+const CommitCollection = vcaligner.commit_interval.CommitCollection;
 
 pub const ReleaseFile = struct {
     path: [:0]const u8,
@@ -249,7 +249,7 @@ fn collectEvidences(
             if (key.blob_path_seq != blob_path_seq) break;
             try builder.appendNativeAssumeGreater(allocator, key.commit_seq.toNative());
         }
-        const collection = try builder.toOwnedCommitRanges(allocator);
+        const collection = try builder.toOwnedCommitIntervals(allocator);
         errdefer collection.deinit(allocator);
         try evidences.append(allocator, .{
             .release_file_idx = release_file_idx,

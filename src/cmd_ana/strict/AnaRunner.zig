@@ -38,7 +38,7 @@ candidate_parser: struct {
             path_not_in_package_directory: void,
             path_not_find_in_release: void,
             blob_path_not_match: void,
-            parsed: vcaligner.commit_range.CommitCollection,
+            parsed: vcaligner.commit_interval.CommitCollection,
         } = .unparsed,
         // 标注此文件是否是空文件。它对于结果分析而言有帮助。
         is_empty: union(enum) { unparsed: void, empty: void, not_empty: void } = .unparsed,
@@ -46,7 +46,7 @@ candidate_parser: struct {
         included_in_candidates_idx: std.ArrayList(usize) = .empty, // 一个agenda只要和candidate取交集不为空，就说这个agenda被这个cadidate包含。此处的usize指candidates中的index
     }, std.mem.Alignment.fromByteUnits(std.atomic.cache_line)),
     candidates: std.ArrayList(struct {
-        commit_collection: vcaligner.commit_range.CommitCollection,
+        commit_collection: vcaligner.commit_interval.CommitCollection,
         parsed: std.ArrayList(c.git_oid) = .empty,
         created_by_agenda_idx: usize, // 记录创建这个候选者的agenda，usize是agenda_parsers中的index
     }),

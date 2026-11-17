@@ -30,7 +30,7 @@ pub fn report(
     };
     var buffer: [1024]u8 = undefined;
     var writer = file.writer(&buffer);
-    var json: std.json.Stringify = .{ .writer = &writer.interface, .options = .{ .whitespace = .indent_4 } };
+    var stringifier: std.json.Stringify = .{ .writer = &writer.interface, .options = .{ .whitespace = .indent_4 } };
     const once_get_roptions = blk: {
         const roptions = c.rocksdb_readoptions_create().?;
         c.rocksdb_readoptions_set_fill_cache(roptions, 0);
@@ -39,131 +39,151 @@ pub fn report(
     defer c.rocksdb_readoptions_destroy(once_get_roptions);
 
     output: {
-        try json.beginObject();
-        try json.objectField("candidates");
+        try stringifier.beginObject();
+        try stringifier.objectField("candidates");
         candidates: {
-            try json.beginArray();
+            try stringifier.beginArray();
             for (candidates, 0..) |*candidate, candidate_idx| {
-                try json.beginObject();
-                try json.objectField("idx");
-                try json.write(candidate_idx);
-                try json.objectField("commits");
+                try stringifier.beginObject();
+                try stringifier.objectField("idx");
+                try stringifier.write(candidate_idx);
+                try stringifier.objectField("commits");
                 commits: {
-                    try json.beginArray();
+                    try stringifier.beginArray();
                     var iter = candidate.commits.view().iter();
                     while (iter.next()) |ci| {
-                        var err_cstr: ?[*:0]u8 = null;
-                        var len: usize = undefined;
-                        const ptr = c.rocksdb_get_cf(
-                            storage.db,
-                            once_get_roptions,
-                            storage.cfs.get(.ci2c),
-                            @ptrCast(&ci),
-                            @sizeOf(vcaligner.rocksdb_custom.CommitSeq),
-                            &len,
-                            @ptrCast(&err_cstr),
-                        );
-                        try vcaligner.c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
-                        if (ptr == null) return Error.DanglingCommitSeq;
-                        defer c.rocksdb_free(ptr);
-                        if (len != @sizeOf(@FieldType(c.git_oid, "id"))) return Error.InvalidCommitHashLength;
-                        const hash = std.mem.bytesToValue(@FieldType(c.git_oid, "id"), ptr[0..len]);
-                        try json.write(std.fmt.bytesToHex(hash, .lower));
+                        const commit: c.git_oid = commit: {
+                            var err_cstr: ?[*:0]u8 = null;
+                            var vallen: usize = undefined;
+                            const commit_ptr = c.rocksdb_get_cf(
+                                storage.db,
+                                once_get_roptions,
+                                storage.cfs.get(.ci2c),
+                                @ptrCast(&ci),
+                                @sizeOf(vcaligner.rocksdb_custom.CommitSeq),
+                                &vallen,
+                                @ptrCast(&err_cstr),
+                            );
+                            try vcaligner.c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
+                            if (commit_ptr == null) {
+                                // 对应的commit不存在
+                                std.log.err("rocksdb commit seq {d} not found!" ++
+                                    \\
+                                    \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
+                                    \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
+                                , .{ci.toNative()});
+                                return Error.DanglingCommitSeq;
+                            }
+                            defer c.rocksdb_free(commit_ptr);
+                            if (vallen != @sizeOf(@FieldType(c.git_oid, "id"))) {
+                                std.log.err("Corrupted or incompatible database entry at commit sequence {d}.\n" ++
+                                    "Expected a commit hash of length {d} bytes, but retrieved {d} bytes." ++
+                                    \\
+                                    \\This probably means that the rocksdb database the analysis was based on does not conform to expectations. 
+                                    \\Use the `vcaligner prep` subcommand to regenerate a valid rocksdb database.
+                                , .{ ci.toNative(), @sizeOf(@FieldType(c.git_oid, "id")), vallen });
+                                return Error.InvalidCommitHashLength;
+                            }
+                            break :commit .{
+                                .id = std.mem.bytesToValue(@FieldType(c.git_oid, "id"), commit_ptr),
+                            };
+                        };
+                        try stringifier.write(std.fmt.bytesToHex(commit.id, .lower));
                     }
-                    try json.endArray();
+                    try stringifier.endArray();
                     break :commits;
                 }
-                try json.objectField("compatible_evidences");
+                try stringifier.objectField("compatible_evidences");
                 compatible_evidences: {
-                    try json.beginArray();
-                    const old_ws = json.options.whitespace;
-                    json.options.whitespace = .minified;
-                    defer json.options.whitespace = old_ws;
+                    try stringifier.beginArray();
+                    const old_ws = stringifier.options.whitespace;
+                    stringifier.options.whitespace = .minified;
+                    defer stringifier.options.whitespace = old_ws;
                     const signature = candidate.signature.promote(evidences.len);
                     var matches = signature.iterator(.{});
-                    while (matches.next()) |evidence_idx| try json.write(evidence_idx);
-                    try json.endArray();
+                    while (matches.next()) |evidence_idx| try stringifier.write(evidence_idx);
+                    try stringifier.endArray();
                     break :compatible_evidences;
                 }
-                try json.endObject();
+                try stringifier.endObject();
             }
-            try json.endArray();
+            try stringifier.endArray();
             break :candidates;
         }
 
-        try json.objectField("evidences");
+        try stringifier.objectField("evidences");
         evidences: {
-            try json.beginArray();
+            try stringifier.beginArray();
             for (evidences, 0..) |*evidence, idx| {
                 const release_file = release_files[evidence.release_file_idx];
-                try json.beginObject();
-                try json.objectField("idx");
-                try json.write(idx);
-                try json.objectField("path");
-                try json.write(release_file.path);
-                try json.objectField("blob");
-                try json.write(std.fmt.bytesToHex(release_file.blob_hash.id, .lower));
-                try json.objectField("discriminative");
-                try json.write(evidence.discriminative);
-                try json.objectField("commit_count");
-                try json.write(evidence.commit_count);
-                try json.endObject();
+                try stringifier.beginObject();
+                try stringifier.objectField("idx");
+                try stringifier.write(idx);
+                try stringifier.objectField("path");
+                try stringifier.write(release_file.path);
+                try stringifier.objectField("blob");
+                try stringifier.write(std.fmt.bytesToHex(release_file.blob_hash.id, .lower));
+                try stringifier.objectField("discriminative");
+                try stringifier.write(evidence.discriminative);
+                try stringifier.objectField("commit_count");
+                try stringifier.write(evidence.commit_count);
+                try stringifier.endObject();
             }
-            try json.endArray();
+            try stringifier.endArray();
             break :evidences;
         }
 
-        try json.objectField("match_files");
+        try stringifier.objectField("match_files");
         match_files: {
-            try json.beginArray();
+            try stringifier.beginArray();
             for (release_files) |release_file| {
                 if (release_file.status != .matched) continue;
-                try json.beginObject();
-                try json.objectField("path");
-                try json.write(release_file.path);
-                try json.objectField("evidence_idx");
-                try json.write(release_file.evidence_idx.?);
-                try json.endObject();
+                try stringifier.beginObject();
+                try stringifier.objectField("path");
+                try stringifier.write(release_file.path);
+                try stringifier.objectField("evidence_idx");
+                try stringifier.write(release_file.evidence_idx.?);
+                try stringifier.endObject();
             }
-            try json.endArray();
+            try stringifier.endArray();
             break :match_files;
         }
 
-        try json.objectField("release_phantom_files");
+        try stringifier.objectField("release_phantom_files");
         release_phantom_files: {
-            try json.beginArray();
+            try stringifier.beginArray();
             for (release_files) |release_file| {
-                if (release_file.status == .path_phantom) try json.write(release_file.path);
+                if (release_file.status == .path_phantom) try stringifier.write(release_file.path);
             }
-            try json.endArray();
+            try stringifier.endArray();
             break :release_phantom_files;
         }
 
-        try json.objectField("dismatch_phantom_files");
+        try stringifier.objectField("dismatch_phantom_files");
         dismatch_phantom_files: {
-            try json.beginArray();
+            try stringifier.beginArray();
             for (release_files) |release_file| {
-                if (release_file.status == .blob_phantom) try json.write(release_file.path);
+                if (release_file.status == .blob_phantom) try stringifier.write(release_file.path);
             }
-            try json.endArray();
+            try stringifier.endArray();
             break :dismatch_phantom_files;
         }
 
-        try json.objectField("repo_only_files");
+        try stringifier.objectField("repo_only_files");
         repo_only_files: {
-            try json.beginArray();
-            try writeRepoOnlyFiles(&json, storage, once_get_roptions, release_by_path, package_directory, last_diag);
-            try json.endArray();
+            try stringifier.beginArray();
+            try writeRepoOnlyFiles(&stringifier, storage, once_get_roptions, release_by_path, package_directory, last_diag);
+            try stringifier.endArray();
             break :repo_only_files;
         }
-        try json.endObject();
+        try stringifier.endObject();
         break :output;
     }
     try writer.interface.flush();
 }
 
 fn writeRepoOnlyFiles(
-    json: *std.json.Stringify,
+    stringifier: *std.json.Stringify,
     storage: Storage,
     once_get_roptions: *c.rocksdb_readoptions_t,
     release_by_path: *const std.StringHashMapUnmanaged(usize),
@@ -199,7 +219,7 @@ fn writeRepoOnlyFiles(
         if (path_ptr == null) return Error.DanglingPathSeq;
         defer c.rocksdb_free(path_ptr);
         const path = analysis.relativeRepoPath(path_ptr[0..path_len], package_directory) orelse continue;
-        if (!release_by_path.contains(path)) try json.write(path);
+        if (!release_by_path.contains(path)) try stringifier.write(path);
     }
     var err_cstr: ?[*:0]u8 = null;
     c.rocksdb_iter_get_error(iter, @ptrCast(&err_cstr));

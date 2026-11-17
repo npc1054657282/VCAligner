@@ -315,7 +315,7 @@ pub const Evidences = struct {
     pub const Unit = struct {
         blob_priority_idx: usize,
         maybe_topology_shape: ?Shape,
-        commit_collection: vcaligner.commit_range.CommitCollection.View,
+        commit_collection: vcaligner.commit_interval.CommitCollection.View,
         pub const Shape = union(analyse_blob_topology.TopologyShapeKind) {
             single: void,
             integer_bitset: analyse_blob_topology.BitSetTopology(.integer_bitset).Shape.View,

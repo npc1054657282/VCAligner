@@ -10,7 +10,7 @@ const BlobPathKey = vcaligner.rocksdb_custom.BlobPathKey;
 const CommitSeqNative = vcaligner.rocksdb_custom.CommitSeqNative;
 const CommitSeq = vcaligner.rocksdb_custom.CommitSeq;
 const Key = vcaligner.rocksdb_custom.Key;
-const CommitRange = vcaligner.commit_range.CommitRange;
+const CommitInterval = vcaligner.commit_interval.CommitInterval;
 
 pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag.Diagnostic) !void {
     const allocator = gpa.allocator;
@@ -156,7 +156,7 @@ pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag
                     const new_candidate_index = ctx.candidate_parser.candidates.items.len;
                     try ctx.candidate_parser.candidates.append(allocator, .{
                         .commit_collection = new_candidate_collection: {
-                            var new_candidate_collection: vcaligner.commit_range.CommitCollection = try commit_collection.view().dupe(allocator);
+                            var new_candidate_collection: vcaligner.commit_interval.CommitCollection = try commit_collection.view().dupe(allocator);
                             // 对于新创建的候选集，重新补课，与前面的所有agenda取交集。
                             for (ctx.candidate_parser.agenda_parsers.items) |*review_agenda| {
                                 if (agenda == review_agenda) {
@@ -190,11 +190,11 @@ pub fn analysis(ctx: *AnaRunner, gpa: vcaligner.gpa.Concurrent, last_diag: *diag
 
     // 最后：对于所有candidate，解析其所有commits的实际值。
     for (ctx.candidate_parser.candidates.items) |*candidate| {
-        for (candidate.commit_collection.ranges) |range| {
-            const ci_native_start = range.start;
-            const ci_native_end = range.end;
-            var ci_native = ci_native_start;
-            while (ci_native <= ci_native_end) {
+        for (candidate.commit_collection.intervals) |interval| {
+            const ci_native_min = interval.min;
+            const ci_native_max = interval.max;
+            var ci_native = ci_native_min;
+            while (ci_native <= ci_native_max) {
                 defer ci_native += 1;
                 const ci: CommitSeq = .fromNative(ci_native);
                 const commit: c.git_oid = blk: {
@@ -466,7 +466,7 @@ fn parseAgenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allo
     };
     // 将`blob_path_seq`作为前缀查找所有commit。
     lctx.commit_collection = commit_collection: {
-        var builder: vcaligner.commit_range.CommitCollection.Builder = .init;
+        var builder: vcaligner.commit_interval.CommitCollection.Builder = .init;
         const bpici_iter = c.rocksdb_create_iterator_cf(gctx.db, gctx.candidate_parser.prefix_scan_roptions, gctx.cf_bpi_ci).?;
         defer c.rocksdb_iter_destroy(bpici_iter);
         c.rocksdb_iter_seek(bpici_iter, @ptrCast(&blob_path_seq), @sizeOf(BlobPathSeq));
@@ -481,9 +481,9 @@ fn parseAgenda(gctx: *AnaRunner, agenda_index: usize, ts_allocator: std.mem.Allo
             builder.appendNativeAssumeGreater(ts_allocator, ci_native) catch vcaligner.crash_dump.dumpAndCrash(@src());
         }
         // 此处不能用`.fromBuilder(...) catch`的写法，[参见](https://github.com/ziglang/zig/issues/21289)
-        break :commit_collection .{ .parsed = builder.toOwnedCommitRanges(ts_allocator) catch |err| {
+        break :commit_collection .{ .parsed = builder.toOwnedCommitIntervals(ts_allocator) catch |err| {
             switch (err) {
-                error.EmptyCommitRanges => {
+                error.EmptyCommitIntervals => {
                     std.log.err("Cannot find any commit with path '{s}' blob {x} blobpathseq {d}", .{
                         path,
                         blob_path_key.blob_hash.id,
@@ -626,7 +626,7 @@ fn gitBlobSha1Hash(allocator: std.mem.Allocator, path: [:0]const u8) !union(enum
 // 二·一找release_path中是否存在对应路径。
 // 二·二：找到对应路径的文件，若存在，将release_path下的对应文件进行hash。
 // 二·三，根据hash结果，通过b_pi2bpi寻找是否存在对应的blob id。
-// 二·四：读取default，根据path-blob对前缀匹配，获得所有键，归并为一个commit id range 列表。
-// 第三步：所有子任务执行完成以后，我们得到的是一个commit id range列表的[序列]。现在我们再设置一类commit id range列表的output[集合]。
-// 遍历[序列]，不断将序列的当前commit id range列表与[集合]里的所有commit id range列表取交集。交集为空认为失败。
-// 如果全部没有交集，当前的commit id range列表成为[集合]的一个新成员。显然，所有集合都是互不相交的。
+// 二·四：读取default，根据path-blob对前缀匹配，获得所有键，归并为一个commit id interval 列表。
+// 第三步：所有子任务执行完成以后，我们得到的是一个commit id interval列表的[序列]。现在我们再设置一类commit id interval列表的output[集合]。
+// 遍历[序列]，不断将序列的当前commit id interval列表与[集合]里的所有commit id interval列表取交集。交集为空认为失败。
+// 如果全部没有交集，当前的commit id interval列表成为[集合]的一个新成员。显然，所有集合都是互不相交的。

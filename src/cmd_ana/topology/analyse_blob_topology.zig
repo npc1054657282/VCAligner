@@ -66,10 +66,10 @@ pub fn BitSetTopology(comptime kind: BitTopologySetShapeKind) type {
         };
         pub const Entry = struct {
             shape: Shape,
-            commits: vcaligner.commit_range.CommitCollection,
+            commits: vcaligner.commit_interval.CommitCollection,
             pub const Building = struct {
                 shape: Shape,
-                commits: vcaligner.commit_range.CommitCollection.Builder,
+                commits: vcaligner.commit_interval.CommitCollection.Builder,
             };
         };
     };
@@ -77,7 +77,7 @@ pub fn BitSetTopology(comptime kind: BitTopologySetShapeKind) type {
 
 pub const BlobTopologies = union(TopologyShapeKind) {
     // 只有一个repo path seq。实际上就是`commit_collections_per_repo_path[0].view()`
-    single: vcaligner.commit_range.CommitCollection.View,
+    single: vcaligner.commit_interval.CommitCollection.View,
     integer_bitset: []BitSetTopology(.integer_bitset).Entry,
     dynamic_bitset: []BitSetTopology(.dynamic_bitset).Entry,
 };
@@ -93,7 +93,7 @@ pub const BlobAnalysisResult = struct {
         empty: void,
         // repo_path_seqs.len > 0
         active: struct {
-            commit_collections_per_repo_path: [*]vcaligner.commit_range.CommitCollection,
+            commit_collections_per_repo_path: [*]vcaligner.commit_interval.CommitCollection,
             topologies: BlobTopologiesResolution,
             // 趁热即时计算blob总commit count的缓存
             commit_count: usize,
@@ -106,10 +106,10 @@ pub const BlobTopologiesResolution = union(TopologyDecision) {
     proceed: vcaligner.bare_union.BareUnion(BlobTopologies),
     // 跳过topology refinement，但该blob仍然作为具有判别力的Blob-level evidence。
     // 表现形式为把所有repo path seqs的CommitCollection做并集。
-    skip_discriminative: vcaligner.commit_range.CommitCollection,
+    skip_discriminative: vcaligner.commit_interval.CommitCollection,
     // 跳过topology refinement，且该blob不参与candidate dominance。
     // 仍保留其CommitCollection，以便完整signature记录其是否命中。
-    skip_non_discriminative: vcaligner.commit_range.CommitCollection,
+    skip_non_discriminative: vcaligner.commit_interval.CommitCollection,
 };
 
 pub fn analyseBlobTopology(
@@ -224,7 +224,7 @@ pub fn analyseBlobTopologySub(
         defer blob_path_seqs.deinit(allocator);
         const len = repo_path_seqs.len;
         std.debug.assert(len == blob_path_seqs.items.len);
-        var commit_collections_per_repo_path: std.ArrayListUnmanaged(vcaligner.commit_range.CommitCollection) = try .initCapacity(allocator, len);
+        var commit_collections_per_repo_path: std.ArrayListUnmanaged(vcaligner.commit_interval.CommitCollection) = try .initCapacity(allocator, len);
         errdefer {
             for (commit_collections_per_repo_path.items) |commit_collection| {
                 commit_collection.deinit(allocator);
@@ -239,7 +239,7 @@ pub fn analyseBlobTopologySub(
         defer c.rocksdb_iter_destroy(iter);
         for (blob_path_seqs.items) |blob_path_seq| {
             const commit_collection = commit_collection: {
-                var builder: vcaligner.commit_range.CommitCollection.Builder = .init;
+                var builder: vcaligner.commit_interval.CommitCollection.Builder = .init;
                 errdefer builder.b.deinit(allocator);
                 c.rocksdb_iter_seek(iter, @ptrCast(&blob_path_seq), @sizeOf(vcaligner.rocksdb_custom.BlobPathSeq));
                 while (c.rocksdb_iter_valid(iter) != 0) : (c.rocksdb_iter_next(iter)) {
@@ -253,7 +253,7 @@ pub fn analyseBlobTopologySub(
                     };
                     try builder.appendNativeAssumeGreater(allocator, ci_native);
                 }
-                break :commit_collection try builder.toOwnedCommitRanges(allocator);
+                break :commit_collection try builder.toOwnedCommitIntervals(allocator);
             };
             commit_collections_per_repo_path.appendAssumeCapacity(commit_collection);
         }
@@ -275,10 +275,10 @@ pub fn analyseBlobTopologySub(
             else => return err,
         },
         .skip_discriminative => .{
-            .skip_discriminative = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path),
+            .skip_discriminative = try vcaligner.commit_interval.unionCollections(allocator, commit_collections_per_repo_path),
         },
         .skip_non_discriminative => .{
-            .skip_non_discriminative = try vcaligner.commit_range.unionCollections(allocator, commit_collections_per_repo_path),
+            .skip_non_discriminative = try vcaligner.commit_interval.unionCollections(allocator, commit_collections_per_repo_path),
         },
     };
     const commit_count = switch (topologies) {
@@ -308,7 +308,7 @@ pub fn analyseBlobTopologySub(
 }
 
 fn topologyAnalysisAndThenDecideTopologyUsage(
-    commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
+    commit_collections_per_repo_path: []const vcaligner.commit_interval.CommitCollection,
     allocator: std.mem.Allocator,
 ) !BlobTopologiesResolution {
     const proceed = try topologyAnalysis(commit_collections_per_repo_path, allocator);
@@ -330,7 +330,7 @@ fn topologyAnalysisAndThenDecideTopologyUsage(
 }
 
 fn topologyAnalysis(
-    commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
+    commit_collections_per_repo_path: []const vcaligner.commit_interval.CommitCollection,
     allocator: std.mem.Allocator,
 ) !BlobTopologies {
     std.debug.assert(commit_collections_per_repo_path.len > 0);
@@ -351,7 +351,7 @@ fn topologyAnalysis(
 
 fn sweepLine(
     comptime kind: BitTopologySetShapeKind,
-    commit_collections_per_repo_path: []const vcaligner.commit_range.CommitCollection,
+    commit_collections_per_repo_path: []const vcaligner.commit_interval.CommitCollection,
     allocator: std.mem.Allocator,
 ) ![]BitSetTopology(kind).Entry {
     const num_repo_path = commit_collections_per_repo_path.len;
@@ -378,14 +378,14 @@ fn sweepLine(
     var repos_triggering_at_min: BitSetTopology(kind).Shape = try .initEmpty(allocator, num_repo_path);
     defer repos_triggering_at_min.deinit(allocator);
     var current_time: vcaligner.rocksdb_custom.CommitSeqNative = 0;
-    // 每个range被认为是发送开始事件和结束时间，时间向前跑，不断翻转在range内和不在range内的状态。
+    // 每个interval被认为是发送开始事件和结束时间，时间向前跑，不断翻转在interval内和不在interval内的状态。
     while (true) {
         var maybe_min_event_time: ?vcaligner.rocksdb_custom.CommitSeqNative = null;
         // 扫描寻找最小事件时间
         scan_min_event_time: for (commit_collections_per_repo_path, 0..) |commit_collection, r| {
-            if (cursors[r] >= commit_collection.ranges.len) continue :scan_min_event_time;
-            const range = commit_collection.ranges[cursors[r]];
-            const event_time = if (active_repo_paths.raw.isSet(r)) range.end + 1 else range.start;
+            if (cursors[r] >= commit_collection.intervals.len) continue :scan_min_event_time;
+            const interval = commit_collection.intervals[cursors[r]];
+            const event_time = if (active_repo_paths.raw.isSet(r)) interval.max + 1 else interval.min;
             reset_old_state: {
                 if (maybe_min_event_time) |min_event_time| {
                     if (event_time > min_event_time) continue :scan_min_event_time;
@@ -398,8 +398,8 @@ fn sweepLine(
         }
         if (maybe_min_event_time) |min_event_time| {
             if (active_repo_paths.raw.count() > 0 and current_time < min_event_time) {
-                const valid_range: vcaligner.commit_range.CommitRange = .packStartEnd(current_time, min_event_time - 1);
-                try commitToBuildingTopologies(kind, allocator, &building_topologies, &active_repo_paths, valid_range);
+                const valid_interval: vcaligner.commit_interval.CommitInterval = .packMinMax(current_time, min_event_time - 1);
+                try commitToBuildingTopologies(kind, allocator, &building_topologies, &active_repo_paths, valid_interval);
             }
             // 状态推进
             var it = repos_triggering_at_min.raw.iterator(.{});
@@ -416,7 +416,7 @@ fn sweepLine(
     for (building_topologies.items) |*building_entry|
         topologies.appendAssumeCapacity(.{
             .shape = building_entry.shape,
-            .commits = try building_entry.commits.toOwnedCommitRanges(allocator),
+            .commits = try building_entry.commits.toOwnedCommitIntervals(allocator),
         });
     return try topologies.toOwnedSlice(allocator);
 }
@@ -426,11 +426,11 @@ fn commitToBuildingTopologies(
     allocator: std.mem.Allocator,
     building_topologies: *std.ArrayListUnmanaged(BitSetTopology(kind).Entry.Building),
     shape: *const BitSetTopology(kind).Shape,
-    valid_range: vcaligner.commit_range.CommitRange,
+    valid_interval: vcaligner.commit_interval.CommitInterval,
 ) !void {
     for (building_topologies.items) |*entry| {
         if (entry.shape.raw.eql(shape.raw)) {
-            try entry.commits.appendRangeAssumeGreater(allocator, valid_range);
+            try entry.commits.appendIntervalAssumeGreater(allocator, valid_interval);
             break;
         }
     } else {
@@ -439,7 +439,7 @@ fn commitToBuildingTopologies(
             new_entry.shape.deinit(allocator);
             new_entry.commits.b.deinit(allocator);
         }
-        try new_entry.commits.appendRangeAssumeGreater(allocator, valid_range);
+        try new_entry.commits.appendIntervalAssumeGreater(allocator, valid_interval);
         try building_topologies.append(allocator, new_entry);
     }
 }
