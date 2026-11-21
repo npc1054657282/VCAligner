@@ -99,7 +99,6 @@ pub fn analysis(runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_
     const SortContext = struct {
         files: []const ReleaseFile,
         fn lessThan(ctx: @This(), a: Evidence, b: Evidence) bool {
-            if (a.discriminative != b.discriminative) return a.discriminative;
             if (a.commit_count != b.commit_count) return a.commit_count < b.commit_count;
             return std.mem.order(u8, ctx.files[a.release_file_idx].path, ctx.files[b.release_file_idx].path) == .lt;
         }
@@ -107,13 +106,11 @@ pub fn analysis(runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_
     std.sort.pdq(Evidence, evidences.items, SortContext{ .files = release_files.items }, SortContext.lessThan);
     const signature_units = try allocator.alloc(SignatureUnit, evidences.items.len);
     defer allocator.free(signature_units);
-    var discriminative_count: u32 = 0;
     for (evidences.items, signature_units, 0..) |*evidence, *unit, i| {
-        if (evidence.discriminative) discriminative_count += 1;
         release_files.items[evidence.release_file_idx].evidence_idx = i;
         unit.* = .{ .commit_collection = evidence.commit_collection.view() };
     }
-    const candidates = try analyse_candidates.analyseCandidates(signature_units, discriminative_count, gpae, 0);
+    const candidates = try analyse_candidates.analyseCandidates(signature_units, @intCast(evidences.items.len), gpae, 0);
     defer candidates.deinit(allocator, evidences.items.len);
     try @import("report.zig").report(
         &runconf.report_output,
