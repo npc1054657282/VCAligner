@@ -137,12 +137,12 @@ pub fn report(
         match_files: {
             try stringifier.beginArray();
             for (release_files) |release_file| {
-                if (release_file.status != .matched) continue;
+                if (release_file.state != .matched) continue;
                 try stringifier.beginObject();
                 try stringifier.objectField("path");
                 try stringifier.write(release_file.path);
                 try stringifier.objectField("evidence_idx");
-                try stringifier.write(release_file.evidence_idx.?);
+                try stringifier.write(release_file.state.matched.evidence_idx);
                 try stringifier.endObject();
             }
             try stringifier.endArray();
@@ -153,7 +153,7 @@ pub fn report(
         release_phantom_files: {
             try stringifier.beginArray();
             for (release_files) |release_file| {
-                if (release_file.status == .path_phantom) try stringifier.write(release_file.path);
+                if (release_file.state == .path_phantom) try stringifier.write(release_file.path);
             }
             try stringifier.endArray();
             break :release_phantom_files;
@@ -163,7 +163,7 @@ pub fn report(
         dismatch_phantom_files: {
             try stringifier.beginArray();
             for (release_files) |release_file| {
-                if (release_file.status == .blob_phantom) try stringifier.write(release_file.path);
+                if (release_file.state == .blob_phantom) try stringifier.write(release_file.path);
             }
             try stringifier.endArray();
             break :dismatch_phantom_files;

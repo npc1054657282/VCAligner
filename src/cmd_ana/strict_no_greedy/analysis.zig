@@ -14,14 +14,17 @@ const CommitCollection = vcaligner.commit_interval.CommitCollection;
 pub const ReleaseFile = struct {
     path: [:0]const u8,
     kind: topology_analysis.release_artifact.Kind,
-    repo_path_seq: ?PathSeq = null,
-    blob_hash: c.git_oid = undefined,
-    status: Status = .path_phantom,
-    evidence_idx: ?usize = null,
-    // 每个 worker 写入自己的槽位；CommitCollection 的内存由对应 worker Arena 持有。
-    commit_collection: ?CommitCollection = null,
-
-    pub const Status = enum { path_phantom, blob_phantom, matched };
+    blob_hash: c.git_oid,
+    state: union(enum) {
+        path_phantom,
+        blob_phantom: PathSeq,
+        matched: struct {
+            // CommitCollection的内存由所属worker Arena持有。
+            commit_collection: CommitCollection,
+            // 证据排序完成后由主线程回填。
+            evidence_idx: usize,
+        },
+    },
 };
 
 pub const Evidence = struct {
@@ -39,9 +42,8 @@ pub const SignatureUnit = struct {
 // Diagnostics 仿照 Prep.ParsersHub.SubParser，每个 worker 独立持有。
 const SubCollectorStation = struct {
     _: void align(std.atomic.cache_line),
-    recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State = .{},
+    recycling_arena_state: vcaligner.ExclusiveRecyclingArena(0).State,
     diagnostics: vcaligner.diag.Diagnostics,
-    failure: ?anyerror = null,
     fn deinit(self: *SubCollectorStation, gpac: vcaligner.gpa.Concurrent) void {
         self.diagnostics.arena.deinit();
         const handle = self.recycling_arena_state.handle(gpac.allocator);
@@ -57,7 +59,13 @@ const SubCollectorsHub = struct {
         for (stations) |*station| {
             station.* = .{
                 ._ = {},
-                .diagnostics = .{ .arena = .init(gpac.allocator) },
+                .recycling_arena_state = .{},
+                .diagnostics = .{
+                    .arena = .init(gpac.allocator),
+                    .last_diagnostic = undefined,
+                    .error_stack = .empty,
+                    .double_error = null,
+                },
             };
         }
         return .{ .stations = stations };
@@ -119,13 +127,13 @@ pub fn analysis(runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_
         var wait_group: std.Thread.WaitGroup = .{};
         // TODO: 将 Git Blob 哈希任务提取到 Strict 与 Topology 共用的模块。
         for (release_files.items) |*file| {
-            if (file.repo_path_seq == null) continue;
+            if (file.state != .blob_phantom) continue;
             pool.spawnWg(&wait_group, collect_artifacts_blob.subTask, .{
                 release_dir, file.path, file.kind, &file.blob_hash,
             });
         }
         pool.waitAndWork(&wait_group);
-        try collectEvidences(&pool, storage, release_files.items, collector_hub.stations, gpac, &evidences, allocator, last_diag);
+        try collectEvidences(&pool, storage, release_files.items, collector_hub.stations, gpac, &evidences, allocator);
     }
 
     const SortContext = struct {
@@ -139,7 +147,7 @@ pub fn analysis(runconf: *const AnaRunner, gpac: vcaligner.gpa.Concurrent, last_
     const signature_units = try allocator.alloc(SignatureUnit, evidences.items.len);
     defer allocator.free(signature_units);
     for (evidences.items, signature_units, 0..) |*evidence, *unit, i| {
-        release_files.items[evidence.release_file_idx].evidence_idx = i;
+        release_files.items[evidence.release_file_idx].state.matched.evidence_idx = i;
         unit.* = .{ .commit_collection = evidence.commit_collection.view() };
     }
     const candidates = try analyse_candidates.analyseCandidates(signature_units, @intCast(evidences.items.len), gpae, 0);
@@ -188,7 +196,12 @@ fn collectReleasePaths(
         };
         const path = try path_allocator.dupeZ(u8, entry.path);
         const idx = files.items.len;
-        try files.append(allocator, .{ .path = path, .kind = kind });
+        try files.append(allocator, .{
+            .path = path,
+            .kind = kind,
+            .blob_hash = undefined,
+            .state = .path_phantom,
+        });
         try release_by_path.put(allocator, path, idx);
     }
 }
@@ -217,8 +230,9 @@ fn associateRepoPaths(
         var key_len: usize = undefined;
         const key_ptr = c.rocksdb_iter_key(iter, &key_len);
         std.debug.assert(key_len == @sizeOf(PathSeq));
-        files[release_file_idx].repo_path_seq = std.mem.bytesToValue(PathSeq, key_ptr[0..key_len]);
-        files[release_file_idx].status = .blob_phantom;
+        files[release_file_idx].state = .{
+            .blob_phantom = std.mem.bytesToValue(PathSeq, key_ptr[0..key_len]),
+        };
     }
     var err_cstr: ?[*:0]u8 = null;
     c.rocksdb_iter_get_error(iter, @ptrCast(&err_cstr));
@@ -233,7 +247,6 @@ fn collectEvidences(
     gpac: vcaligner.gpa.Concurrent,
     evidences: *std.ArrayListUnmanaged(Evidence),
     allocator: std.mem.Allocator,
-    last_diag: *vcaligner.diag.Diagnostic,
 ) !void {
     // Immutable read settings can be shared by all workers. They outlive every
     // Get() and task-local iterator; nothing modifies them after construction.
@@ -246,32 +259,17 @@ fn collectEvidences(
 
     var wait_group: std.Thread.WaitGroup = .{};
     for (files) |*file| {
-        if (file.repo_path_seq == null) continue;
+        if (file.state != .blob_phantom) continue;
         pool.spawnWgId(&wait_group, collectEvidenceSubTask, .{
             storage, file, stations, gpac, once_get_roptions, prefix_scan_roptions,
         });
     }
     pool.waitAndWork(&wait_group);
 
-    // 只在 WaitGroup 结束之后读线程本地诊断，且复制到调用者的诊断 Arena。
-    // 不允许把工作线程 Arena 中的 Diagnostic 指针留给上层。
-    for (stations) |*station| {
-        if (station.failure) |failure| {
-            if (failure == error.RocksdbError) {
-                const worker_diag = station.diagnostics.last_diagnostic.RocksdbError;
-                const message = last_diag.getAllocator().dupeZ(u8, worker_diag.message) catch |err|
-                    return last_diag.unableToConstructDiagnostic(err);
-                last_diag.* = .{ .RocksdbError = .{ .message = message, .src = worker_diag.src } };
-            } else if (failure == error.UnableToConstructDiagnostic) {
-                return last_diag.unableToConstructDiagnostic(station.diagnostics.double_error orelse error.OutOfMemory);
-            }
-            return failure;
-        }
-    }
-
     // 子任务仅写自己的 ReleaseFile 槽位。此处串行收集，严格保留原始文件顺序。
     for (files, 0..) |*file, release_file_idx| {
-        const collection = file.commit_collection orelse continue;
+        if (file.state != .matched) continue;
+        const collection = file.state.matched.commit_collection;
         try evidences.append(allocator, .{
             .release_file_idx = release_file_idx,
             .commit_collection = collection,
@@ -292,7 +290,6 @@ fn collectEvidenceSubTask(
 ) void {
     const station = &stations[thrd_id];
     // 每个 thread id 只会被一个执行流同时使用（含主线程 id 0）。
-    if (station.failure != null) return;
     collectEvidenceSub(
         storage,
         file,
@@ -301,7 +298,11 @@ fn collectEvidenceSubTask(
         once_get_roptions,
         prefix_scan_roptions,
     ) catch |err| {
-        station.failure = err;
+        // 与 Prep.subParseTask 一样，在线程池无法继续传播错误的边界记录诊断后直接终止。
+        std.log.err("Strict-No-Greedy evidence collection failed at '{s}'", .{file.path});
+        station.diagnostics.log_all(err);
+        station.diagnostics.clear();
+        vcaligner.crash_dump.dumpAndCrash(@src());
     };
 }
 
@@ -313,7 +314,7 @@ fn collectEvidenceSub(
     once_get_roptions: *c.rocksdb_readoptions_t,
     prefix_scan_roptions: *c.rocksdb_readoptions_t,
 ) !void {
-    const path_seq = file.repo_path_seq.?;
+    const path_seq = file.state.blob_phantom;
     var arena_handle = station.recycling_arena_state.handle(backing_allocator);
     const allocator = arena_handle.allocator();
     const last_diag = &station.diagnostics.last_diagnostic;
@@ -361,8 +362,10 @@ fn collectEvidenceSub(
     c.rocksdb_iter_get_error(iter, @ptrCast(&err_cstr));
     try vcaligner.c_helper.checkRocksdbErr(err_cstr, @src(), last_diag);
     const collection = try builder.toOwnedCommitIntervals(allocator);
-    file.commit_collection = collection;
-    file.status = .matched;
+    file.state = .{ .matched = .{
+        .commit_collection = collection,
+        .evidence_idx = undefined,
+    } };
 }
 
 test "package directory boundary" {
