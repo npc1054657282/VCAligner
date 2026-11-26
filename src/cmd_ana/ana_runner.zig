@@ -13,11 +13,13 @@ pub const Strategy = enum {
     @"strict-no-greedy",
     topology,
     @"blob-only",
+    @"blob-only-nd",
 };
 
 pub const TopologyAnalysisPolicy = enum {
     topology,
     blob_only,
+    blob_only_nd,
 };
 
 pub const cmd = blk: {
@@ -97,7 +99,7 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
     return switch (args.strategy) {
         .strict => Strict.initFromArgs(args, allocator),
         .@"strict-no-greedy" => StrictNoGreedy.initFromArgs(args, allocator),
-        .topology, .@"blob-only" => Topology.initFromArgs(args, allocator),
+        .topology, .@"blob-only", .@"blob-only-nd" => Topology.initFromArgs(args, allocator),
     };
 }
 

@@ -40,6 +40,7 @@ pub fn initFromArgs(args: cmd.Result(), allocator: std.mem.Allocator) !cli.Runne
             .topology_analysis_policy = switch (args.strategy) {
                 .topology => .topology,
                 .@"blob-only" => .blob_only,
+                .@"blob-only-nd" => .blob_only_nd,
                 .strict, .@"strict-no-greedy" => unreachable,
             },
         },

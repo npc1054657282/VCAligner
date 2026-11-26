@@ -466,7 +466,7 @@ pub fn decideTopologyAnalysis(
 ) TopologyDecision {
     switch (policy) {
         .blob_only => return .skip_discriminative,
-        .topology => {},
+        .topology, .blob_only_nd => {},
     }
     const ana_runner = vcaligner.cli.ana_runner;
     if (std.mem.eql(u8, &blob_hash.id, &ana_runner.empty_git_blob_sha1_hash.id) or
@@ -475,7 +475,11 @@ pub fn decideTopologyAnalysis(
     {
         return .skip_non_discriminative;
     }
-    return .proceed;
+    return switch (policy) {
+        .blob_only => unreachable,
+        .blob_only_nd => .skip_discriminative,
+        .topology => .proceed,
+    };
 }
 
 // 事后过滤，看了拓扑分析结果决定是否使用拓扑
